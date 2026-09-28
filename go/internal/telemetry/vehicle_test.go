@@ -258,3 +258,32 @@ func TestPickBestVehicleForLoadpointStrictTiebreakByFreshness(t *testing.T) {
 		t.Errorf("strict gate: fresher reading should win tiebreak, got %q", pick.Driver)
 	}
 }
+
+func TestPickBestVehicleForDisplayRetainsOldObservation(t *testing.T) {
+	s := NewStore()
+	pushVehicle(t, s, "asleep", 0.50, 0.80, "Stopped", false, 12*time.Minute)
+
+	if pick := PickBestVehicleForLoadpoint(s, false, time.Now()); pick.Driver != "" {
+		t.Fatalf("old SoC must stay unavailable to control, got %+v", pick)
+	}
+
+	pick := PickBestVehicleForDisplay(s, false, time.Now())
+	if pick.Driver != "asleep" {
+		t.Fatalf("display picker lost last-known car report: %+v", pick)
+	}
+	if !pick.Stale {
+		t.Fatalf("12-minute-old report must be marked stale: %+v", pick)
+	}
+	if pick.SoC != 0.50 {
+		t.Fatalf("display SoC=%v, want 0.50", pick.SoC)
+	}
+}
+
+func TestPickBestVehicleForDisplayStillRejectsDriverMarkedStale(t *testing.T) {
+	s := NewStore()
+	pushVehicle(t, s, "invalid", 0.50, 0.80, "Stopped", true, 12*time.Minute)
+
+	if pick := PickBestVehicleForDisplay(s, false, time.Now()); pick.Driver != "" {
+		t.Fatalf("driver-marked stale reading must not be displayed: %+v", pick)
+	}
+}

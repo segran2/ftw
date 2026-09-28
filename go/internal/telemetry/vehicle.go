@@ -76,7 +76,7 @@ func VehicleConnectedRank(chargingState string) int {
 // Lives in telemetry/ rather than api/ or cmd/ because both packages
 // need it and the dependency direction otherwise cycles.
 func PickBestVehicle(s *Store, now time.Time) VehiclePick {
-	return pickBestVehicle(s, 0, now)
+	return pickBestVehicle(s, 0, now, false)
 }
 
 // PickBestVehicleForLoadpoint adds connection-evidence gating: when
@@ -100,7 +100,19 @@ func PickBestVehicleForLoadpoint(s *Store, lpDeliveringPower bool, now time.Time
 		// loadpoint is at 11 kW is definitely not the connected one.
 		minRank = 3
 	}
-	return pickBestVehicle(s, minRank, now)
+	return pickBestVehicle(s, minRank, now, false)
+}
+
+// PickBestVehicleForDisplay retains an otherwise valid last-known vehicle
+// observation after the five-minute control freshness window. The returned
+// pick is marked stale, so presentation can show provenance and age without
+// making the old SoC usable by MPC or control.
+func PickBestVehicleForDisplay(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
+	minRank := 0
+	if lpDeliveringPower {
+		minRank = 3
+	}
+	return pickBestVehicle(s, minRank, now, true)
 }
 
 // PickVehicleForCompletion requires one vehicle source. Rank and freshness
@@ -110,10 +122,10 @@ func PickVehicleForCompletion(s *Store, now time.Time) VehiclePick {
 	if s == nil || len(s.ReadingsByType(DerVehicle)) != 1 {
 		return VehiclePick{}
 	}
-	return pickBestVehicle(s, 1, now)
+	return pickBestVehicle(s, 1, now, false)
 }
 
-func pickBestVehicle(s *Store, minRank int, now time.Time) VehiclePick {
+func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) VehiclePick {
 	if s == nil {
 		return VehiclePick{}
 	}
@@ -127,7 +139,11 @@ func pickBestVehicle(s *Store, minRank int, now time.Time) VehiclePick {
 			continue
 		}
 		socUpdatedAt := vr.SoCUpdatedAt
-		if socUpdatedAt.IsZero() || now.Sub(socUpdatedAt) > VehicleMaxAge {
+		if socUpdatedAt.IsZero() {
+			continue
+		}
+		ageStale := now.Sub(socUpdatedAt) > VehicleMaxAge
+		if ageStale && !allowAgeStale {
 			// Reading is older than we're willing to trust as ground
 			// truth — driver probably stopped publishing. Skip rather
 			// than risk acting on a stale SoC.
@@ -159,7 +175,7 @@ func pickBestVehicle(s *Store, minRank int, now time.Time) VehiclePick {
 			SoC:           soc,
 			ChargeLimit:   limit,
 			ChargingState: meta.ChargingState,
-			Stale:         meta.Stale,
+			Stale:         ageStale,
 			UpdatedAt:     socUpdatedAt,
 		}
 		bestRank = rank
