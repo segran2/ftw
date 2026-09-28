@@ -37,14 +37,17 @@ The handshake identifies the worker, its version, protocol range and features.
 Protocol compatibility and supported features govern use, not matching Core
 and Energyplan release numbers. Current features are `champion`,
 `forecast_reset`, `partial_slots`, `demand_charges`, `ev_duty` and
-`charging_periods`; the worker also reports `forecast_protocol_version`.
+`charging_periods` and `published_prices`; the worker also reports
+`forecast_protocol_version`.
 Core negotiates `charging_periods` before sending its optional fields.
 
 New optional request fields need capability negotiation or a paired update
 that preserves deployed clients. Unknown optimizer request fields are errors.
 Do not remove a required field or reuse it for a new meaning under an unchanged
-contract. Core still sends `confidence: 1` for each published price; its removal
-requires a paired worker and Core change.
+contract. Workers with `published_prices` use each supplied price directly and
+accept but ignore the retired `confidence` field from older clients. Core omits
+that field after negotiation and retains `confidence: 1` for older workers.
+Forecast uncertainty belongs in load/PV inputs, not in published-price blending.
 
 Optimizer frames have a 2 MiB request limit and a 16 MiB reply limit. Forecast
 clients apply a stricter 2 MiB limit to both directions and a 1 MiB model-state
@@ -162,6 +165,15 @@ charges, with a 7 s transport timeout. It reduces the budget near the first
 slot's end and leaves 50 ms for validation/publication. These are compute and
 call budgets, not a proven wall-time SLA. Measure queueing, startup, decoding,
 solving, replay, encoding and Core validation separately when changing them.
+
+A warm worker may keep one previous plan as a candidate. Before reuse it must
+match asset identities, advance time, rebuild energy from current measurements,
+reprice all actions and replay current physical limits and scenarios. New tail
+slots need validation too. Cached costs, bounds and optimal status never carry
+over. A candidate must compete with fresh planning on deadline energy, charging
+preferences and cost. `solver.warm_start_valid`, when present, means a cached
+candidate passed this check; it does not mean the final plan used it. Restart
+may discard this optional cache without losing stored user goals.
 
 On failure Core may use its validated fallback only where it can represent
 the site. Otherwise an old plan may remain as diagnostic history; retention
