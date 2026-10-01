@@ -38,7 +38,7 @@ export function chargingLevels(lp = {}) {
     fromCar,
     explanation: lp.manual_active ? 'Your saved goal resumes when you return to the plan.'
       : lp.goal_complete === true ? 'The car has confirmed this goal is complete.'
-      : vehicleGoal && limit == null
+      : vehicleGoal && limit == null && lp.soc_source === 'vehicle'
       ? 'FTW does not know the car’s limit. It reserves charging for up to 100%; the car decides when to stop.'
       : target != null ? `Planning from ${fraction(planningNow) ? percent(planningNow) : 'an unknown level'} to ${percent(target)}${unconfirmed ? ' · confirm the current level' : ''}.` : 'Set a goal to plan charging.',
   };
