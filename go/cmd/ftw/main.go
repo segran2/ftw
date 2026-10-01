@@ -2457,6 +2457,9 @@ func main() {
 		SiteDispatchBlocked: func() string {
 			return siteDispatchNow(tel, cfg, cfgMu, ctrl, ctrlMu, time.Now()).Reason
 		},
+		SiteMeasurementSources: func() telemetry.ForecastOptions {
+			return forecastSettings.Snapshot().Options
+		},
 		HA:               haOwner.Bridge,
 		Registry:         reg,
 		DriverRepository: driverRepository,

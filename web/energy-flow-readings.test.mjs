@@ -144,3 +144,18 @@ describe("fmtKwhShort", () => {
     assert.equal(fmtKwhShort(100.6), "101");
   });
 });
+
+it('marks only devices that need attention and keeps an offline sibling visible without old watts', () => {
+  const status = {grid_w:1000,load_w:500,drivers:{a:{status:'ok',bat_w:1000},b:{status:'offline',bat_w:5000}},control_feedback:[
+    {driver:'a',kind:'battery',status:'following',reason:'power_observed',severity:'info',evidence:'confirmed',readings_fresh:true},
+    {driver:'b',kind:'battery',status:'no_contact',reason:'readings_lost',severity:'alarm',evidence:'accepted',readings_fresh:false,actual_w:null},
+  ]};
+  const planets=flowReadingsFromStatus(status).planets;
+  assert.equal(planets.find(p=>p.name==='a').controlMark,undefined);
+  const failed=planets.find(p=>p.name==='b');
+  assert.deepEqual(failed.controlMark,{tone:'alarm',label:'Lost control'});
+  assert.equal(failed.placeholder,true);
+  assert.equal(failed.kw,0);
+  assert.equal(failed.clickable,true);
+  assert.equal(flowReadingsFromStatus(status,{live:false}).planets.find(p=>p.name==='b').controlMark,undefined);
+});

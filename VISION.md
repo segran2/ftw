@@ -34,6 +34,54 @@ Core validates every plan and command, including plans supplied by another
 system. Fuse, equipment, SoC, freshness and other quantified safety limits
 always apply. Stale required site-meter data stops dispatch.
 
+## Are we in control?
+
+**Trust what you read, not what you sent.**
+
+For each device function FTW commands, such as a battery, a car charger, a
+solar cap or V2X, the normal view answers one question: is the device doing
+what FTW asked? A successful driver call, an API reply or an echoed setpoint
+does not prove a physical effect.
+
+Core decides the answer and its urgency; clients only render it:
+
+- **Following FTW:** fresh readings show the device doing what FTW asked.
+- **Waiting:** a response is still due, or there is nothing to verify yet.
+- **Limited:** the device follows within a known limit, such as a nearly full
+  battery, the main fuse or a charger setting.
+- **Not following:** fresh readings disagree with the command after the
+  device's response time.
+- **No contact:** readings or commands fail. Losing a device FTW had measured
+  is an alarm.
+- **Not controlled:** FTW only reads the device or has handed control back.
+
+Show the evidence as a receipt, not as the headline: sent, accepted, measured
+and confirmed. Accepted means the driver took the command. Measured means
+fresh, distinct device readings across the response window. Confirmed means a
+separate physical meter saw the matching change. Keep the target separate: a
+battery can be confirmed at 4.4 kW against a 5 kW command, and the shortfall
+stays visible.
+
+- Freshness follows the source. A slow cloud source stays current for as long
+  as it declares; a repeated or cached sample never extends proof.
+- Compare each reading with the commands that could still be in force during
+  the response time. Retuning every tick is normal control, not a new test.
+  A material step starts a new comparison.
+- Confirmation needs a separate physical sensor, aligned readings and a clear
+  step. Subtract other measured flows, and never let an unmeasured load
+  disappear into an average. A confirmed step stays confirmed while the device
+  keeps following with fresh readings.
+- Explain a shortfall only with a fresh, relevant fact, such as state of
+  charge or a reported limit. Say when the cause is unknown.
+- Keep the overview quiet while FTW is in control. Mark warnings amber and
+  alarms red, and clear them when fresh evidence shows recovery.
+- Never change a power target just to create a test signal without the
+  owner's consent.
+- Give authorized agents and support reports the same evidence.
+
+This is the product direction. Each implementation states which devices,
+paths and physical outcomes it has verified.
+
 ## Trust through visible behaviour
 
 The live view is a core product feature. It must feel local and fast, and
@@ -67,6 +115,25 @@ inverter power ratings should not normally be required form fields: obtain
 verified device limits where available and learn the usable response within
 safe bounds. Advanced users may set limits explicitly. Do not treat an
 observed power level as proof of an absolute hardware or installation limit.
+
+Develop the per-device battery and inverter model into a digital twin grounded
+in normal operation. Learn charge and discharge response, delay, usable power
+and losses under the observed state of charge, temperature and device mode.
+Keep energy capacity in kWh separate from power in kW. A 10 kWh battery may
+have a 5 kW inverter; reaching 5 kW says nothing by itself about its capacity.
+If user input conflicts with repeated measurements or device ratings, explain
+the conflict and propose a correction rather than silently changing that input.
+
+Keep user input, reported limits and learned estimates distinct, with source,
+age, tested conditions and uncertainty. Prefer independently confirmed samples
+for learning, label device-only samples, and never train on an inferred site
+effect as though it were another meter. A plateau at one state of charge is
+evidence for those conditions, not a permanent nameplate limit. Learn capacity
+only from suitable energy and state-of-charge observations. Detect changed
+behaviour and rebuild confidence after equipment or mode changes. Use the model
+to plan achievable work within verified safety limits; learned estimates must
+never raise those limits or replace fresh measurements as proof of an effect.
+This is the target for the model, not a claim that the full twin has shipped.
 
 For solar, the target is that "I have solar" is enough to start learning.
 Installed kWp is an optional starting estimate. Approximate user input must

@@ -182,6 +182,7 @@
 
       <div id="power-now-values" class="power-now-panel" role="tabpanel"
            aria-labelledby="power-now-tab-values" hidden>
+        <section id="control-results" class="control-status control-status-compact" aria-label="Are we in control?" hidden></section>
         <div class="summary-cards">
           <div class="summary-card" id="card-pv">
             <div class="card-label">Solar</div>
@@ -861,11 +862,15 @@
   </footer>
 
   <!-- Battery manual-hold popup — opened from the battery planet click. -->
-  <ftw-battery-control id="battery-control"></ftw-battery-control>
+  <ftw-battery-control id="battery-control">
+    <section slot="status" id="battery-control-proof" class="control-status" aria-label="Are we in control?"></section>
+  </ftw-battery-control>
 
   <!-- PV curtail manual-hold popup — opened from the solar planet click,
        only meaningful when a PV driver advertises pv-curtail support. -->
-  <ftw-pv-control id="pv-control"></ftw-pv-control>
+  <ftw-pv-control id="pv-control">
+    <section slot="status" id="pv-control-proof" class="control-status" aria-label="Are we in control?"></section>
+  </ftw-pv-control>
 
   <!-- Plan numbers — what they mean -->
   <ftw-modal id="plan-help-modal" style="--ftw-modal-max-width:560px">
@@ -916,6 +921,7 @@
   <!-- EV detail popup -->
   <ftw-modal id="ev-modal" style="--ftw-modal-max-width:380px">
     <span slot="title">EV Charger</span>
+    <section id="ev-control-proof" class="control-status" aria-label="Are we in control?"></section>
     <div id="ev-modal-body">
       <p style="color:var(--text-dim)">Loading...</p>
     </div>
@@ -926,8 +932,15 @@
          The /api/ev/command endpoint stays for HA / scripts. -->
   </ftw-modal>
 
+  <!-- Control status for a device without its own controls. -->
+  <ftw-modal id="control-proof-modal" style="--ftw-modal-max-width:480px">
+    <span slot="title">Device</span>
+    <section id="control-proof-details" class="control-status" aria-label="Are we in control?"></section>
+  </ftw-modal>
+
   <!-- Grid detail popup — peak import ceiling + grid target. Open from
        the GRID planet in the energy-flow hero. -->
+
   <ftw-modal id="grid-modal" style="--ftw-modal-max-width:420px">
     <span slot="title">Grid</span>
     <div id="grid-modal-body">
@@ -964,6 +977,7 @@
   </ftw-modal>
 
   <script src="/lan-auth.js?v=lan1"></script>
+  <script type="module" src="/control-feedback-view.js"></script>
   <script src="/app.js?v=noask1"></script>
   <script src="/settings.js?v=diag3"></script>
   <script src="/settings/tabs/control.js?v=tabsplit1"></script>

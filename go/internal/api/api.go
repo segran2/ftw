@@ -73,6 +73,9 @@ const (
 // One instance is shared across all handlers; mutations use the contained
 // mutexes from each package.
 type Deps struct {
+	// SiteMeasurementSources reuses the configured physical-flow inventory.
+	// These are source declarations, never forecast values or derived load.
+	SiteMeasurementSources func() telemetry.ForecastOptions
 
 	// MutationPolicy protects every state-changing route at the shared
 	// Handler boundary. Production requires tokens for non-local hostnames;
@@ -1220,6 +1223,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// diagnostic — incremented when actual fleet delivery diverges
 		// from the plan's BatteryEnergyWh by > 50 % (over) or < 50 %
 		// (under). Idle slots (|planned| ≤ 50 Wh) are ignored.
+		"control_feedback":    s.controlFeedback(time.Now()),
 		"slot_delivery_stats": ctrl.SlotDeliveryStats,
 	}
 	// A stale or missing site meter is not 0 W. Publishing zero made the
@@ -3677,7 +3681,7 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"enabled":                      true,
 		"vehicle_limit_goal_supported": true,
-		"loadpoints":                   states,
+		"loadpoints":                   s.loadpointsWithFeedback(states),
 	})
 }
 
