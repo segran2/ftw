@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"encoding/json"
+	"math"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/units"
@@ -132,13 +133,22 @@ func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) V
 	var best VehiclePick
 	bestRank := -1
 	for _, vr := range s.ReadingsByType(DerVehicle) {
-		if vr.SoC == nil {
+		socValue := vr.SoC
+		socUpdatedAt := vr.SoCUpdatedAt
+		cachedDisplay := false
+		if allowAgeStale {
+			if value, observedAt, ok := cachedVehicleDisplay(s, vr); ok {
+				socValue = &value
+				socUpdatedAt = observedAt
+				cachedDisplay = true
+			}
+		}
+		if socValue == nil {
 			continue
 		}
 		if h := s.DriverHealth(vr.Driver); h == nil || !h.IsOnline() {
 			continue
 		}
-		socUpdatedAt := vr.SoCUpdatedAt
 		if socUpdatedAt.IsZero() {
 			continue
 		}
@@ -158,7 +168,7 @@ func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) V
 		if len(vr.Data) > 0 {
 			_ = json.Unmarshal(vr.Data, &meta)
 		}
-		if meta.Stale {
+		if meta.Stale && !allowAgeStale {
 			continue
 		}
 		rank := VehicleConnectedRank(meta.ChargingState)
@@ -168,17 +178,42 @@ func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) V
 		if rank < bestRank || (rank == bestRank && !socUpdatedAt.After(best.UpdatedAt)) {
 			continue
 		}
-		soc := units.ClampFraction(*vr.SoC)
+		soc := units.ClampFraction(*socValue)
 		limit := units.ClampFraction(units.DecodeJSONFraction(meta.ChargeLimit, meta.ChargeLimitPct))
 		best = VehiclePick{
 			Driver:        vr.Driver,
 			SoC:           soc,
 			ChargeLimit:   limit,
 			ChargingState: meta.ChargingState,
-			Stale:         ageStale,
+			Stale:         ageStale || meta.Stale || cachedDisplay,
 			UpdatedAt:     socUpdatedAt,
 		}
 		bestRank = rank
 	}
 	return best
+}
+
+// Cached car reports can arrive before any fresh report after a restart.
+// Store.SoC intentionally retains only control-trusted observations. Read the
+// latest raw report for presentation alone, requiring its explicit cache flag
+// and the driver's measured SoC age. Never synthesize a fresh receipt time.
+func cachedVehicleDisplay(s *Store, vr *DerReading) (float64, time.Time, bool) {
+	var report struct {
+		SoC      *float64 `json:"soc"`
+		SoCFresh *bool    `json:"soc_fresh"`
+	}
+	if json.Unmarshal(vr.Data, &report) != nil || report.SoC == nil ||
+		report.SoCFresh == nil || *report.SoCFresh {
+		return 0, time.Time{}, false
+	}
+	raw := *report.SoC
+	if math.IsNaN(raw) || math.IsInf(raw, 0) || raw < 0 || raw > 100 {
+		return 0, time.Time{}, false
+	}
+	age, receivedAt, ok := s.LatestMetric(vr.Driver, "vehicle_soc_age_s")
+	if !ok || receivedAt.IsZero() || math.IsNaN(age) || math.IsInf(age, 0) ||
+		age < 0 || age > (100*365*24*time.Hour).Seconds() {
+		return 0, time.Time{}, false
+	}
+	return units.DecodeJSONFraction(0, raw), receivedAt.Add(-time.Duration(age * float64(time.Second))), true
 }
