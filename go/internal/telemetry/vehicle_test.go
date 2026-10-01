@@ -279,11 +279,59 @@ func TestPickBestVehicleForDisplayRetainsOldObservation(t *testing.T) {
 	}
 }
 
-func TestPickBestVehicleForDisplayStillRejectsDriverMarkedStale(t *testing.T) {
+func TestPickBestVehicleForDisplayRetainsDriverMarkedStale(t *testing.T) {
 	s := NewStore()
 	pushVehicle(t, s, "invalid", 0.50, 0.80, "Stopped", true, 12*time.Minute)
 
-	if pick := PickBestVehicleForDisplay(s, false, time.Now()); pick.Driver != "" {
-		t.Fatalf("driver-marked stale reading must not be displayed: %+v", pick)
+	if pick := PickBestVehicleForDisplay(s, false, time.Now()); pick.Driver != "invalid" || !pick.Stale {
+		t.Fatalf("stale display: %+v", pick)
+	}
+	if pick := PickBestVehicleForLoadpoint(s, false, time.Now()); pick.Driver != "" {
+		t.Fatalf("stale control: %+v", pick)
+	}
+}
+
+func TestCachedVehicleDisplayAfterRestartAndOlderPredecessor(t *testing.T) {
+	for _, predecessor := range []bool{false, true} {
+		s := NewStore()
+		if predecessor {
+			pushVehicle(t, s, "audi-vag", .48, .8, "Stopped", false, 48*time.Hour)
+		}
+		soc := .98
+		s.Update("audi-vag", DerVehicle, 0, &soc, json.RawMessage(`{"soc":98,"soc_fresh":false,"stale":true,"charging_state":"Stopped"}`))
+		s.EmitMetric("audi-vag", "vehicle_soc_age_s", 156022, "s", "", "")
+		s.DriverHealthMut("audi-vag").RecordSuccess()
+		_, receivedAt, _ := s.LatestMetric("audi-vag", "vehicle_soc_age_s")
+		now := receivedAt.Add(2 * time.Minute)
+		got := PickBestVehicleForDisplay(s, false, now)
+		if got.Driver != "audi-vag" || got.SoC != .98 || !got.Stale || int64(now.Sub(got.UpdatedAt)/time.Second) != 156142 {
+			t.Fatalf("predecessor=%v: cached display = %+v", predecessor, got)
+		}
+		if got := PickBestVehicleForLoadpoint(s, false, now); got.Driver != "" {
+			t.Fatalf("cached report reached control: %+v", got)
+		}
+		if got := PickVehicleForCompletion(s, now); got.Driver != "" {
+			t.Fatalf("cached report completed goal: %+v", got)
+		}
+		if got := PickBestVehicleForDisplay(s, true, now); got.Driver != "" {
+			t.Fatalf("Stopped car matched charging loadpoint: %+v", got)
+		}
+	}
+}
+func TestCachedVehicleDisplayRequiresValidSourceAgeAndSoC(t *testing.T) {
+	for _, report := range []string{`{"soc":98,"soc_fresh":false,"stale":true}`, `{"soc":101,"soc_fresh":false,"stale":true}`, `{"soc":98,"soc_fresh":"false","stale":true}`} {
+		s := NewStore()
+		soc := .98
+		s.Update("audi", DerVehicle, 0, &soc, json.RawMessage(report))
+		s.DriverHealthMut("audi").RecordSuccess()
+		if got := PickBestVehicleForDisplay(s, false, time.Now()); got.Driver != "" {
+			t.Fatalf("invalid report/unknown age: %+v", got)
+		}
+		if report != `{"soc":98,"soc_fresh":false,"stale":true}` {
+			s.EmitMetric("audi", "vehicle_soc_age_s", 156022, "s", "", "")
+			if got := PickBestVehicleForDisplay(s, false, time.Now()); got.Driver != "" {
+				t.Fatalf("invalid raw report: %+v", got)
+			}
+		}
 	}
 }
