@@ -11,11 +11,11 @@ const view = source.slice(
 // The plug-in moment (#1059): the modal shows what the box will do and
 // lets the car's charge level be corrected without a button.
 
-test('the charge-level slider writes on release, with no button', () => {
+test('the charge-level slider writes on release, without an extra save step', () => {
   assert.match(view, /slider\.addEventListener\("change"/);
   assert.match(view, /\/soc"/);
   assert.doesNotMatch(view, /Set current charge/);
-  assert.doesNotMatch(view, /createElement\("button"\)/);
+  assert.match(view, /confirmCar\.addEventListener\("click"/);
   // The refetch right after the write is what moves the plan on screen.
   assert.match(view, /Charge level saved:/);
   assert.match(view, /refreshEvModalAfterWrite\(\)/);

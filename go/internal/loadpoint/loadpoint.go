@@ -162,6 +162,9 @@ type State struct {
 	VehicleStale         bool    `json:"vehicle_stale,omitempty"`
 	VehicleSoCAgeS       int64   `json:"vehicle_soc_age_s,omitempty"`
 	SoCSource            string  `json:"soc_source,omitempty"`
+	// True only while the current level still equals a user's confirmation,
+	// before any additional delivered energy advances the estimate.
+	SoCConfirmedByUser bool `json:"soc_confirmed_by_user,omitempty"`
 	// VehicleName is the vehicle profile the session identified (via the
 	// charging transaction's idTag/idToken), empty when none matched.
 	VehicleName string `json:"vehicle_name,omitempty"`
@@ -428,7 +431,8 @@ type loadpointRuntime struct {
 
 	// socConfirmed is true only after a level from the user or a matched car.
 	// A configured/default plug-in level remains a planning assumption.
-	socConfirmed bool
+	socConfirmed         bool
+	socUserConfirmedAtWh *float64
 
 	// surplusWithheld is set by the controller each tick: true when WE
 	// are intentionally withholding power from this loadpoint (a
@@ -598,6 +602,7 @@ func (m *Manager) Load(cfgs []Config) {
 			lp.chargingDeclined = existing.chargingDeclined
 			lp.socConfirmed = existing.socConfirmed && existing.DriverName == c.DriverName
 			if existing.DriverName == c.DriverName {
+				lp.socUserConfirmedAtWh = existing.socUserConfirmedAtWh
 				lp.sessionDeviceID = existing.sessionDeviceID
 				lp.sessionID = existing.sessionID
 				lp.socRetention = existing.socRetention
@@ -757,6 +762,7 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 		}
 		lp.sessionPluginSoC = anchor
 		lp.socConfirmed = false
+		lp.socUserConfirmedAtWh = nil
 		lp.completionNotified = false
 		lp.deliveredHistory = nil
 		lp.notRequestingSince = time.Time{}
@@ -1080,6 +1086,8 @@ func (m *Manager) SetCurrentSoC(id string, socPct float64) bool {
 	lp.chargingDeclined = false
 	lp.notRequestingSince = time.Time{}
 	reanchorSoCLocked(lp, socPct)
+	confirmedWh := lp.deliveredWhSession
+	lp.socUserConfirmedAtWh = &confirmedWh
 	return true
 }
 
@@ -1213,6 +1221,7 @@ func reanchorSoCLocked(lp *loadpointRuntime, soc float64) {
 func reanchorSoCAtLocked(lp *loadpointRuntime, soc, deliveredWh float64) {
 	soc = units.ClampFraction(soc)
 	lp.socConfirmed = true
+	lp.socUserConfirmedAtWh = nil
 	// Re-anchor: new_anchor + delivered/capacity == soc.
 	delivered := 0.0
 	if lp.VehicleCapacityWh > 0 {
@@ -1239,6 +1248,7 @@ func (lp *loadpointRuntime) snapshot() State {
 		DriverName:               lp.DriverName,
 		PluggedIn:                lp.pluggedIn,
 		CurrentSoC:               lp.currentSoC,
+		SoCConfirmedByUser:       lp.pluggedIn && lp.socConfirmed && lp.socUserConfirmedAtWh != nil && lp.deliveredWhSession == *lp.socUserConfirmedAtWh,
 		CurrentPowerW:            lp.currentPowerW,
 		DeliveredWhSession:       lp.deliveredWhSession,
 		TargetSoC:                lp.targetSoC,

@@ -263,6 +263,8 @@ func scheduledUnlockTick(t *testing.T, cfg Config, budgetWh, batSoC, surplusW fl
 	}
 	samples := map[string]EVSample{cfg.DriverName: {Connected: true, PowerW: 0, RequestActive: true}}
 	c := newTestController(t, []Config{cfg}, dir, samples, sender)
+	c.manager.Observe(cfg.ID, true, 0, 0, true)
+	c.manager.SetCurrentSoC(cfg.ID, .5)
 	c.manager.SetSchedule(cfg.ID, Schedule{
 		SoC: 0.8, TimeOfDayMinUTC: 7 * 60, Recurring: true, SurplusUnlockBatSoC: 0.8,
 	})

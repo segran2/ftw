@@ -29,6 +29,8 @@ func TestStaleSiteMeterStopsScheduledChargeAndRecovers(t *testing.T) {
 		cfg.DriverName: {Connected: true, RequestActive: true},
 	}
 	c := newTestController(t, []Config{cfg}, directive, samples, sender)
+	c.manager.Observe(cfg.ID, true, 0, 0, true)
+	c.manager.SetCurrentSoC(cfg.ID, .5)
 	if !c.manager.SetSchedule(cfg.ID, Schedule{
 		SoC:             0.8,
 		TimeOfDayMinUTC: 13 * 60,

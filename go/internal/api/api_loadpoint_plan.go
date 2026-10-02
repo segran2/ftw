@@ -33,6 +33,9 @@ func (s *Server) decorateLoadpointsWithPlan(states []loadpoint.State) {
 	for i := range states {
 		states[i].PlanPending = snapshot.Pending
 		states[i].PlanOutdated = snapshot.Outdated
+		if !loadpoint.SoCConfirmedForPlan(states[i]) && !states[i].ManualActive && !states[i].SurplusOnly {
+			continue
+		}
 		if snapshot.Outdated {
 			continue
 		}

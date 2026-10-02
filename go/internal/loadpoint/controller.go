@@ -1559,6 +1559,11 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 				cmdReason = "vehicle_complete"
 			}
 		}
+		// An old plan must not dispatch from an unconfirmed plug-in guess.
+		// Explicit manual charging and PV-only charging do not use this estimate.
+		if st, ok := c.manager.State(lpCfg.ID); ok && sched.HasTarget() && !surplusOn && cmdReason != "pv_surplus" && !SoCConfirmedForPlan(st) {
+			cmdW, cmdReason = 0, "soc_confirmation_required"
+		}
 		// Fuse protection: applied LAST (after MPC budget, surplus
 		// clamp, wake-kick) so all upstream sources see their nominal
 		// wantW; only the actual ceiling we send to the wallbox is

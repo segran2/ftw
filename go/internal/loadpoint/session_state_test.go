@@ -210,3 +210,33 @@ func TestLegacySessionAnchorMigratesWithoutChangingConfirmedSoC(t *testing.T) {
 		t.Fatalf("post-confirmation loss missing: %v", s.CurrentSoC)
 	}
 }
+
+func TestUserSoCProvenanceSurvivesSameSessionAndEndsAfterDelivery(t *testing.T) {
+	store := &sessionMemory{data: map[string]string{}}
+	m := sessionManager(store, "garage", "charger")
+	m.ObserveSession("garage", true, 0, 9000, true, "easee:ABC", "connection-1")
+	m.SetCurrentSoC("garage", .86)
+	if st, _ := m.State("garage"); !st.SoCConfirmedByUser {
+		t.Fatal("manual level lost its source")
+	}
+	m = sessionManager(store, "garage", "charger")
+	m.ObserveSession("garage", true, 0, 9000, true, "easee:ABC", "connection-1")
+	if st, _ := m.State("garage"); !st.SoCConfirmedByUser {
+		t.Fatal("same-session restore lost user confirmation")
+	}
+	m.ObserveSession("garage", true, 0, 9600, true, "easee:ABC", "connection-1")
+	if st, _ := m.State("garage"); st.SoCConfirmedByUser {
+		t.Fatal("delivered-energy estimate still claims user confirmation")
+	}
+	m.SetCurrentSoC("garage", .87)
+	m.AnchorVehicleSoC("garage", .88)
+	if st, _ := m.State("garage"); st.SoCConfirmedByUser {
+		t.Fatal("vehicle anchor claims user confirmation")
+	}
+	m.SetCurrentSoC("garage", .88)
+	m.ObserveSession("garage", false, 0, 9600, true, "easee:ABC", "connection-1")
+	m.ObserveSession("garage", true, 0, 0, true, "easee:ABC", "connection-2")
+	if st, _ := m.State("garage"); st.SoCConfirmedByUser {
+		t.Fatal("new session reused user confirmation")
+	}
+}

@@ -3847,6 +3847,19 @@
     note.style.marginTop = "0.3rem";
     note.style.minHeight = "1em";
     socWrap.appendChild(note);
+    var confirmCar = document.createElement("button");
+    confirmCar.type = "button";
+    confirmCar.hidden = true;
+    socWrap.appendChild(confirmCar);
+    confirmCar.addEventListener("click", function () {
+      var reported = lastLp.vehicle_soc == null ? 0 : lastLp.vehicle_soc;
+      if (!lastLp.vehicle_driver || !lastLp.vehicle_stale || !isFinite(reported) || reported < 0 || reported > 1) return;
+      socRevision++;
+      socFailed = false;
+      socPending = Math.round(reported * 100);
+      note.textContent = "Confirming charge level: " + socPending + " %…";
+      sendSoc();
+    });
 
     box.appendChild(levels);
     box.appendChild(levelsNote);
@@ -3879,10 +3892,12 @@
         : lpNow.soc_retention === "error"
           ? " This level could not be saved for a box restart. Enter it again before relying on the plan after restarting."
           : " This level must be entered again after a box restart.";
-      if (src === "assumed") return "Battery level needs confirmation. The plan currently assumes " + Math.round(lpNow.current_soc * 100) + " %. Drag to match the car." + retention;
+      if (src === "assumed") return "Battery level needs confirmation. Scheduled charging waits until you confirm the level. Drag to match the car." + retention;
       if (src === "vehicle") return "The car reports its current level automatically.";
       if (src === "completed") return "The car stopped asking for charge. Its actual battery level is not confirmed. Drag to match the car.";
-      return "Estimated from energy delivered. Drag to the real value and the plan follows." + retention;
+      return (lpNow.soc_confirmed_by_user
+        ? "Confirmed by user. Drag to update the level and the plan follows."
+        : "Estimated from energy delivered. Drag to the real value and the plan follows.") + retention;
     }
 
     var socPending = null;
@@ -3958,7 +3973,11 @@
       levels.hidden = !lpNow.plugged_in;
       levelsNote.hidden = !lpNow.plugged_in;
       var plugged = !!(lpNow && lpNow.plugged_in);
-      socWrap.hidden = !plugged || !!(info && info.fromCar);
+      var oldCar = !!(info && info.fromCar && lpNow.vehicle_stale);
+      socWrap.hidden = !plugged || !!(info && info.fromCar && !oldCar);
+      confirmCar.hidden = !oldCar;
+      confirmCar.disabled = !!lpNow.read_unavailable || socSaving;
+      confirmCar.textContent = oldCar ? "Confirm " + Math.round((lpNow.vehicle_soc || 0) * 100) + " % matches the car now" : "";
       slider.disabled = !!lpNow.read_unavailable;
       if (!plugged) return;
       var cur = (lpNow.current_soc != null) ? Math.max(0, Math.min(100, Math.round(lpNow.current_soc * 100))) : null;

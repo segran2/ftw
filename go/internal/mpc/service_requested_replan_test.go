@@ -120,6 +120,9 @@ func TestFailedGoalReplanStopsOldEVAllocationButKeepsManualControl(t *testing.T)
 		}
 		return sent[len(sent)-1]
 	}
+	// Confirm the starting level for this session before scheduling.
+	ctrl.Tick(context.Background(), now)
+	mgr.SetCurrentSoC("garage", .5)
 	if got := tickPower(); got <= 0 {
 		t.Fatalf("initial plan did not charge: %v", got)
 	}

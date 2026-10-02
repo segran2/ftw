@@ -1649,6 +1649,9 @@ func main() {
 					socSource = "vehicle:" + pick.Driver
 					vehicleChargeLimit = pick.ChargeLimit
 				}
+				if socSource == "inferred" && !loadpoint.SoCConfirmedForPlan(st) {
+					continue
+				}
 				// Map target time → slot index using the DP's
 				// actual slot length (hour-of-prices vs. 15-min
 				// quarters vary by market). Both planners clamp a

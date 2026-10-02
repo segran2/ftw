@@ -144,3 +144,91 @@ test('mounted car view follows source changes and keeps the slider while editing
   view.slider.emit('pointerup'); view.update({...car,current_soc:.46},{});
   assert.equal(view.slider.value,'46');
 });
+
+
+test('unconfirmed plug-in level cannot expose cached charging windows', () => {
+ const lp = {...known, vehicle_soc: .87, vehicle_stale: true, vehicle_soc_age_s: 11817,
+ current_soc: .2, soc_source: 'assumed', schedule: {soc: .9}, plan_windows: windows};
+ const info = chargingLevels(lp);
+ assert.equal(info.now, '87%');
+ assert.match(info.source, /197 min old/);
+ assert.match(info.explanation, /Confirm/);
+ assert.doesNotMatch(info.explanation, /Planning from 20/);
+ assert.equal(chargingPlan(lp, now).windows.length, 0);
+ assert.match(chargingPlan(lp, now).message, /Confirm/);
+ assert.ok(chargingPlan({...lp, soc_source: 'inferred', current_soc: .86}, now).windows.length);
+});
+
+test('old car level can be confirmed and corrected without hiding the slider', async () => {
+ const source=readFileSync(new URL('./app.js',import.meta.url),'utf8');
+ const functions=source.slice(source.indexOf('function sliderHeader'),source.indexOf('function buildEvCapacityView'));
+ const writes=[];
+ const api=new Function('document','evPlanUI','buildEvCapacityView','renderEvPlanStatus','evWrite','refreshEvModalAfterWrite','setTimeout',functions+';return buildEvPlanView;')(
+ doc, Promise.resolve({chargingLevels,createChargingTimeline:()=>createChargingTimeline(doc)}),
+ ()=>({el:new Element('details'),update(){}}),()=>null,
+ async(url,opts)=>{writes.push(JSON.parse(opts.body));return {ok:true,json:async()=>({ok:true})};},async()=>{},()=>0);
+ const lp={...known,vehicle_soc:.86,vehicle_stale:true,vehicle_soc_age_s:11817,current_soc:.2,soc_source:'assumed'};
+ const view=api(lp,{}); await new Promise(r=>setImmediate(r));
+ assert.equal(view.slider.parentNode.hidden,false);
+ const button=descendants(view.el).find(el=>el.tag==='button' || el.textContent==='Confirm 86 % matches the car now');
+ assert.ok(button); assert.equal(button.hidden,false);
+ button.emit('click'); await new Promise(r=>setImmediate(r));
+ assert.equal(writes[0].soc,.86);
+ view.update({...lp,vehicle_stale:false,soc_source:'vehicle'},{});
+ assert.equal(button.hidden,true);
+});
+
+
+test('car timeline names the saved target and follows target changes', () => {
+ const view=createChargingTimeline(doc);
+ view.update({...car,schedule:{soc:.9},plan_windows:windows},{start:now});
+ assert.match(text(view.el),/FTW replans\. Car SoC target 90%/);
+ view.update({...car,schedule:{soc:.8},plan_windows:windows},{start:now});
+ assert.match(text(view.el),/Car SoC target 80%/);
+ assert.doesNotMatch(text(view.el),/Car SoC target 90%/);
+ view.update({...known,vehicle_stale:true,plan_windows:windows},{start:now});
+ assert.match(text(view.el),/Car target: car’s charge limit/);
+ assert.doesNotMatch(text(view.el),/Car SoC target 100%/);
+});
+
+test('car target stays visible without a charging plan when current SoC exceeds the goal', () => {
+ const view=createChargingTimeline(doc);
+ view.update({...car,current_soc:.86,schedule:{soc:.8},plan_windows:[]},{start:now});
+ const note=descendants(view.el).find(el=>el.tag==='small' && el.textContent==='Car SoC target 80% < actual SoC 86% (FTW estimate).');
+ assert.ok(note);
+ assert.equal(note.hidden,false);
+ assert.match(text(view.el),/No charging planned/);
+ assert.doesNotMatch(text(view.el),/Planned charging · times can change/);
+ view.update({...known,goal_complete:true,plan_windows:[]},{start:now});
+ assert.equal(note.hidden,false);
+ assert.equal(note.textContent,'Car SoC target 80% ≥ actual SoC 47% (From Car · Current).');
+ view.update({...car,schedule:{},target_soc:0,plan_windows:[]},{start:now});
+ assert.equal(note.hidden,true);
+});
+
+
+test('car target comparison follows fresh SoC, equality, old reports and unknown levels', () => {
+ const view=createChargingTimeline(doc);
+ const update=lp=>{view.update(lp,{start:now});return text(view.el);};
+ assert.match(update({...known,vehicle_soc:.86,schedule:{soc:.9}}),/Car SoC target 90% ≥ actual SoC 86%/);
+ assert.match(update({...known,vehicle_soc:.9,schedule:{soc:.9}}),/90% ≥ actual SoC 90%/);
+ assert.match(update({...known,vehicle_soc:.91,schedule:{soc:.9}}),/90% < actual SoC 91%/);
+ assert.match(update({...known,vehicle_soc:0,schedule:{soc:.9}}),/90% ≥ actual SoC 0%/);
+ assert.match(update({...known,vehicle_stale:true,vehicle_soc_age_s:3600,soc_source:'assumed',schedule:{soc:.9}}),/actual SoC 47% \(From Car · 60 min old\)/);
+ assert.match(update({...car,soc_source:'assumed',schedule:{soc:.9}}),/Car SoC target 90% · actual SoC unknown/);
+ assert.match(update({...known,vehicle_stale:true,current_soc:.86,soc_source:'inferred',schedule:{soc:.9}}),/90% ≥ actual SoC 86% \(FTW estimate\)/);
+});
+
+
+test('SoC comparison identifies a user-confirmed level, a fresh car report and later estimates', () => {
+ const view=createChargingTimeline(doc);
+ const lp={...car,current_soc:.86,schedule:{soc:.9},soc_confirmed_by_user:true};
+ assert.equal(chargingLevels(lp).source,'Confirmed by user');
+ view.update(lp,{start:now});
+ assert.match(text(view.el),/actual SoC 86% \(Confirmed by user\)/);
+ view.update({...lp,current_soc:.87,soc_confirmed_by_user:false},{start:now});
+ assert.match(text(view.el),/actual SoC 87% \(FTW estimate\)/);
+ view.update({...lp,vehicle_driver:'audi-vag',vehicle_soc:.86,vehicle_stale:false,soc_source:'vehicle'},{start:now});
+ assert.match(text(view.el),/actual SoC 86% \(From Car · Current\)/);
+ assert.doesNotMatch(text(view.el),/Confirmed by user/);
+});

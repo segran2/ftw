@@ -25,6 +25,7 @@ type savedSession struct {
 	SessionID          string    `json:"session_id"`
 	AnchorSoC          float64   `json:"anchor_soc"`
 	ConfirmedAtWh      float64   `json:"confirmed_at_wh"`
+	UserConfirmedAtWh  *float64  `json:"user_confirmed_at_wh,omitempty"`
 	CapacityWh         float64   `json:"capacity_wh"`
 	EstimatedWh        *float64  `json:"estimated_wh,omitempty"`
 	EstimatedAt        time.Time `json:"estimated_at,omitempty"`
@@ -132,6 +133,10 @@ func (m *Manager) ObserveSample(id string, sample EVSample) {
 		// a level. Keep that correction while joining the measured time line.
 		baseline := lp.energy.counterWh - lp.energy.integralAt(lp.energy.counterAt)
 		lp.sessionPluginSoC -= baseline * DefaultChargeEfficiency / lp.VehicleCapacityWh
+		if lp.socUserConfirmedAtWh != nil {
+			adjusted := *lp.socUserConfirmedAtWh + baseline
+			lp.socUserConfirmedAtWh = &adjusted
+		}
 	}
 	if changed {
 		lp.chargingPeriodSince = time.Time{}
@@ -194,6 +199,10 @@ func (m *Manager) ObserveSample(id string, sample EVSample) {
 		lp.sessionPluginSoC = restore.AnchorSoC
 		lp.currentSoC = estimateSoC(restore.AnchorSoC, deliveredWh, restore.CapacityWh)
 		lp.socConfirmed = true
+		lp.socUserConfirmedAtWh = nil
+		if restore.UserConfirmedAtWh != nil && finite(*restore.UserConfirmedAtWh) && *restore.UserConfirmedAtWh >= 0 && *restore.UserConfirmedAtWh <= deliveredWh {
+			lp.socUserConfirmedAtWh = restore.UserConfirmedAtWh
+		}
 		lp.completionNotified = restore.CompletionNotified
 		lp.socRetention = "session"
 	} else if !lp.socConfirmed || deviceID == "" || sessionID == "" || m.sessionStore == nil {
@@ -259,7 +268,8 @@ func (m *Manager) persistSession(id string) {
 	}
 	record := savedSession{Version: 2, DeviceID: lp.sessionDeviceID, SessionID: lp.sessionID,
 		AnchorSoC: lp.sessionPluginSoC, ConfirmedAtWh: lp.deliveredWhSession,
-		CapacityWh: lp.VehicleCapacityWh, CompletionNotified: lp.completionNotified}
+		UserConfirmedAtWh: lp.socUserConfirmedAtWh,
+		CapacityWh:        lp.VehicleCapacityWh, CompletionNotified: lp.completionNotified}
 	if lp.energy != nil && lp.energy.counterKnown {
 		record.ConfirmedAtWh = lp.energy.counterWh
 		if lp.deliveredWhSession > lp.energy.counterWh {
@@ -330,6 +340,7 @@ func (m *Manager) observeConnectionProof(id string, generation uint64, unknown b
 	m.nextSessionGeneration++
 	lp.sessionGeneration = m.nextSessionGeneration
 	lp.socConfirmed = false
+	lp.socUserConfirmedAtWh = nil
 	lp.socRetention = "unavailable"
 	if lp.vehicleName != "" || lp.capacityFromCar {
 		lp.VehicleCapacityWh = lp.baseCapacityWh

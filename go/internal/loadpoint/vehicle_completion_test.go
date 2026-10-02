@@ -32,6 +32,8 @@ func TestVehicleLimitCompletionKeepsChargingAndSafetyWins(t *testing.T) {
 	sender := &fakeSender{}
 	dir := &Directive{SlotStart: now.Add(-time.Second), SlotEnd: now.Add(time.Hour), LoadpointEnergyWh: map[string]float64{cfg.ID: 0}}
 	c := newTestController(t, []Config{cfg}, dir, samples, sender)
+	c.manager.Observe(cfg.ID, true, 0, 0, true)
+	c.manager.SetCurrentSoC(cfg.ID, 1)
 	c.manager.SetSchedule(cfg.ID, Schedule{FinishAtVehicleLimit: true, TimeOfDayMinUTC: 5 * 60, Recurring: true})
 	c.manager.RollSchedules(now)
 	c.SetSiteFuse(SiteFuse{MaxAmps: 16, Voltage: 230, PhaseCnt: 3})

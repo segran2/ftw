@@ -245,7 +245,7 @@ import {
     const soc = document.getElementById('overview-plan-soc');
     if (soc) {
       soc.hidden = !brief.soc;
-      soc.textContent = brief.soc ? `Expected charge · ${brief.soc.label}` : '';
+      soc.textContent = brief.soc ? `Home battery · ${brief.soc.label}` : '';
     }
   }
 
