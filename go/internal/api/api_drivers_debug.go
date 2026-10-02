@@ -267,6 +267,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	if displayName == "" {
 		displayName = filepath.Base(cfg.Lua)
 	}
+	secretOwner := displayName
 	testName := "__test_" + safeProbeName(displayName) + "_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	cfg.Name = testName
 	if cfg.BatteryCapacityWh <= 0 {
@@ -280,6 +281,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	reg.MQTTFactory = s.deps.DriverMQTTFactory
 	reg.ModbusFactory = s.deps.DriverModbusFactory
 	reg.ARPLookup = s.deps.DriverARPLookup
+	s.wireDriverProbeSecrets(reg, testName, secretOwner)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
@@ -318,6 +320,28 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+func driverSecretStateKey(driverName, key string) string {
+	return "driver_secret:" + driverName + ":" + key
+}
+
+func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName, secretOwner string) {
+	if s.deps.State == nil || strings.TrimSpace(secretOwner) == "" {
+		return
+	}
+	ownerFor := func(driverName string) string {
+		if driverName == probeName {
+			return secretOwner
+		}
+		return driverName
+	}
+	reg.SecretOverride = func(driverName, key string) (string, bool) {
+		return s.deps.State.LoadConfig(driverSecretStateKey(ownerFor(driverName), key))
+	}
+	reg.SecretPersister = func(driverName, key, value string) error {
+		return s.deps.State.SaveConfig(driverSecretStateKey(ownerFor(driverName), key), value)
 	}
 }
 
