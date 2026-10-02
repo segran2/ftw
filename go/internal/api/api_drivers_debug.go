@@ -390,7 +390,8 @@ func (s *Server) configuredProbeLoopbackHost(probe config.Driver) string {
 	}
 	current, ok := s.configuredDriver(probe.Name)
 	if !ok || current.Disabled || current.Lua == "" ||
-		filepath.Clean(current.Lua) != filepath.Clean(probe.Lua) {
+		filepath.Clean(current.Lua) != filepath.Clean(probe.Lua) ||
+		!sameProbeHTTPAllowlist(current.Capabilities.HTTP, probe.Capabilities.HTTP) {
 		return ""
 	}
 	savedURL, ok := current.Config["url"].(string)
@@ -407,6 +408,24 @@ func (s *Server) configuredProbeLoopbackHost(probe config.Driver) string {
 		return ""
 	}
 	return ip.String()
+}
+
+func sameProbeHTTPAllowlist(saved, probe *config.HTTPCapability) bool {
+	if (saved == nil) != (probe == nil) {
+		return false
+	}
+	if saved == nil {
+		return true
+	}
+	if len(saved.AllowedHosts) != len(probe.AllowedHosts) {
+		return false
+	}
+	for i := range saved.AllowedHosts {
+		if saved.AllowedHosts[i] != probe.AllowedHosts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func rejectUnsafeProbeHostOrConfiguredLoopback(host, allowedLoopbackHost string) error {
