@@ -265,6 +265,71 @@ func TestHandleDriverTestRestoresMaskedSecrets(t *testing.T) {
 	}
 }
 
+func TestConfiguredProbeLoopbackHostRequiresSameEnabledDriverAndURL(t *testing.T) {
+	driver := config.Driver{
+		Name: "audi-vag",
+		Lua:  "/var/lib/ftw/drivers/vw_merged.lua",
+		Config: map[string]any{
+			"url": "http://127.0.0.1:8787",
+		},
+	}
+	live := &config.Config{Drivers: []config.Driver{driver}}
+	srv := New(&Deps{Cfg: live})
+
+	if got := srv.configuredProbeLoopbackHost(driver); got != "127.0.0.1" {
+		t.Fatalf("configured loopback host = %q, want 127.0.0.1", got)
+	}
+
+	changed := driver
+	changed.Lua = "/var/lib/ftw/drivers/other.lua"
+	if got := srv.configuredProbeLoopbackHost(changed); got != "" {
+		t.Errorf("different Lua file was trusted: %q", got)
+	}
+	changed = driver
+	changed.Config = map[string]any{"url": "http://127.0.0.1:8080"}
+	if got := srv.configuredProbeLoopbackHost(changed); got != "" {
+		t.Errorf("changed URL was trusted: %q", got)
+	}
+	changed = driver
+	changed.Capabilities.HTTP = &config.HTTPCapability{AllowedHosts: []string{"127.0.0.1"}}
+	if got := srv.configuredProbeLoopbackHost(changed); got != "" {
+		t.Errorf("changed HTTP allowlist was trusted: %q", got)
+	}
+	live.Drivers[0].Disabled = true
+	if got := srv.configuredProbeLoopbackHost(driver); got != "" {
+		t.Errorf("disabled configured driver was trusted: %q", got)
+	}
+}
+
+func TestRejectUnsafeProbeTargetsAllowsOnlyConfiguredLoopbackException(t *testing.T) {
+	cfg := config.Driver{
+		Config: map[string]any{"url": "http://127.0.0.1:8787"},
+		Capabilities: config.Capabilities{
+			HTTP: &config.HTTPCapability{AllowedHosts: []string{"127.0.0.1:8787"}},
+		},
+	}
+	if err := rejectUnsafeProbeTargets(cfg, ""); err == nil {
+		t.Fatal("unconfigured loopback URL was accepted")
+	}
+	if err := rejectUnsafeProbeTargets(cfg, "127.0.0.1"); err != nil {
+		t.Fatalf("configured loopback URL was rejected: %v", err)
+	}
+
+	cfg.Config["url"] = "http://127.0.0.2:8787"
+	if err := rejectUnsafeProbeTargets(cfg, "127.0.0.1"); err == nil {
+		t.Fatal("different loopback URL was accepted")
+	}
+	cfg.Config["url"] = "http://169.254.169.254:8787"
+	if err := rejectUnsafeProbeTargets(cfg, "127.0.0.1"); err == nil {
+		t.Fatal("link-local URL was accepted by the loopback exception")
+	}
+	cfg.Config["url"] = "http://127.0.0.1:8787"
+	cfg.MQTT = &config.MQTTConfig{Host: "127.0.0.1"}
+	if err := rejectUnsafeProbeTargets(cfg, "127.0.0.1"); err == nil {
+		t.Fatal("loopback MQTT target was accepted by the HTTP URL exception")
+	}
+}
+
 func TestIsSensitiveKey(t *testing.T) {
 	sensitive := []string{
 		"password", "Password", "mqtt_password", "passwd", "client_secret",
