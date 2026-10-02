@@ -290,6 +290,11 @@ func TestConfiguredProbeLoopbackHostRequiresSameEnabledDriverAndURL(t *testing.T
 	if got := srv.configuredProbeLoopbackHost(changed); got != "" {
 		t.Errorf("changed URL was trusted: %q", got)
 	}
+	changed = driver
+	changed.Capabilities.HTTP = &config.HTTPCapability{AllowedHosts: []string{"127.0.0.1"}}
+	if got := srv.configuredProbeLoopbackHost(changed); got != "" {
+		t.Errorf("changed HTTP allowlist was trusted: %q", got)
+	}
 	live.Drivers[0].Disabled = true
 	if got := srv.configuredProbeLoopbackHost(driver); got != "" {
 		t.Errorf("disabled configured driver was trusted: %q", got)
