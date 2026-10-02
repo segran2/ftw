@@ -1,6 +1,10 @@
 package mpc
 
-import "github.com/srcfl/ftw/go/internal/loadpoint"
+import (
+	"math"
+
+	"github.com/srcfl/ftw/go/internal/loadpoint"
+)
 
 // LoadpointSpec tells the DP how to extend its state space with an EV
 // loadpoint. Set `Params.Loadpoint` to a non-nil spec to have the
@@ -131,6 +135,26 @@ func (l *LoadpointSpec) normalizedSteps() []float64 {
 
 // active reports whether the DP should include EV dimensions for
 // this spec. Nil or un-plugged = inactive; treat as pure battery.
+// requestSoC is the initial and target SoC sent to the optimizer, inside the
+// loadpoint's SoC bounds, and the upper bound itself.
+func (l *LoadpointSpec) requestSoC() (initial, target, maxSoC float64) {
+	minSoC, maxSoC := l.SoCMin, l.SoCMax
+	if maxSoC <= minSoC {
+		minSoC, maxSoC = 0, 1
+	}
+	return math.Max(minSoC, math.Min(maxSoC, l.InitialSoC)), math.Max(minSoC, math.Min(maxSoC, l.TargetSoC)), maxSoC
+}
+
+// deadlineSlot is the slot by whose end the target must be met in a horizon
+// of n slots: -1 without a target or deadline, and the last slot for a
+// deadline past the horizon, so a planner still works toward it.
+func (l *LoadpointSpec) deadlineSlot(n int) int {
+	if l.TargetSoC <= 0 || l.TargetSlotIdx < 0 || n <= 0 {
+		return -1
+	}
+	return min(l.TargetSlotIdx, n-1)
+}
+
 func (l *LoadpointSpec) active() bool {
 	return l != nil && l.PluggedIn && l.CapacityWh > 0 && l.Levels >= 2
 }
