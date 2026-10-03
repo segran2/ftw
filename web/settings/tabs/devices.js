@@ -1194,7 +1194,12 @@
             // vag_vehicle.lua and must be part of the row so the generic
             // connection probe receives it together with VIN and secrets.
             var vagBrand = String(vcfg.brand || '').toLowerCase();
-            html += '<fieldset><legend>Vehicle</legend>' +
+            var vagHasPassword = d.has_password === true ||
+              (typeof vcfg.password === 'string' && vcfg.password !== '');
+            var vagPasswordBadge = vagHasPassword
+              ? '<span class="creds-badge creds-saved">✓ Saved</span>'
+              : '<span class="creds-badge creds-missing">⚠ Not saved</span>';
+            html += '<fieldset><legend>VAG EU Data Act</legend>' +
               '<div class="field-row"><div>' +
               '<label>Brand ' + help('Brand account linked to this VIN on the VW Group EU Data Act portal.') + '</label>' +
               '<select data-path="drivers.' + idx + '.config.brand">' +
@@ -1208,6 +1213,17 @@
               '<label>VIN ' + help('Vehicle Identification Number registered to the selected brand account.') + '</label>' +
               '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="WAUZZZ…">' +
               '</div></div>' +
+              '<div class="field-row"><div>' +
+              '<label>Email ' + help('Email address for the selected VW Group brand account. VAG driver v0.2.0 and newer use it to renew the portal session automatically.') + '</label>' +
+              '<input type="email" autocomplete="username" data-path="drivers.' + idx + '.config.email" value="' + escHtml(vcfg.email || '') + '" placeholder="name@example.com">' +
+              '</div><div>' +
+              '<label>Password ' + vagPasswordBadge + ' ' + help('Stored as a masked driver secret. Leave empty to keep an already saved password. VAG driver v0.2.0 and newer use it for automatic re-login.') + '</label>' +
+              '<input type="password" autocomplete="current-password" data-path="drivers.' + idx + '.config.password" value="" placeholder="' +
+                (vagHasPassword ? '•••••••• (leave empty to keep)' : 'enter account password') + '">' +
+              '</div></div>' +
+              '<p style="color:var(--text-dim);font-size:0.75rem;margin:8px 0 0">' +
+              'VAG driver v0.2.0+ signs in again automatically when the portal session expires. A pasted Cookie is only a fallback for older Core/driver versions.' +
+              '</p>' +
               '</fieldset>';
           } else {
             // TeslaBLEProxy-style drivers only need the LAN IP of the
