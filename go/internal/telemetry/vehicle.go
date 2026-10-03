@@ -17,6 +17,12 @@ import (
 // would mean acting on a value that no longer reflects reality.
 const VehicleMaxAge = 5 * time.Minute
 
+// VehicleAnchorMaxAge bounds how old a car reading may be and still anchor
+// a loadpoint's SoC estimate. The loadpoint adds the energy delivered since
+// the reading, so age adds only metering error. Cloud sources such as the
+// VW Group portal report every 15 minutes.
+const VehicleAnchorMaxAge = time.Hour
+
 // VehiclePick is the "best matching" DerVehicle reading for a loadpoint:
 // the one most likely to be the car physically connected right now.
 // Empty Driver means "no usable reading" — the caller should fall back
@@ -77,7 +83,7 @@ func VehicleConnectedRank(chargingState string) int {
 // Lives in telemetry/ rather than api/ or cmd/ because both packages
 // need it and the dependency direction otherwise cycles.
 func PickBestVehicle(s *Store, now time.Time) VehiclePick {
-	return pickBestVehicle(s, 0, now, false)
+	return pickBestVehicle(s, 0, now, VehicleMaxAge, false)
 }
 
 // PickBestVehicleForLoadpoint adds connection-evidence gating: when
@@ -101,7 +107,17 @@ func PickBestVehicleForLoadpoint(s *Store, lpDeliveringPower bool, now time.Time
 		// loadpoint is at 11 kW is definitely not the connected one.
 		minRank = 3
 	}
-	return pickBestVehicle(s, minRank, now, false)
+	return pickBestVehicle(s, minRank, now, VehicleMaxAge, false)
+}
+
+// PickVehicleForAnchor applies the loadpoint gates with VehicleAnchorMaxAge.
+// Its SoC is a past observation: anchor it at UpdatedAt, never as now.
+func PickVehicleForAnchor(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
+	minRank := 0
+	if lpDeliveringPower {
+		minRank = 3
+	}
+	return pickBestVehicle(s, minRank, now, VehicleAnchorMaxAge, false)
 }
 
 // PickBestVehicleForDisplay retains an otherwise valid last-known vehicle
@@ -113,7 +129,7 @@ func PickBestVehicleForDisplay(s *Store, lpDeliveringPower bool, now time.Time) 
 	if lpDeliveringPower {
 		minRank = 3
 	}
-	return pickBestVehicle(s, minRank, now, true)
+	return pickBestVehicle(s, minRank, now, VehicleMaxAge, true)
 }
 
 // PickVehicleForCompletion requires one vehicle source. Rank and freshness
@@ -123,10 +139,10 @@ func PickVehicleForCompletion(s *Store, now time.Time) VehiclePick {
 	if s == nil || len(s.ReadingsByType(DerVehicle)) != 1 {
 		return VehiclePick{}
 	}
-	return pickBestVehicle(s, 1, now, false)
+	return pickBestVehicle(s, 1, now, VehicleMaxAge, false)
 }
 
-func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) VehiclePick {
+func pickBestVehicle(s *Store, minRank int, now time.Time, maxAge time.Duration, allowAgeStale bool) VehiclePick {
 	if s == nil {
 		return VehiclePick{}
 	}
@@ -152,8 +168,8 @@ func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) V
 		if socUpdatedAt.IsZero() {
 			continue
 		}
-		ageStale := now.Sub(socUpdatedAt) > VehicleMaxAge
-		if ageStale && !allowAgeStale {
+		age := now.Sub(socUpdatedAt)
+		if age > maxAge && !allowAgeStale {
 			// Reading is older than we're willing to trust as ground
 			// truth — driver probably stopped publishing. Skip rather
 			// than risk acting on a stale SoC.
@@ -185,7 +201,7 @@ func pickBestVehicle(s *Store, minRank int, now time.Time, allowAgeStale bool) V
 			SoC:           soc,
 			ChargeLimit:   limit,
 			ChargingState: meta.ChargingState,
-			Stale:         ageStale || meta.Stale || cachedDisplay,
+			Stale:         age > VehicleMaxAge || meta.Stale || cachedDisplay,
 			UpdatedAt:     socUpdatedAt,
 		}
 		bestRank = rank
