@@ -116,6 +116,64 @@ func HardwareEnergyAssetID(deviceID string, kind EnergyAssetKind) string {
 	return energyAssetID(deviceID, kind)
 }
 
+// SeedEnergyCursorsFromDeviceAlias carries cumulative-counter state from a
+// weaker identity (for example mac:...) to a newly confirmed hardware identity
+// (for example vendor:serial). Existing target cursors always win, making the
+// operation idempotent and preventing a late alias from rewinding live state.
+// Historical ledger entries stay on their original asset IDs; only the cursor
+// continuity needed to recover the next counter gap is transferred.
+func (s *Store) SeedEnergyCursorsFromDeviceAlias(fromDeviceID, toDeviceID string) (int64, error) {
+	fromDeviceID = strings.TrimSpace(fromDeviceID)
+	toDeviceID = strings.TrimSpace(toDeviceID)
+	if fromDeviceID == "" || toDeviceID == "" || fromDeviceID == toDeviceID {
+		return 0, nil
+	}
+	tx, err := s.history.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT asset_id, kind FROM energy_assets WHERE device_id = ?`, fromDeviceID)
+	if err != nil {
+		return 0, err
+	}
+	type aliasAsset struct {
+		assetID string
+		kind EnergyAssetKind
+	}
+	var assets []aliasAsset
+	for rows.Next() {
+		var a aliasAsset
+		if err := rows.Scan(&a.assetID, &a.kind); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		assets = append(assets, a)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	var seeded int64
+	for _, a := range assets {
+		toAssetID := HardwareEnergyAssetID(toDeviceID, a.kind)
+		result, err := tx.Exec(`INSERT OR IGNORE INTO energy_ledger_cursors(asset_id, flow, cursor_kind, value, ts_ms)
+			SELECT ?, flow, cursor_kind, value, ts_ms
+			FROM energy_ledger_cursors WHERE asset_id = ?`, toAssetID, a.assetID)
+		if err != nil {
+			return 0, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		seeded += n
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return seeded, nil
+}
+
 func validEnergyFlow(flow EnergyFlow) bool {
 	switch flow {
 	case FlowGridImport, FlowGridExport, FlowBatteryCharge, FlowBatteryDischarge,
