@@ -1186,24 +1186,48 @@
         var isCloudDriver = !isVehicleDriver && !isApiCredsDriver && cap.http != null && !hasHostField &&
           (hasAuthField || Object.keys(dcfg).length === 0);
         if (isVehicleDriver) {
-          // TeslaBLEProxy-style drivers only need the LAN IP of the
-          // proxy and the VIN it's paired to. "Verify connection"
-          // makes the backend issue a one-shot vehicle_data poll so
-          // the operator can confirm pairing before saving.
           var vcfg = d.config || {};
-          html += '<fieldset><legend>Vehicle</legend>' +
-            '<div class="field-row"><div>' +
-            '<label>Proxy IP ' + help('LAN address of the TeslaBLEProxy. Bare IP uses port 8080; append ":port" to override (e.g. 192.168.1.50:1234).') + '</label>' +
-            '<input type="text" class="tesla-ip-input" data-driver-idx="' + idx + '" data-path="drivers.' + idx + '.config.ip" value="' + escHtml(vcfg.ip || '') + '" placeholder="192.168.1.50 (or 192.168.1.50:1234)">' +
-            '</div><div>' +
-            '<label>VIN ' + help('Vehicle Identification Number the proxy is paired to.') + '</label>' +
-            '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="5YJ3E1EA1KF000000">' +
-            '</div></div>' +
-            '<div style="margin-top:8px;display:flex;gap:10px;align-items:center">' +
-            '<button class="btn-add tesla-verify-btn" type="button" data-driver-idx="' + idx + '">Verify connection</button>' +
-            '<span class="tesla-verify-status" data-driver-idx="' + idx + '" style="font-size:0.82rem;color:var(--text-dim)"></span>' +
-            '</div>' +
-            '</fieldset>';
+          var isVAGVehicle = (d.lua || '').indexOf('vag_vehicle.lua') >= 0;
+          if (isVAGVehicle) {
+            // VAG EU Data Act is a cloud vehicle driver, not a
+            // TeslaBLEProxy-style LAN driver. Brand is required by
+            // vag_vehicle.lua and must be part of the row so the generic
+            // connection probe receives it together with VIN and secrets.
+            var vagBrand = String(vcfg.brand || '').toLowerCase();
+            html += '<fieldset><legend>Vehicle</legend>' +
+              '<div class="field-row"><div>' +
+              '<label>Brand ' + help('Brand account linked to this VIN on the VW Group EU Data Act portal.') + '</label>' +
+              '<select data-path="drivers.' + idx + '.config.brand">' +
+              '<option value=""' + (!vagBrand ? ' selected' : '') + '>Choose brand…</option>' +
+              ['audi', 'volkswagen', 'skoda', 'seat', 'cupra'].map(function (brand) {
+                var labels = { audi: 'Audi', volkswagen: 'Volkswagen', skoda: 'Škoda', seat: 'SEAT', cupra: 'Cupra' };
+                return '<option value="' + brand + '"' + (vagBrand === brand ? ' selected' : '') + '>' + labels[brand] + '</option>';
+              }).join('') +
+              '</select>' +
+              '</div><div>' +
+              '<label>VIN ' + help('Vehicle Identification Number registered to the selected brand account.') + '</label>' +
+              '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="WAUZZZ…">' +
+              '</div></div>' +
+              '</fieldset>';
+          } else {
+            // TeslaBLEProxy-style drivers only need the LAN IP of the
+            // proxy and the VIN it's paired to. "Verify connection"
+            // makes the backend issue a one-shot vehicle_data poll so
+            // the operator can confirm pairing before saving.
+            html += '<fieldset><legend>Vehicle</legend>' +
+              '<div class="field-row"><div>' +
+              '<label>Proxy IP ' + help('LAN address of the TeslaBLEProxy. Bare IP uses port 8080; append ":port" to override (e.g. 192.168.1.50:1234).') + '</label>' +
+              '<input type="text" class="tesla-ip-input" data-driver-idx="' + idx + '" data-path="drivers.' + idx + '.config.ip" value="' + escHtml(vcfg.ip || '') + '" placeholder="192.168.1.50 (or 192.168.1.50:1234)">' +
+              '</div><div>' +
+              '<label>VIN ' + help('Vehicle Identification Number the proxy is paired to.') + '</label>' +
+              '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="5YJ3E1EA1KF000000">' +
+              '</div></div>' +
+              '<div style="margin-top:8px;display:flex;gap:10px;align-items:center">' +
+              '<button class="btn-add tesla-verify-btn" type="button" data-driver-idx="' + idx + '">Verify connection</button>' +
+              '<span class="tesla-verify-status" data-driver-idx="' + idx + '" style="font-size:0.82rem;color:var(--text-dim)"></span>' +
+              '</div>' +
+              '</fieldset>';
+          }
         }
         if (isLocalHTTP) {
           var lcfg = d.config || {};
