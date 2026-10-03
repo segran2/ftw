@@ -131,3 +131,59 @@ func TestStartupAliasCannotReplayCountersWhileRawHistoryKeepsWriting(t *testing.
 		}
 	}
 }
+
+func TestSerialRefinementSeedsMacEnergyCursorAndRecoversGap(t *testing.T) {
+	st, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	mac := state.Device{DriverName: "meter", Make: "Pixii", MAC: "aa:bb:cc:dd:ee:ff", Endpoint: "modbus://site"}
+	if _, err := st.RegisterDevice(mac); err != nil {
+		t.Fatal(err)
+	}
+	oldAt := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	oldCounter := 1000.0
+	macAsset := state.HardwareEnergyAssetID("mac:aabbccddeeff", state.AssetGridMeter)
+	if err := st.EnqueueTelemetryTick(nil, nil, []state.EnergyObservation{{
+		AssetID: macAsset, DeviceID: "mac:aabbccddeeff", AssetKind: state.AssetGridMeter,
+		Flow: state.FlowGridImport, AtMs: oldAt.UnixMilli(), CounterWh: &oldCounter,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FlushHistory(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	serial := state.Device{DriverName: "meter", Make: "Pixii", Serial: "235101100376", MAC: mac.MAC, Endpoint: mac.Endpoint}
+	if alias := energyCursorAlias(serial, st.CachedDevices()); alias != "mac:aabbccddeeff" {
+		t.Fatalf("alias = %q, want MAC identity", alias)
+	}
+	if _, err := st.SeedEnergyCursorsFromDeviceAlias("mac:aabbccddeeff", "pixii:235101100376"); err != nil {
+		t.Fatal(err)
+	}
+	newCounter := 1600.0
+	newAt := oldAt.Add(24 * time.Hour)
+	serialAsset := state.HardwareEnergyAssetID("pixii:235101100376", state.AssetGridMeter)
+	if err := st.EnqueueTelemetryTick(nil, nil, []state.EnergyObservation{{
+		AssetID: serialAsset, DeviceID: "pixii:235101100376", AssetKind: state.AssetGridMeter,
+		Flow: state.FlowGridImport, AtMs: newAt.UnixMilli(), CounterWh: &newCounter,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FlushHistory(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := oldAt.UnixMilli() / state.EnergyLedgerBucketMS * state.EnergyLedgerBucketMS
+	points, _, err := st.LoadEnergyHistory(state.EnergyHistoryQuery{AssetID: serialAsset, SinceMS: start, UntilMS: newAt.Add(time.Minute).UnixMilli(), BucketMS: state.EnergyLedgerBucketMS, Limit: 400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total float64
+	for _, point := range points {
+		total += point.EnergyWh
+	}
+	if total < 599.999 || total > 600.001 {
+		t.Fatalf("recovered serial energy = %g Wh, want 600 Wh", total)
+	}
+}
