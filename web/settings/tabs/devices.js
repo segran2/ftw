@@ -1189,6 +1189,18 @@
           var vcfg = d.config || {};
           var isVAGVehicle = (d.lua || '').indexOf('vag_vehicle.lua') >= 0;
           if (isVAGVehicle) {
+            // Existing VAG configs can predate catalog http_hosts and therefore
+            // carry capabilities.http.allowed_hosts=[] (or no allowlist at all).
+            // host.http_request deliberately refuses that, so hydrate the
+            // driver's signed catalog allowlist before Save/Test connection.
+            // Never derive these cloud hosts from operator input.
+            var vagHTTPHosts = (catalogEntry && catalogEntry.http_hosts) || [];
+            d.capabilities = d.capabilities || {};
+            d.capabilities.http = d.capabilities.http || {};
+            if (vagHTTPHosts.length > 0) {
+              d.capabilities.http.allowed_hosts = vagHTTPHosts.slice();
+            }
+
             // VAG EU Data Act is a cloud vehicle driver, not a
             // TeslaBLEProxy-style LAN driver. Brand is required by
             // vag_vehicle.lua and must be part of the row so the generic
