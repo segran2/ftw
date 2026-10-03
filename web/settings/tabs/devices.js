@@ -1794,6 +1794,16 @@
               return k !== 'client_secret' && k !== 'refresh_token';
             });
           }
+          // VAG v0.2.0+ renders email/password in its dedicated fieldset.
+          // Cookie is retained in config as a legacy fallback for older
+          // Core/driver versions, but it is not part of the normal UI.
+          // Do not delete or overwrite an already saved cookie here.
+          var isVAG = (d.lua || '').indexOf('vag_vehicle.lua') >= 0 ||
+            !!(entry && entry.id === 'vag_vehicle');
+          if (isVAG) {
+            secrets = secrets.filter(function (k) { return k !== 'cookie'; });
+          }
+
           // Cloud credentials already render config.password. A second
           // Secrets field bound to the same path (Easee, Zaptec) saves
           // whichever input is read last and shows the wrong hint.
