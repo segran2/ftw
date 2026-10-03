@@ -1187,7 +1187,12 @@
           (hasAuthField || Object.keys(dcfg).length === 0);
         if (isVehicleDriver) {
           var vcfg = d.config || {};
-          var isVAGVehicle = (d.lua || '').indexOf('vag_vehicle.lua') >= 0;
+          // Match both the configured logical path and the catalog entry.
+          // Repository-installed drivers may use a versioned/managed path, so
+          // filename-only detection can misclassify VAG as TeslaBLEProxy and
+          // render Proxy IP while hiding the VAG email fieldset.
+          var isVAGVehicle = (d.lua || '').indexOf('vag_vehicle.lua') >= 0 ||
+            !!(catalogEntry && catalogEntry.id === 'vag_vehicle');
           if (isVAGVehicle) {
             // Existing VAG configs can predate catalog http_hosts and therefore
             // carry capabilities.http.allowed_hosts=[] (or no allowlist at all).
