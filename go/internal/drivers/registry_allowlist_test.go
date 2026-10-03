@@ -1,6 +1,9 @@
 package drivers
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -152,6 +155,82 @@ func TestTcpAllowedHostsFor(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("tcpAllowedHostsFor() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+
+// A cloud driver owns its fixed network boundary in DRIVER.http_hosts.
+// Existing configs may predate that metadata and therefore carry an empty
+// capabilities.http.allowed_hosts. Both ordinary startup and connection
+// probes must hydrate the same driver-declared hosts before Lua starts.
+func TestRegistryHydratesHTTPHostsFromDriverMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cloud.lua")
+	src := `DRIVER = {
+  id = "cloud",
+  name = "Cloud",
+  read_only = true,
+  protocols = { "http" },
+  capabilities = { "vehicle" },
+  http_hosts = { "api.example.test", " identity.example.test ", "api.example.test" },
+}
+function driver_init(config)
+  local r, err = host.http_request{url = "https://not-declared.invalid/data"}
+  assert(r == nil, "unexpected request")
+  assert(err and err:find("not in allowed_hosts", 1, true),
+    "driver-declared allowlist was not installed: " .. tostring(err))
+end
+function driver_poll() return 60000 end
+`
+	if err := os.WriteFile(path, []byte(src), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		add  func(*Registry, context.Context, config.Driver) error
+		stop func(*Registry, string)
+	}{
+		{
+			name: "startup",
+			add: func(r *Registry, ctx context.Context, cfg config.Driver) error {
+				return r.Add(ctx, cfg)
+			},
+			stop: func(r *Registry, name string) { r.Remove(name) },
+		},
+		{
+			name: "probe",
+			add: func(r *Registry, ctx context.Context, cfg config.Driver) error {
+				return r.AddProbe(ctx, cfg)
+			},
+			stop: func(r *Registry, name string) { r.RemoveProbe(name) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRegistry(nil)
+			cfg := config.Driver{
+				Name: "cloud-" + tc.name,
+				Lua:  path,
+				Capabilities: config.Capabilities{
+					HTTP: &config.HTTPCapability{},
+				},
+			}
+			if err := tc.add(r, context.Background(), cfg); err != nil {
+				t.Fatalf("add with DRIVER.http_hosts: %v", err)
+			}
+			t.Cleanup(func() { tc.stop(r, cfg.Name) })
+
+			r.mu.Lock()
+			rd := r.rec[cfg.Name]
+			r.mu.Unlock()
+			if rd == nil {
+				t.Fatal("driver was not registered")
+			}
+			want := []string{"api.example.test", "identity.example.test"}
+			if !reflect.DeepEqual(rd.env.HTTPAllowedHosts, want) {
+				t.Fatalf("HTTPAllowedHosts = %v, want %v", rd.env.HTTPAllowedHosts, want)
 			}
 		})
 	}
