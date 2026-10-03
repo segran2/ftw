@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/srcfl/ftw/go/internal/config"
+	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
 func TestMergeAllowedHosts(t *testing.T) {
@@ -209,7 +210,7 @@ function driver_poll() return 60000 end
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := NewRegistry(nil)
+			r := NewRegistry(telemetry.NewStore())
 			cfg := config.Driver{
 				Name: "cloud-" + tc.name,
 				Lua:  path,
