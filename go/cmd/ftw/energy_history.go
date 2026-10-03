@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log/slog"
 	"math"
 
 	"github.com/srcfl/ftw/go/internal/state"
@@ -15,6 +16,32 @@ type energyIdentityLookup func(string) state.Device
 // A known serial must be confirmed by the running driver before a weaker
 // alias can write counters again. Another MAC or a newly reported serial is
 // a replacement, not evidence that it owns the old device's counter history.
+// energyCursorAlias returns a weaker identity that belongs to the same hardware
+// and may safely seed ledger cursors when the live driver learns a serial.
+// A prior different serial on the same MAC is a replacement and must never
+// inherit the old counter state.
+func energyCursorAlias(current state.Device, known []state.Device) string {
+	strongID := state.ResolveDeviceID(current.Make, current.Serial, "", "")
+	macID := state.ResolveDeviceID("", "", current.MAC, "")
+	if strongID == "" || macID == "" {
+		return ""
+	}
+	for _, previous := range known {
+		previousStrong := state.ResolveDeviceID(previous.Make, previous.Serial, "", "")
+		previousMAC := state.ResolveDeviceID("", "", previous.MAC, "")
+		if previousStrong != "" && previousStrong != strongID && previousMAC == macID {
+			return ""
+		}
+	}
+	for _, previous := range known {
+		if state.ResolveDeviceID(previous.Make, previous.Serial, "", "") == "" &&
+			state.ResolveDeviceID("", "", previous.MAC, "") == macID {
+			return macID
+		}
+	}
+	return ""
+}
+
 func confirmedEnergyDeviceID(current state.Device, known []state.Device) string {
 	id := state.ResolveDeviceID(current.Make, current.Serial, current.MAC, current.Endpoint)
 	if id == "" || state.ResolveDeviceID(current.Make, current.Serial, "", "") != "" {
@@ -62,7 +89,13 @@ func buildEnergyObservations(st *state.Store, tel *telemetry.Store, ctrl tickPer
 	asset := func(driver string, kind state.EnergyAssetKind) (string, string, bool) {
 		id, resolved := ids[driver]
 		if !resolved && identity != nil {
-			id = confirmedEnergyDeviceID(identity(driver), known)
+			current := identity(driver)
+			id = confirmedEnergyDeviceID(current, known)
+			if alias := energyCursorAlias(current, known); id != "" && alias != "" && alias != id {
+				if _, err := st.SeedEnergyCursorsFromDeviceAlias(alias, id); err != nil {
+					slog.Warn("energy cursor identity migration failed", "driver", driver, "from", alias, "to", id, "err", err)
+				}
+			}
 			ids[driver] = id
 		}
 		if id == "" {
