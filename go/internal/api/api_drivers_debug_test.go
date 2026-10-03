@@ -353,6 +353,141 @@ function driver_cleanup() end
 	}
 }
 
+func writeOAuthProbeLua(t *testing.T, dir, name string) string {
+	t.Helper()
+	luaPath := filepath.Join(dir, name)
+	luaSrc := `
+function driver_init(config)
+    host.set_poll_interval(50)
+    local token = ""
+    if config and config.refresh_token then
+        token = config.refresh_token
+    end
+    host.emit_metric("token_" .. token, 1)
+    host.persist_secret("refresh_token", "rotated-" .. token)
+end
+function driver_poll() end
+function driver_command() end
+function driver_default_mode() end
+function driver_cleanup() end
+`
+	if err := os.WriteFile(luaPath, []byte(luaSrc), 0o644); err != nil {
+		t.Fatalf("write lua: %v", err)
+	}
+	return luaPath
+}
+
+func metricToken(resp driverProbeResp) string {
+	const prefix = "token_"
+	for _, m := range resp.Metrics {
+		if strings.HasPrefix(m.Name, prefix) && m.Value == 1 {
+			return strings.TrimPrefix(m.Name, prefix)
+		}
+	}
+	return ""
+}
+
+func TestHandleDriverTestDoesNotShareSecretsWithDifferentLua(t *testing.T) {
+	dir := t.TempDir()
+	liveLua := writeOAuthProbeLua(t, dir, "myuplink.lua")
+	otherLua := writeOAuthProbeLua(t, dir, "other.lua")
+	st, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.SaveConfig(driverSecretStateKey("myuplink", "refresh_token"), "fresh-token"); err != nil {
+		t.Fatalf("save secret override: %v", err)
+	}
+
+	live := &config.Config{Drivers: []config.Driver{{
+		Name:   "myuplink",
+		Lua:    liveLua,
+		Config: map[string]any{"refresh_token": "stale-token"},
+	}}}
+	srv := New(&Deps{
+		Cfg:        live,
+		CfgMu:      &sync.RWMutex{},
+		ConfigPath: filepath.Join(dir, "config.yaml"),
+		State:      st,
+	})
+	body, _ := json.Marshal(map[string]any{
+		"name":   "myuplink",
+		"lua":    otherLua,
+		"config": map[string]any{"refresh_token": "stale-token"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/drivers/test", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp driverProbeResp
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, rr.Body.String())
+	}
+	if !resp.OK {
+		t.Fatalf("probe.ok = false, error=%q (body=%s)", resp.Error, rr.Body.String())
+	}
+	if got := metricToken(resp); got != "stale-token" {
+		t.Fatalf("used token = %q, want posted stale-token, not the live driver's override", got)
+	}
+	if got, ok := st.LoadConfig(driverSecretStateKey("myuplink", "refresh_token")); !ok || got != "fresh-token" {
+		t.Fatalf("live secret = %q ok=%v, want unchanged fresh-token", got, ok)
+	}
+}
+
+func TestHandleDriverTestKeepsExplicitReauthToken(t *testing.T) {
+	dir := t.TempDir()
+	luaPath := writeOAuthProbeLua(t, dir, "oauth_probe.lua")
+	st, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.SaveConfig(driverSecretStateKey("myuplink", "refresh_token"), "fresh-token"); err != nil {
+		t.Fatalf("save secret override: %v", err)
+	}
+
+	live := &config.Config{Drivers: []config.Driver{{
+		Name:   "myuplink",
+		Lua:    luaPath,
+		Config: map[string]any{"refresh_token": "stale-token"},
+	}}}
+	srv := New(&Deps{
+		Cfg:        live,
+		CfgMu:      &sync.RWMutex{},
+		ConfigPath: filepath.Join(dir, "config.yaml"),
+		State:      st,
+	})
+	body, _ := json.Marshal(map[string]any{
+		"name":   "myuplink",
+		"lua":    luaPath,
+		"config": map[string]any{"refresh_token": "new-account-token"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/drivers/test", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp driverProbeResp
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, rr.Body.String())
+	}
+	if !resp.OK {
+		t.Fatalf("probe.ok = false, error=%q (body=%s)", resp.Error, rr.Body.String())
+	}
+	if got := metricToken(resp); got != "new-account-token" {
+		t.Fatalf("used token = %q, want explicit new-account-token", got)
+	}
+	if got, ok := st.LoadConfig(driverSecretStateKey("myuplink", "refresh_token")); !ok || got != "fresh-token" {
+		t.Fatalf("live secret = %q ok=%v, want unchanged fresh-token", got, ok)
+	}
+}
+
 func TestConfiguredProbeLoopbackHostRequiresSameEnabledDriverAndURL(t *testing.T) {
 	driver := config.Driver{
 		Name: "audi-vag",

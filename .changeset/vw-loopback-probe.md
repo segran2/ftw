@@ -2,4 +2,4 @@
 "ftw": patch
 ---
 
-Allow Test connection to use the exact loopback URL already saved for an enabled driver.
+Let Test connection reuse the saved driver's OAuth tokens and its exact loopback URL.

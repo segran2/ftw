@@ -267,7 +267,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	if displayName == "" {
 		displayName = filepath.Base(cfg.Lua)
 	}
-	secretOwner := displayName
+	probe := cfg
 	testName := "__test_" + safeProbeName(displayName) + "_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	cfg.Name = testName
 	if cfg.BatteryCapacityWh <= 0 {
@@ -281,7 +281,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	reg.MQTTFactory = s.deps.DriverMQTTFactory
 	reg.ModbusFactory = s.deps.DriverModbusFactory
 	reg.ARPLookup = s.deps.DriverARPLookup
-	s.wireDriverProbeSecrets(reg, testName, secretOwner)
+	s.wireDriverProbeSecrets(reg, testName, probe)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
@@ -327,10 +327,51 @@ func driverSecretStateKey(driverName, key string) string {
 	return "driver_secret:" + driverName + ":" + key
 }
 
-func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName, secretOwner string) {
-	if s.deps.State == nil || strings.TrimSpace(secretOwner) == "" {
+func (s *Server) sameConfiguredProbeDriver(probe config.Driver) (config.Driver, bool) {
+	if strings.TrimSpace(probe.Name) == "" || strings.TrimSpace(probe.Lua) == "" {
+		return config.Driver{}, false
+	}
+	current, ok := s.configuredDriver(probe.Name)
+	if !ok || current.Lua == "" ||
+		filepath.Clean(current.Lua) != filepath.Clean(probe.Lua) {
+		return config.Driver{}, false
+	}
+	return current, true
+}
+
+func probeConfigSecret(cfg config.Driver, key string) (string, bool) {
+	if cfg.Config == nil {
+		return "", false
+	}
+	raw, ok := cfg.Config[key].(string)
+	if !ok {
+		return "", false
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" || value == maskedPlaceholder {
+		return "", false
+	}
+	return value, true
+}
+
+func probePostedDifferentSecret(probe, live config.Driver, key string) bool {
+	posted, ok := probeConfigSecret(probe, key)
+	if !ok {
+		return false
+	}
+	saved, _ := probeConfigSecret(live, key)
+	return posted != saved
+}
+
+func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string, probe config.Driver) {
+	if s.deps.State == nil {
 		return
 	}
+	live, ok := s.sameConfiguredProbeDriver(probe)
+	if !ok {
+		return
+	}
+	secretOwner := live.Name
 	ownerFor := func(driverName string) string {
 		if driverName == probeName {
 			return secretOwner
@@ -338,9 +379,15 @@ func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName, secret
 		return driverName
 	}
 	reg.SecretOverride = func(driverName, key string) (string, bool) {
+		if driverName == probeName && probePostedDifferentSecret(probe, live, key) {
+			return "", false
+		}
 		return s.deps.State.LoadConfig(driverSecretStateKey(ownerFor(driverName), key))
 	}
 	reg.SecretPersister = func(driverName, key, value string) error {
+		if driverName == probeName && probePostedDifferentSecret(probe, live, key) {
+			return nil
+		}
 		return s.deps.State.SaveConfig(driverSecretStateKey(ownerFor(driverName), key), value)
 	}
 }
