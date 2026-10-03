@@ -16,3 +16,11 @@ test("every add path scrolls the new device into view and focuses a connection f
   const calls = source.match(/revealAddedDevice\(/g) || [];
   assert.ok(calls.length >= 4, "catalog, mqtt and modbus adds must reveal the new card");
 });
+
+
+test("VAG vehicle renders brand instead of Tesla proxy configuration", () => {
+  assert.match(source, /isVAGVehicle = \(d\.lua \|\| ''\)\.indexOf\('vag_vehicle\.lua'\) >= 0/);
+  assert.match(source, /data-path="drivers\.' \+ idx \+ '\.config\.brand"/);
+  assert.match(source, /\['audi', 'volkswagen', 'skoda', 'seat', 'cupra'\]/);
+  assert.match(source, /if \(isVAGVehicle\)/);
+});
