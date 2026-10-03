@@ -2240,6 +2240,26 @@
           ctx.captureCurrentTab();
           var driver = config.drivers && config.drivers[dIdx];
           if (!driver) return;
+
+          // Authorization-code drivers such as MyUplink cannot be probed until
+          // the one-time OAuth consent has produced a refresh token. Treat
+          // "Test connection" as the next setup action instead of running a
+          // probe that is guaranteed to fail: start the existing Connect flow.
+          var oauthConnectBtn = bodyEl.querySelector('.myuplink-connect-btn[data-driver-idx="' + dIdx + '"]');
+          var refreshToken = driver.config && driver.config.refresh_token;
+          if (oauthConnectBtn && (typeof refreshToken !== "string" || refreshToken === "")) {
+            if (statusEl) {
+              statusEl.textContent = "Authorization required";
+              statusEl.className = "driver-test-status";
+            }
+            if (outputEl) {
+              outputEl.hidden = false;
+              outputEl.innerHTML = '<div class="driver-test-empty">Connect to MyUplink and sign in before the connection can be tested.</div>';
+            }
+            oauthConnectBtn.click();
+            return;
+          }
+
           if (statusEl) {
             statusEl.textContent = "Testing...";
             statusEl.className = "driver-test-status";
