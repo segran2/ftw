@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/config"
@@ -281,11 +283,23 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	reg.MQTTFactory = s.deps.DriverMQTTFactory
 	reg.ModbusFactory = s.deps.DriverModbusFactory
 	reg.ARPLookup = s.deps.DriverARPLookup
-	s.wireDriverProbeSecrets(reg, testName, probe)
+	probeChangedSharedSecret := s.wireDriverProbeSecrets(reg, testName, probe)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
 	started := time.Now()
+	probeAdded := false
+	defer func() {
+		if probeAdded {
+			reg.RemoveProbe(cfg.Name)
+		}
+		if !probeChangedSharedSecret() || s.deps.Registry == nil {
+			return
+		}
+		if err := s.deps.Registry.RestartByName(context.Background(), probe.Name); err != nil {
+			slog.Warn("driver probe secret changed but restart failed", "driver", probe.Name, "err", err)
+		}
+	}()
 	if err := reg.AddProbe(ctx, cfg); err != nil {
 		writeJSON(w, 200, driverProbeResp{
 			Name:      displayName,
@@ -295,7 +309,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer reg.RemoveProbe(cfg.Name)
+	probeAdded = true
 
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -363,13 +377,20 @@ func probePostedDifferentSecret(probe, live config.Driver, key string) bool {
 	return posted != saved
 }
 
-func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string, probe config.Driver) {
+func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string, probe config.Driver) func() bool {
+	var mu sync.Mutex
+	changed := false
+	changedSharedSecret := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return changed
+	}
 	if s.deps.State == nil {
-		return
+		return changedSharedSecret
 	}
 	live, ok := s.sameConfiguredProbeDriver(probe)
 	if !ok {
-		return
+		return changedSharedSecret
 	}
 	secretOwner := live.Name
 	ownerFor := func(driverName string) string {
@@ -388,8 +409,22 @@ func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string,
 		if driverName == probeName && probePostedDifferentSecret(probe, live, key) {
 			return nil
 		}
-		return s.deps.State.SaveConfig(driverSecretStateKey(ownerFor(driverName), key), value)
+		owner := ownerFor(driverName)
+		stateKey := driverSecretStateKey(owner, key)
+		if old, ok := s.deps.State.LoadConfig(stateKey); ok && old == value {
+			return nil
+		}
+		if err := s.deps.State.SaveConfig(stateKey, value); err != nil {
+			return err
+		}
+		if driverName == probeName && owner == secretOwner {
+			mu.Lock()
+			changed = true
+			mu.Unlock()
+		}
+		return nil
 	}
+	return changedSharedSecret
 }
 
 // rejectUnsafeProbeTargets checks every host a driver test might dial:

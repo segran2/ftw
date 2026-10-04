@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +12,9 @@ import (
 	"testing"
 
 	"github.com/srcfl/ftw/go/internal/config"
+	"github.com/srcfl/ftw/go/internal/drivers"
 	"github.com/srcfl/ftw/go/internal/state"
+	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
 // /api/drivers/test handler-level coverage. The probe path runs a real
@@ -589,5 +592,186 @@ func TestRedactDumpLog(t *testing.T) {
 	}
 	if !strings.Contains(got, "poll ok") {
 		t.Errorf("redactDumpLog dropped benign text: %q", got)
+	}
+}
+
+func writeProbeRestartLua(t *testing.T, dir string) string {
+	t.Helper()
+	luaPath := filepath.Join(dir, "probe_restart.lua")
+	luaSrc := `
+function driver_init(config)
+    host.set_poll_interval(50)
+    if config and config.rotate_secret then
+        host.persist_secret("refresh_token", config.persist_value)
+    end
+end
+function driver_poll() end
+function driver_command() end
+function driver_default_mode() end
+function driver_cleanup() end
+`
+	if err := os.WriteFile(luaPath, []byte(luaSrc), 0o644); err != nil {
+		t.Fatalf("write lua: %v", err)
+	}
+	return luaPath
+}
+
+func TestHandleDriverTestRestartsRunningDriverAfterRefreshTokenRotation(t *testing.T) {
+	dir := t.TempDir()
+	luaPath := writeProbeRestartLua(t, dir)
+
+	st, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const secretKey = "refresh_token"
+	if err := st.SaveConfig(driverSecretStateKey("myuplink", secretKey), "fresh-token"); err != nil {
+		t.Fatalf("save secret: %v", err)
+	}
+
+	tel := telemetry.NewStore()
+	reg := drivers.NewRegistry(tel)
+	reg.SecretOverride = func(driverName, key string) (string, bool) {
+		return st.LoadConfig(driverSecretStateKey(driverName, key))
+	}
+	reg.SecretPersister = func(driverName, key, value string) error {
+		return st.SaveConfig(driverSecretStateKey(driverName, key), value)
+	}
+	t.Cleanup(reg.ShutdownAll)
+
+	liveDriver := config.Driver{
+		Name: "myuplink",
+		Lua:  luaPath,
+		Config: map[string]any{
+			"refresh_token": "stale-token",
+		},
+	}
+	if err := reg.Add(context.Background(), liveDriver); err != nil {
+		t.Fatalf("add live driver: %v", err)
+	}
+
+	before, ok := reg.ControlStatus("myuplink")
+	if !ok {
+		t.Fatal("live driver missing before probe")
+	}
+
+	live := &config.Config{Drivers: []config.Driver{liveDriver}}
+	srv := New(&Deps{
+		Cfg:        live,
+		CfgMu:      &sync.RWMutex{},
+		ConfigPath: filepath.Join(dir, "config.yaml"),
+		State:      st,
+		Registry:   reg,
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"name": "myuplink",
+		"lua":  luaPath,
+		"config": map[string]any{
+			"refresh_token": "stale-token",
+			"rotate_secret": true,
+			"persist_value": "rotated-token",
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/drivers/test", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+
+	if got, ok := st.LoadConfig(driverSecretStateKey("myuplink", secretKey)); !ok || got != "rotated-token" {
+		t.Fatalf("persisted secret = %q ok=%v, want rotated-token", got, ok)
+	}
+
+	after, ok := reg.ControlStatus("myuplink")
+	if !ok {
+		t.Fatal("live driver missing after probe")
+	}
+	if after.Generation <= before.Generation {
+		t.Fatalf("generation = %d after probe, want greater than %d after rotated shared secret",
+			after.Generation, before.Generation)
+	}
+}
+
+func TestHandleDriverTestDoesNotRestartRunningDriverWhenSecretUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	luaPath := writeProbeRestartLua(t, dir)
+
+	st, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const secretKey = "refresh_token"
+	if err := st.SaveConfig(driverSecretStateKey("myuplink", secretKey), "same-token"); err != nil {
+		t.Fatalf("save secret: %v", err)
+	}
+
+	tel := telemetry.NewStore()
+	reg := drivers.NewRegistry(tel)
+	reg.SecretOverride = func(driverName, key string) (string, bool) {
+		return st.LoadConfig(driverSecretStateKey(driverName, key))
+	}
+	reg.SecretPersister = func(driverName, key, value string) error {
+		return st.SaveConfig(driverSecretStateKey(driverName, key), value)
+	}
+	t.Cleanup(reg.ShutdownAll)
+
+	liveDriver := config.Driver{
+		Name: "myuplink",
+		Lua:  luaPath,
+		Config: map[string]any{
+			"refresh_token": "stale-token",
+		},
+	}
+	if err := reg.Add(context.Background(), liveDriver); err != nil {
+		t.Fatalf("add live driver: %v", err)
+	}
+
+	before, ok := reg.ControlStatus("myuplink")
+	if !ok {
+		t.Fatal("live driver missing before probe")
+	}
+
+	live := &config.Config{Drivers: []config.Driver{liveDriver}}
+	srv := New(&Deps{
+		Cfg:        live,
+		CfgMu:      &sync.RWMutex{},
+		ConfigPath: filepath.Join(dir, "config.yaml"),
+		State:      st,
+		Registry:   reg,
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"name": "myuplink",
+		"lua":  luaPath,
+		"config": map[string]any{
+			"refresh_token": "stale-token",
+			"rotate_secret": true,
+			"persist_value": "same-token",
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/drivers/test", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+
+	after, ok := reg.ControlStatus("myuplink")
+	if !ok {
+		t.Fatal("live driver missing after probe")
+	}
+	if after.Generation != before.Generation {
+		t.Fatalf("generation changed from %d to %d even though shared secret was unchanged",
+			before.Generation, after.Generation)
 	}
 }
