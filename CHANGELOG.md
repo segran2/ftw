@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.139.4
+
+### Patch Changes
+
+- 695f899: Fix VAG EU Data Act setup and automatic sign-in by hydrating driver-declared HTTP hosts in Core, and show the VAG brand, VIN, email, and password fields without proxy or legacy cookie controls.
+- 1853d67: Phones can save household planner preferences over the session. `planner.prefs.set` stores the forecast safety factor and whether the battery may sell, and the box maps that permission to a planner mode. Each write sends only the preference it changes, so another client's stored choice stays in place.
+
 ## 0.139.3
 
 ### Patch Changes
