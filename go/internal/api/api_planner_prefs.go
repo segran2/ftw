@@ -171,12 +171,19 @@ func (s *Server) applyPlannerPrefsLocked(safetyK float64, export config.BatteryE
 // ApplyPlannerPrefs is the session door into the same write POST
 // /api/planner/prefs performs. The mapped mode in the snapshot is this
 // server's answer; the caller does not choose it.
-func (s *Server) ApplyPlannerPrefs(safetyK float64, export string) (appproto.PlannerPrefsSnapshot, error) {
-	exp, ok := config.ParseBatteryExport(export)
-	if !ok {
-		return appproto.PlannerPrefsSnapshot{}, errors.New("battery_export must be unknown, not_allowed, or allowed")
+func (s *Server) ApplyPlannerPrefs(safetyK *float64, export *string) (appproto.PlannerPrefsSnapshot, error) {
+	if safetyK == nil && export == nil {
+		return appproto.PlannerPrefsSnapshot{}, errors.New("send safety_k or battery_export")
 	}
-	if err := s.applyPlannerPrefs(safetyK, exp); err != nil {
+	var exp *config.BatteryExport
+	if export != nil {
+		parsed, ok := config.ParseBatteryExport(*export)
+		if !ok {
+			return appproto.PlannerPrefsSnapshot{}, errors.New("battery_export must be unknown, not_allowed, or allowed")
+		}
+		exp = &parsed
+	}
+	if _, err := s.applyPlannerChange(safetyK, exp); err != nil {
 		return appproto.PlannerPrefsSnapshot{}, err
 	}
 	_, got, k, mapped := s.plannerPrefsSnapshot()

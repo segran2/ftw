@@ -194,7 +194,7 @@ type PlannerPrefsSnapshot struct {
 // permission through the same write POST /api/planner/prefs performs.
 // Nil answers E_UNAVAILABLE.
 type PlannerPrefs interface {
-	Apply(safetyK float64, export string) (PlannerPrefsSnapshot, error)
+	Apply(safetyK *float64, export *string) (PlannerPrefsSnapshot, error)
 }
 
 // PlanReader hands over the planner's current output.

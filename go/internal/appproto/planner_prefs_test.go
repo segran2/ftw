@@ -17,15 +17,19 @@ type memPrefs struct {
 	err    error
 }
 
-func (m *memPrefs) Apply(k float64, export string) (PlannerPrefsSnapshot, error) {
+func (m *memPrefs) Apply(k *float64, export *string) (PlannerPrefsSnapshot, error) {
 	m.calls++
 	if m.err != nil {
 		return PlannerPrefsSnapshot{}, m.err
 	}
-	m.k = config.ClampSafetyK(k)
-	m.export = export
-	mapped := config.BatteryExport(export).PlannerModeKey()
-	return PlannerPrefsSnapshot{SafetyK: m.k, Export: export, MappedMode: mapped}, nil
+	if k != nil {
+		m.k = config.ClampSafetyK(*k)
+	}
+	if export != nil {
+		m.export = *export
+	}
+	mapped := config.BatteryExport(m.export).PlannerModeKey()
+	return PlannerPrefsSnapshot{SafetyK: m.k, Export: m.export, MappedMode: mapped}, nil
 }
 
 func cmdPlannerPrefs(k float64, export string) Cmd {
@@ -103,5 +107,49 @@ func TestPlannerPrefsSetReportsWhenTheWriteFails(t *testing.T) {
 	}
 	if mem.calls != 1 {
 		t.Fatalf("calls = %d, want the one attempt", mem.calls)
+	}
+}
+
+func TestPlannerPrefsSetChangesOnePreference(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		args       map[string]any
+		wantK      float64
+		wantExport string
+	}{
+		{"style keeps export", map[string]any{"safety_k": 0.15}, 0.15, "allowed"},
+		{"export keeps margin", map[string]any{"battery_export": "not_allowed"}, 0.6, "not_allowed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := &memPrefs{k: 0.6, export: "allowed"}
+			h, _, rec, _ := newRigWith(t, mem)
+			subscribe(t, h, rec)
+			rec.reset()
+			cmd := cmdPlannerPrefs(0, "")
+			cmd.Args = tc.args
+			deliver(t, h, MsgCmd, nil, cmd)
+			res := body[CmdResult](t, rec.only(t, MsgCmdResult))
+			if res.State != CmdApplied || mem.k != tc.wantK || mem.export != tc.wantExport {
+				t.Fatalf("result=%+v stored=%+v", res, mem)
+			}
+		})
+	}
+}
+
+func TestPlannerPrefsSetRejectsEmptyOrInvalidChanges(t *testing.T) {
+	for _, args := range []map[string]any{
+		{}, {"safety_k": "bold"}, {"safety_k": nil}, {"battery_export": nil},
+	} {
+		mem := &memPrefs{k: 0.3, export: "not_allowed"}
+		h, _, rec, _ := newRigWith(t, mem)
+		subscribe(t, h, rec)
+		rec.reset()
+		cmd := cmdPlannerPrefs(0, "")
+		cmd.Args = args
+		deliver(t, h, MsgCmd, nil, cmd)
+		res := body[CmdResult](t, rec.only(t, MsgCmdResult))
+		if res.State != CmdRejected || mem.calls != 0 {
+			t.Fatalf("args=%v result=%+v calls=%d", args, res, mem.calls)
+		}
 	}
 }

@@ -22,13 +22,27 @@ func (h *Handler) setPlannerPrefs(cmd Cmd, uptimeMs int64) error {
 		})
 	}
 
-	k, ok := argNum(cmd.Args, "safety_k")
-	if !ok {
-		return h.rejectArg(cmd, "safety_k", cmd.Args["safety_k"])
+	var k *float64
+	if _, present := cmd.Args["safety_k"]; present {
+		value, ok := argNum(cmd.Args, "safety_k")
+		if !ok {
+			return h.rejectArg(cmd, "safety_k", cmd.Args["safety_k"])
+		}
+		k = &value
 	}
-	export, _ := cmd.Args["battery_export"].(string)
-	if _, ok := config.ParseBatteryExport(export); !ok {
-		return h.rejectArg(cmd, "battery_export", cmd.Args["battery_export"])
+	var export *string
+	if raw, present := cmd.Args["battery_export"]; present {
+		value, ok := raw.(string)
+		if !ok {
+			return h.rejectArg(cmd, "battery_export", raw)
+		}
+		if _, ok := config.ParseBatteryExport(value); !ok {
+			return h.rejectArg(cmd, "battery_export", raw)
+		}
+		export = &value
+	}
+	if k == nil && export == nil {
+		return h.rejectArg(cmd, "safety_k", nil)
 	}
 
 	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {

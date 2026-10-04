@@ -668,7 +668,7 @@ func (l *lateAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Apply stores planner prefs through the API server, once it exists.
 // Until then the command is refused: the session is up a moment before the
 // server is bound, and a write in that window has nowhere to land.
-func (l *lateAPI) Apply(safetyK float64, export string) (appproto.PlannerPrefsSnapshot, error) {
+func (l *lateAPI) Apply(safetyK *float64, export *string) (appproto.PlannerPrefsSnapshot, error) {
 	srv := l.srv.Load()
 	if srv == nil {
 		return appproto.PlannerPrefsSnapshot{}, errors.New("the box is still starting")

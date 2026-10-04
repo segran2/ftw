@@ -230,7 +230,8 @@ func TestPlannerPrefsCommandIsTheActuateDoor(t *testing.T) {
 	if facts.CmdOp != appproto.OpPlannerPrefsSet {
 		t.Fatalf("cmd op = %q, want %s", facts.CmdOp, appproto.OpPlannerPrefsSet)
 	}
-	snap, err := srv.ApplyPlannerPrefs(0.4, "allowed")
+	k, export := 0.4, "allowed"
+	snap, err := srv.ApplyPlannerPrefs(&k, &export)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,5 +240,30 @@ func TestPlannerPrefsCommandIsTheActuateDoor(t *testing.T) {
 	}
 	if ctrl.Mode != control.ModePlannerArbitrage {
 		t.Fatalf("mode = %q, want planner_arbitrage", ctrl.Mode)
+	}
+}
+
+func TestPlannerPrefsCommandKeepsTheOtherPreference(t *testing.T) {
+	for _, mode := range []control.Mode{control.ModePlannerPassiveArbitrage, control.ModeSelfConsumption} {
+		t.Run(string(mode), func(t *testing.T) {
+			srv, ctrl, _ := plannerPrefsServer(t, mode)
+			k, export := 0.6, "allowed"
+			if _, err := srv.ApplyPlannerPrefs(&k, &export); err != nil {
+				t.Fatal(err)
+			}
+			k = 0.15
+			snap, err := srv.ApplyPlannerPrefs(&k, nil)
+			if err != nil || snap.Export != "allowed" || snap.SafetyK != 0.15 {
+				t.Fatalf("style change: snapshot=%+v err=%v", snap, err)
+			}
+			export = "not_allowed"
+			snap, err = srv.ApplyPlannerPrefs(nil, &export)
+			if err != nil || snap.SafetyK != 0.15 || snap.Export != "not_allowed" {
+				t.Fatalf("export change: snapshot=%+v err=%v", snap, err)
+			}
+			if mode == control.ModeSelfConsumption && ctrl.Mode != mode {
+				t.Fatalf("preference write left manual mode: %s", ctrl.Mode)
+			}
+		})
 	}
 }
