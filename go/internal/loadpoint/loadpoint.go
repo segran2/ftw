@@ -160,6 +160,7 @@ type State struct {
 	VehicleChargingState string  `json:"vehicle_charging_state,omitempty"`
 	VehicleDriver        string  `json:"vehicle_driver,omitempty"`
 	VehicleStale         bool    `json:"vehicle_stale,omitempty"`
+	VehicleSoCAgeS       int64   `json:"vehicle_soc_age_s,omitempty"`
 	SoCSource            string  `json:"soc_source,omitempty"`
 	// VehicleName is the vehicle profile the session identified (via the
 	// charging transaction's idTag/idToken), empty when none matched.
@@ -359,11 +360,14 @@ type loadpointRuntime struct {
 	completionNotified       bool
 	Config
 
-	pluggedIn                bool
-	connectionObservedAt     time.Time
-	currentSoC               float64
-	currentPowerW            float64
-	deliveredWhSession       float64
+	pluggedIn            bool
+	connectionObservedAt time.Time
+	currentSoC           float64
+	currentPowerW        float64
+	deliveredWhSession   float64
+	// deliveredHistory samples deliveredWhSession during the session, so
+	// a car reading can be anchored at the time it was measured.
+	deliveredHistory         []deliveredSample
 	finishAtVehicleLimit     bool
 	finishGoalCompleted      bool
 	finishGoalSavedCompleted bool
@@ -568,6 +572,7 @@ func (m *Manager) Load(cfgs []Config) {
 			lp.currentSoC = existing.currentSoC
 			lp.currentPowerW = existing.currentPowerW
 			lp.deliveredWhSession = existing.deliveredWhSession
+			lp.deliveredHistory = existing.deliveredHistory
 			lp.energy = existing.energy
 			lp.powerAt = existing.powerAt
 			lp.powerWindow = existing.powerWindow
@@ -700,32 +705,8 @@ func (m *Manager) Configs() []Config {
 	return out
 }
 
-// Observe updates the measurement side of a loadpoint from raw driver
-// telemetry. The manager derives current SoC internally from the
-// session's plug-in anchor + delivered energy (chargers like Easee
-// don't report the vehicle's actual SoC).
-//
-// Plug-in transitions (prev !pluggedIn → now pluggedIn) reset the
-// session anchor to Config.PluginSoC (default 20 %) so the
-// inference is stable across plug cycles even if the underlying
-// charger's session counter wraps or resets.
-//
-// requestActive expresses whether the vehicle is (or could imminently
-// be) drawing current. Drivers that can distinguish "we throttled to 0"
-// from "the vehicle has explicitly stopped requesting current" pass
-// false on the latter; drivers without that distinction always pass
-// true and pre-existing behaviour is preserved. After
-// SessionCompletionTimeout of sustained !requestActive on a connected
-// session, charging_declined tells the planner to stop allocating energy.
-// This never changes the battery level or claims that its target was reached.
-//
-// No-op for unknown IDs — a misconfigured driver shouldn't crash the
-// manager.
-// SetSurplusWithheld records whether the controller is intentionally
-// withholding power from this loadpoint this tick (a surplus_only pause below
-// the 3-phase floor). When true, the next Observe treats a "not requesting
-// current" report as self-induced and does not advance the session-completion
-// timer. No-op for an unknown id.
+// SetSurplusWithheld marks a surplus pause the controller chose.
+// Observe then ignores "not requesting" for the completion timer.
 func (m *Manager) SetSurplusWithheld(id string, withheld bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -734,6 +715,12 @@ func (m *Manager) SetSurplusWithheld(id string, withheld bool) {
 	}
 }
 
+// Observe updates one loadpoint from charger telemetry. SoC is inferred
+// from the plug-in anchor plus delivered Wh, because the charger does not
+// read the pack. A new plug resets that anchor to Config.PluginSoC.
+// requestActive false means the car stopped asking, not that we throttled
+// it. After SessionCompletionTimeout the planner stops allocating.
+// That does not mark the target reached. Unknown ids are ignored.
 func (m *Manager) Observe(id string, pluggedIn bool, powerW, deliveredWh float64, requestActive bool) {
 	m.ObserveSession(id, pluggedIn, powerW, deliveredWh, requestActive, "", "")
 }
@@ -771,6 +758,7 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 		lp.sessionPluginSoC = anchor
 		lp.socConfirmed = false
 		lp.completionNotified = false
+		lp.deliveredHistory = nil
 		lp.notRequestingSince = time.Time{}
 		lp.chargingDeclined = false
 	}
@@ -790,6 +778,11 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 	lp.pluggedIn = pluggedIn
 	lp.currentPowerW = powerW
 	lp.deliveredWhSession = deliveredWh
+	if pluggedIn {
+		lp.recordDelivered(now, deliveredWh)
+	} else {
+		lp.deliveredHistory = nil
+	}
 
 	if pluggedIn && powerW >= DeliveringW {
 		// Measured energy delivery is stronger evidence than a delayed
@@ -1090,26 +1083,19 @@ func (m *Manager) SetCurrentSoC(id string, socPct float64) bool {
 	return true
 }
 
-// AnchorVehicleSoC re-anchors the inferred SoC to a trusted vehicle BMS
-// reading. It is the automatic counterpart to the operator's manual
-// SetCurrentSoC: the control loop calls it every tick with the SoC from
-// the vehicle driver paired to this loadpoint (e.g. Tesla via
-// TeslaBLEProxy), so the dashboard's current_soc and the planner's
-// InitialSoC both reflect BMS ground truth instead of the
-// delivered-Wh estimate, which is blind to the real pack (Easee and
-// other chargers can't read the car).
-//
-// Caller is responsible for the trust gate — only call with a reading
-// that is online, fresh, and matched to this loadpoint
-// (telemetry.PickBestVehicleForLoadpoint enforces this). Re-anchoring
-// every tick keeps current_soc locked to the latest BMS value; between
-// refreshes the inference advances from the last anchor on delivered Wh,
-// and if the vehicle goes BLE-silent (caller stops anchoring) the
-// estimate continues from the last known BMS truth rather than snapping
-// back to the plug-in guess.
-//
-// Returns false for unknown IDs or when the loadpoint is unplugged.
+// AnchorVehicleSoC sets inferred SoC from a fresh BMS reading the caller
+// already matched to this loadpoint. Between readings, delivered Wh
+// moves the anchor. If anchoring stops, the last BMS value stays.
+// False when the id is unknown or the car is unplugged.
 func (m *Manager) AnchorVehicleSoC(id string, socPct float64) bool {
+	return m.AnchorVehicleSoCAt(id, socPct, time.Time{})
+}
+
+// AnchorVehicleSoCAt anchors a car reading at the time the car measured
+// it. Energy delivered since then moves the estimate past the reading, so
+// a cloud SoC that is half an hour old stays useful. A zero observedAt
+// means now. False when the session's energy at observedAt is unknown.
+func (m *Manager) AnchorVehicleSoCAt(id string, socPct float64, observedAt time.Time) bool {
 	m.sessionMu.Lock()
 	m.mu.Lock()
 	var completion *events.ChargingSessionComplete
@@ -1129,12 +1115,88 @@ func (m *Manager) AnchorVehicleSoC(id string, socPct float64) bool {
 	if !lp.pluggedIn || !finite(socPct) || socPct < 0 || socPct > 1 {
 		return false
 	}
-	if lp.targetSoC > 0 && socPct >= lp.targetSoC && !lp.completionNotified {
+	deliveredAt := lp.deliveredWhSession
+	if !observedAt.IsZero() {
+		// A reading from before plug-in may predate a drive home.
+		if observedAt.Before(lp.connectionObservedAt.Add(-anchorBeforePlugSlack)) {
+			return false
+		}
+		var ok bool
+		if deliveredAt, ok = lp.deliveredAt(observedAt); !ok {
+			return false
+		}
+	}
+	reanchorSoCAtLocked(lp, socPct, deliveredAt)
+	if lp.targetSoC > 0 && lp.currentSoC >= lp.targetSoC && !lp.completionNotified {
 		lp.completionNotified = true
 		completion = &events.ChargingSessionComplete{LoadpointID: id, KWh: lp.deliveredWhSession / 1000, At: m.now()}
 	}
-	reanchorSoCLocked(lp, socPct)
 	return true
+}
+
+type deliveredSample struct {
+	at time.Time
+	wh float64
+}
+
+const (
+	// deliveredHistoryKeep bounds how old a car reading may be and still
+	// be anchored. Telemetry's VehicleAnchorMaxAge stays within it.
+	deliveredHistoryKeep = 2 * time.Hour
+	deliveredHistoryStep = 30 * time.Second
+	// anchorBeforePlugSlack accepts a reading taken just before plug-in,
+	// as live car drivers report a moment before the charger does.
+	anchorBeforePlugSlack = 5 * time.Minute
+)
+
+// recordDelivered appends at most one sample per step and drops samples
+// older than deliveredHistoryKeep. A counter that goes backwards starts a
+// new history, since earlier samples no longer share its origin.
+func (lp *loadpointRuntime) recordDelivered(now time.Time, wh float64) {
+	h := lp.deliveredHistory
+	if n := len(h); n > 0 {
+		last := h[n-1]
+		if wh < last.wh || now.Before(last.at) {
+			h = h[:0]
+		} else if now.Sub(last.at) < deliveredHistoryStep {
+			return
+		}
+	}
+	h = append(h, deliveredSample{at: now, wh: wh})
+	cut := 0
+	for cut < len(h)-1 && now.Sub(h[cut+1].at) >= deliveredHistoryKeep {
+		cut++
+	}
+	if cut > 0 {
+		h = append(h[:0], h[cut:]...)
+	}
+	lp.deliveredHistory = h
+}
+
+// deliveredAt returns the session energy at t, interpolated between
+// samples. Before the first sample the energy is known only if that
+// sample is still zero: nothing had been delivered yet.
+func (lp *loadpointRuntime) deliveredAt(t time.Time) (float64, bool) {
+	h := lp.deliveredHistory
+	if len(h) == 0 {
+		return 0, false
+	}
+	if t.Before(h[0].at) {
+		return h[0].wh, h[0].wh == 0
+	}
+	last := h[len(h)-1]
+	if !t.Before(last.at) {
+		return lp.deliveredWhSession, true
+	}
+	for i := 1; i < len(h); i++ {
+		if t.After(h[i].at) {
+			continue
+		}
+		a, b := h[i-1], h[i]
+		f := float64(t.Sub(a.at)) / float64(b.at.Sub(a.at))
+		return a.wh + f*(b.wh-a.wh), true
+	}
+	return lp.deliveredWhSession, true
 }
 
 // reanchorSoCLocked re-bases the session anchor so the CURRENT estimate
@@ -1143,12 +1205,18 @@ func (m *Manager) AnchorVehicleSoC(id string, socPct float64) bool {
 // manual (SetCurrentSoC) and automatic (AnchorVehicleSoC) correction
 // paths so they stay arithmetically identical.
 func reanchorSoCLocked(lp *loadpointRuntime, soc float64) {
+	reanchorSoCAtLocked(lp, soc, lp.deliveredWhSession)
+}
+
+// reanchorSoCAtLocked sets the anchor so the estimate equals soc when the
+// session had delivered deliveredWh.
+func reanchorSoCAtLocked(lp *loadpointRuntime, soc, deliveredWh float64) {
 	soc = units.ClampFraction(soc)
 	lp.socConfirmed = true
 	// Re-anchor: new_anchor + delivered/capacity == soc.
 	delivered := 0.0
 	if lp.VehicleCapacityWh > 0 {
-		delivered = lp.deliveredWhSession * DefaultChargeEfficiency / lp.VehicleCapacityWh
+		delivered = deliveredWh * DefaultChargeEfficiency / lp.VehicleCapacityWh
 	}
 	// The offset may be negative when the corrected level is below the
 	// energy already delivered. Clamp the resulting level, not the offset.

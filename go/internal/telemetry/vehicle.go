@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"encoding/json"
+	"math"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/units"
@@ -15,6 +16,12 @@ import (
 // vendors whose backends only refresh on a 60–120 s cadence; looser
 // would mean acting on a value that no longer reflects reality.
 const VehicleMaxAge = 5 * time.Minute
+
+// VehicleAnchorMaxAge bounds how old a car reading may be and still anchor
+// a loadpoint's SoC estimate. The loadpoint adds the energy delivered since
+// the reading, so age adds only metering error. Cloud sources such as the
+// VW Group portal report every 15 minutes.
+const VehicleAnchorMaxAge = time.Hour
 
 // VehiclePick is the "best matching" DerVehicle reading for a loadpoint:
 // the one most likely to be the car physically connected right now.
@@ -76,7 +83,7 @@ func VehicleConnectedRank(chargingState string) int {
 // Lives in telemetry/ rather than api/ or cmd/ because both packages
 // need it and the dependency direction otherwise cycles.
 func PickBestVehicle(s *Store, now time.Time) VehiclePick {
-	return pickBestVehicle(s, 0, now)
+	return pickBestVehicle(s, 0, now, VehicleMaxAge, false)
 }
 
 // PickBestVehicleForLoadpoint adds connection-evidence gating: when
@@ -100,7 +107,29 @@ func PickBestVehicleForLoadpoint(s *Store, lpDeliveringPower bool, now time.Time
 		// loadpoint is at 11 kW is definitely not the connected one.
 		minRank = 3
 	}
-	return pickBestVehicle(s, minRank, now)
+	return pickBestVehicle(s, minRank, now, VehicleMaxAge, false)
+}
+
+// PickVehicleForAnchor applies the loadpoint gates with VehicleAnchorMaxAge.
+// Its SoC is a past observation: anchor it at UpdatedAt, never as now.
+func PickVehicleForAnchor(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
+	minRank := 0
+	if lpDeliveringPower {
+		minRank = 3
+	}
+	return pickBestVehicle(s, minRank, now, VehicleAnchorMaxAge, false)
+}
+
+// PickBestVehicleForDisplay retains an otherwise valid last-known vehicle
+// observation after the five-minute control freshness window. The returned
+// pick is marked stale, so presentation can show provenance and age without
+// making the old SoC usable by MPC or control.
+func PickBestVehicleForDisplay(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
+	minRank := 0
+	if lpDeliveringPower {
+		minRank = 3
+	}
+	return pickBestVehicle(s, minRank, now, VehicleMaxAge, true)
 }
 
 // PickVehicleForCompletion requires one vehicle source. Rank and freshness
@@ -110,24 +139,37 @@ func PickVehicleForCompletion(s *Store, now time.Time) VehiclePick {
 	if s == nil || len(s.ReadingsByType(DerVehicle)) != 1 {
 		return VehiclePick{}
 	}
-	return pickBestVehicle(s, 1, now)
+	return pickBestVehicle(s, 1, now, VehicleMaxAge, false)
 }
 
-func pickBestVehicle(s *Store, minRank int, now time.Time) VehiclePick {
+func pickBestVehicle(s *Store, minRank int, now time.Time, maxAge time.Duration, allowAgeStale bool) VehiclePick {
 	if s == nil {
 		return VehiclePick{}
 	}
 	var best VehiclePick
 	bestRank := -1
 	for _, vr := range s.ReadingsByType(DerVehicle) {
-		if vr.SoC == nil {
+		socValue := vr.SoC
+		socUpdatedAt := vr.SoCUpdatedAt
+		cachedDisplay := false
+		if allowAgeStale {
+			if value, observedAt, ok := cachedVehicleDisplay(s, vr); ok {
+				socValue = &value
+				socUpdatedAt = observedAt
+				cachedDisplay = true
+			}
+		}
+		if socValue == nil {
 			continue
 		}
 		if h := s.DriverHealth(vr.Driver); h == nil || !h.IsOnline() {
 			continue
 		}
-		socUpdatedAt := vr.SoCUpdatedAt
-		if socUpdatedAt.IsZero() || now.Sub(socUpdatedAt) > VehicleMaxAge {
+		if socUpdatedAt.IsZero() {
+			continue
+		}
+		age := now.Sub(socUpdatedAt)
+		if age > maxAge && !allowAgeStale {
 			// Reading is older than we're willing to trust as ground
 			// truth — driver probably stopped publishing. Skip rather
 			// than risk acting on a stale SoC.
@@ -142,7 +184,7 @@ func pickBestVehicle(s *Store, minRank int, now time.Time) VehiclePick {
 		if len(vr.Data) > 0 {
 			_ = json.Unmarshal(vr.Data, &meta)
 		}
-		if meta.Stale {
+		if meta.Stale && !allowAgeStale {
 			continue
 		}
 		rank := VehicleConnectedRank(meta.ChargingState)
@@ -152,17 +194,42 @@ func pickBestVehicle(s *Store, minRank int, now time.Time) VehiclePick {
 		if rank < bestRank || (rank == bestRank && !socUpdatedAt.After(best.UpdatedAt)) {
 			continue
 		}
-		soc := units.ClampFraction(*vr.SoC)
+		soc := units.ClampFraction(*socValue)
 		limit := units.ClampFraction(units.DecodeJSONFraction(meta.ChargeLimit, meta.ChargeLimitPct))
 		best = VehiclePick{
 			Driver:        vr.Driver,
 			SoC:           soc,
 			ChargeLimit:   limit,
 			ChargingState: meta.ChargingState,
-			Stale:         meta.Stale,
+			Stale:         age > VehicleMaxAge || meta.Stale || cachedDisplay,
 			UpdatedAt:     socUpdatedAt,
 		}
 		bestRank = rank
 	}
 	return best
+}
+
+// Cached car reports can arrive before any fresh report after a restart.
+// Store.SoC intentionally retains only control-trusted observations. Read the
+// latest raw report for presentation alone, requiring its explicit cache flag
+// and the driver's measured SoC age. Never synthesize a fresh receipt time.
+func cachedVehicleDisplay(s *Store, vr *DerReading) (float64, time.Time, bool) {
+	var report struct {
+		SoC      *float64 `json:"soc"`
+		SoCFresh *bool    `json:"soc_fresh"`
+	}
+	if json.Unmarshal(vr.Data, &report) != nil || report.SoC == nil ||
+		report.SoCFresh == nil || *report.SoCFresh {
+		return 0, time.Time{}, false
+	}
+	raw := *report.SoC
+	if math.IsNaN(raw) || math.IsInf(raw, 0) || raw < 0 || raw > 100 {
+		return 0, time.Time{}, false
+	}
+	age, receivedAt, ok := s.LatestMetric(vr.Driver, "vehicle_soc_age_s")
+	if !ok || receivedAt.IsZero() || math.IsNaN(age) || math.IsInf(age, 0) ||
+		age < 0 || age > (100*365*24*time.Hour).Seconds() {
+		return 0, time.Time{}, false
+	}
+	return units.DecodeJSONFraction(0, raw), receivedAt.Add(-time.Duration(age * float64(time.Second))), true
 }

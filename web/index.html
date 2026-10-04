@@ -182,6 +182,7 @@
 
       <div id="power-now-values" class="power-now-panel" role="tabpanel"
            aria-labelledby="power-now-tab-values" hidden>
+        <section id="control-results" class="control-status control-status-compact" aria-label="Are we in control?" hidden></section>
         <div class="summary-cards">
           <div class="summary-card" id="card-pv">
             <div class="card-label">Solar</div>
@@ -539,21 +540,32 @@
              Passive/Active are no longer primary buttons (HA/app keep
              those keys). Manual fallbacks stay behind Manual…. -->
         <div class="plan-strategy">
-          <span class="card-label plan-strategy-label">Follow the forecast</span>
-          <!-- The slider's value IS the planner's safety factor k, so the
-               position and the number the plan runs on can never drift
-               apart. Left is k=0 (raw forecast); right is k=2. -->
-          <div class="forecast-trust">
-            <input type="range" id="forecast-trust-slider" min="0" max="2" step="0.05" value="1"
-                   aria-valuemin="0" aria-valuemax="2" aria-valuenow="1"
-                   aria-label="Share of the PV forecast uncertainty held in reserve">
-            <div class="forecast-trust-labels">
-              <span>Trust forecast</span>
-              <span id="forecast-trust-value" class="slider-current">k 1</span>
-              <span>Hold reserve</span>
+          <span class="card-label plan-strategy-label" id="plan-style-label">Planning style</span>
+          <!-- Five styles on one stored number, safety_k (PLAN_STYLES in
+               plan-prefs.js). Left keeps the most in the battery; right
+               counts most on the forecast. Settings → Planner fine-tunes
+               the number itself. -->
+          <div class="plan-style" id="plan-style">
+            <div class="plan-style-steps" id="plan-style-steps" role="radiogroup" aria-labelledby="plan-style-label">
+              <button type="button" role="radio" aria-checked="false" data-style="very_careful">Very careful</button>
+              <button type="button" role="radio" aria-checked="false" data-style="careful">Careful</button>
+              <button type="button" role="radio" aria-checked="false" data-style="balanced">Balanced</button>
+              <button type="button" role="radio" aria-checked="false" data-style="bold">Bold</button>
+              <button type="button" role="radio" aria-checked="false" data-style="very_bold">Very bold</button>
             </div>
-            <div id="forecast-trust-hedge" class="forecast-trust-hedge" hidden></div>
-            <p class="forecast-trust-help">Left follows the forecast fully — if it is right, that earns more. Right keeps more in the battery in case the sun misses, closer to using the battery only for the house. Every notch changes how much of each slot's own forecast error the plan holds back.</p>
+            <div class="plan-style-ends" aria-hidden="true">
+              <span>Keeps more in the battery</span>
+              <span>Counts more on the forecast</span>
+            </div>
+            <p id="plan-style-text" class="plan-style-text" aria-live="polite" hidden></p>
+            <p id="plan-style-sun" class="plan-style-sun" hidden></p>
+            <p id="plan-style-extra" class="plan-style-extra" hidden></p>
+            <p class="plan-style-note">
+              <span id="plan-style-fine" hidden></span>
+              Safety limits are the same in every style.
+              <button type="button" class="btn-link" id="plan-style-settings">Fine-tune in Settings</button>
+            </p>
+            <p id="plan-style-status" class="plan-style-status" role="status" hidden></p>
           </div>
           <div class="plan-export">
             <div id="plan-export-banner" class="plan-export-banner" hidden>
@@ -861,11 +873,15 @@
   </footer>
 
   <!-- Battery manual-hold popup — opened from the battery planet click. -->
-  <ftw-battery-control id="battery-control"></ftw-battery-control>
+  <ftw-battery-control id="battery-control">
+    <section slot="status" id="battery-control-proof" class="control-status" aria-label="Are we in control?"></section>
+  </ftw-battery-control>
 
   <!-- PV curtail manual-hold popup — opened from the solar planet click,
        only meaningful when a PV driver advertises pv-curtail support. -->
-  <ftw-pv-control id="pv-control"></ftw-pv-control>
+  <ftw-pv-control id="pv-control">
+    <section slot="status" id="pv-control-proof" class="control-status" aria-label="Are we in control?"></section>
+  </ftw-pv-control>
 
   <!-- Plan numbers — what they mean -->
   <ftw-modal id="plan-help-modal" style="--ftw-modal-max-width:560px">
@@ -916,6 +932,7 @@
   <!-- EV detail popup -->
   <ftw-modal id="ev-modal" style="--ftw-modal-max-width:380px">
     <span slot="title">EV Charger</span>
+    <section id="ev-control-proof" class="control-status" aria-label="Are we in control?"></section>
     <div id="ev-modal-body">
       <p style="color:var(--text-dim)">Loading...</p>
     </div>
@@ -926,8 +943,15 @@
          The /api/ev/command endpoint stays for HA / scripts. -->
   </ftw-modal>
 
+  <!-- Control status for a device without its own controls. -->
+  <ftw-modal id="control-proof-modal" style="--ftw-modal-max-width:480px">
+    <span slot="title">Device</span>
+    <section id="control-proof-details" class="control-status" aria-label="Are we in control?"></section>
+  </ftw-modal>
+
   <!-- Grid detail popup — peak import ceiling + grid target. Open from
        the GRID planet in the energy-flow hero. -->
+
   <ftw-modal id="grid-modal" style="--ftw-modal-max-width:420px">
     <span slot="title">Grid</span>
     <div id="grid-modal-body">
@@ -964,6 +988,7 @@
   </ftw-modal>
 
   <script src="/lan-auth.js?v=lan1"></script>
+  <script type="module" src="/control-feedback-view.js"></script>
   <script src="/app.js?v=noask1"></script>
   <script src="/settings.js?v=diag3"></script>
   <script src="/settings/tabs/control.js?v=tabsplit1"></script>

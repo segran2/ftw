@@ -73,6 +73,9 @@ const (
 // One instance is shared across all handlers; mutations use the contained
 // mutexes from each package.
 type Deps struct {
+	// SiteMeasurementSources reuses the configured physical-flow inventory.
+	// These are source declarations, never forecast values or derived load.
+	SiteMeasurementSources func() telemetry.ForecastOptions
 
 	// MutationPolicy protects every state-changing route at the shared
 	// Handler boundary. Production requires tokens for non-local hostnames;
@@ -177,8 +180,9 @@ type Deps struct {
 	// manual V2X command) check it. Nil refuses those setpoints.
 	SiteDispatchBlocked func() string
 
-	// Optional: HA MQTT bridge (nil if disabled).
-	HA *ha.Bridge
+	// Optional: returns the running HA MQTT bridge, or nil when HA is
+	// disabled or not connected yet. Nil func means HA is not wired.
+	HA func() *ha.Bridge
 
 	// Driver registry — used by lifecycle endpoints (restart/disable/enable)
 	// and EV command dispatch. Nil disables those endpoints (returns 503).
@@ -1219,8 +1223,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// diagnostic — incremented when actual fleet delivery diverges
 		// from the plan's BatteryEnergyWh by > 50 % (over) or < 50 %
 		// (under). Idle slots (|planned| ≤ 50 Wh) are ignored.
+		"control_feedback":    s.controlFeedback(time.Now()),
 		"slot_delivery_stats": ctrl.SlotDeliveryStats,
 	}
+	// The operator's cap for storing live PV surplus, 0 when unset. Dispatch
+	// prefers it to the plan's per-slot cap, so the Plan card needs it to say
+	// where extra sun goes.
+	resp["pv_surplus_absorb_soc_cap"] = ctrl.PVSurplusAbsorbSoCCap
 	// A stale or missing site meter is not 0 W. Publishing zero made the
 	// dashboard and the FTW app draw "balanced" / "0 W" as if the house
 	// were idle. JSON null is what the flow mapping already treats as
@@ -2015,7 +2024,11 @@ func (s *Server) setDriverDisabled(w http.ResponseWriter, r *http.Request, disab
 // Used by the Settings UI to show a live connection indicator
 // instead of silently relying on "it's saved".
 func (s *Server) handleHAStatus(w http.ResponseWriter, r *http.Request) {
-	enabled := s.deps.HA != nil
+	var bridge *ha.Bridge
+	if s.deps.HA != nil {
+		bridge = s.deps.HA()
+	}
+	enabled := bridge != nil
 	broker := ""
 	if s.deps.Cfg != nil {
 		if s.deps.CfgMu != nil {
@@ -2037,7 +2050,7 @@ func (s *Server) handleHAStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"enabled": false})
 		return
 	}
-	if s.deps.HA == nil {
+	if bridge == nil {
 		writeJSON(w, 200, map[string]any{
 			"enabled":   true,
 			"connected": false,
@@ -2047,10 +2060,10 @@ func (s *Server) handleHAStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"enabled":           true,
-		"connected":         s.deps.HA.IsConnected(),
-		"broker":            s.deps.HA.BrokerAddr(),
-		"last_publish_ms":   s.deps.HA.LastPublishMs(),
-		"sensors_announced": s.deps.HA.SensorsAnnounced(),
+		"connected":         bridge.IsConnected(),
+		"broker":            bridge.BrokerAddr(),
+		"last_publish_ms":   bridge.LastPublishMs(),
+		"sensors_announced": bridge.SensorsAnnounced(),
 	})
 }
 
@@ -3672,7 +3685,7 @@ func (s *Server) handleLoadpoints(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"enabled":                      true,
 		"vehicle_limit_goal_supported": true,
-		"loadpoints":                   states,
+		"loadpoints":                   s.loadpointsWithFeedback(states),
 	})
 }
 
@@ -3716,18 +3729,33 @@ func decorateLoadpointsWithVehicle(states []loadpoint.State, tel *telemetry.Stor
 		}
 		delivering := states[i].CurrentPowerW > loadpoint.DeliveringW
 		pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, now)
-		if pick.Driver == "" {
-			if states[i].SoCSource == "" {
-				states[i].SoCSource = "inferred"
+		freshVehicle := pick.Driver != ""
+		if !freshVehicle {
+			pick = telemetry.PickBestVehicleForDisplay(tel, delivering, now)
+			if pick.Driver == "" {
+				if states[i].SoCSource == "" {
+					states[i].SoCSource = "inferred"
+				}
+				continue
 			}
-			continue
 		}
 		states[i].VehicleDriver = pick.Driver
 		states[i].VehicleSoC = pick.SoC
 		states[i].VehicleChargeLimit = pick.ChargeLimit
 		states[i].VehicleChargingState = pick.ChargingState
 		states[i].VehicleStale = pick.Stale
-		states[i].SoCSource = "vehicle"
+		if !pick.UpdatedAt.IsZero() {
+			age := now.Sub(pick.UpdatedAt)
+			if age < 0 {
+				age = 0
+			}
+			states[i].VehicleSoCAgeS = int64(age / time.Second)
+		}
+		if freshVehicle {
+			states[i].SoCSource = "vehicle"
+		} else if states[i].SoCSource == "" {
+			states[i].SoCSource = "inferred"
+		}
 	}
 }
 

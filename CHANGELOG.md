@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.139.3
+
+### Patch Changes
+
+- 9246e4f: On a slow box such as a Raspberry Pi 4, the Core DP shadow no longer spends 10 s of CPU on almost every replan with a car plugged in, only to run out of time. After a shadow runs out of time, Core skips shadows of that size or larger for an hour and records each skip in the plan diagnostics, with the reason and the time of the next try. Battery-only shadows still run. The active plan and dispatch do not change.
+- e64d587: Update the bundled Energyplan planner to 0.5.0. On a small box such as a Raspberry Pi 4, plans with a car get better within the 0.5 s budget: time that the solver's LP phases cannot use now goes to improving the plan Core gets. A car that cannot charge is planned with the exact battery method, and a car a fraction of a watt-hour short of its goal no longer restarts the charger. The planner keeps a valid plan when its solver fails, reports `gap_satisfied` when it meets Core's gap, fixes a wrong demand-charge sign for the running hour, and closes two ways it could report an unproven optimum. Core still validates every plan.
+- 4dce1ff: Give the Energyplan planner 1.5 s instead of 0.5 s when a car is plugged in. On a Raspberry Pi 4, 0.5 s stopped just before the planner could improve on its first plan for the car, and the published plan could cost about 11% more than the best one. Battery-only plans keep their 0.5 s budget, and the first slot's remaining time still caps every budget.
+
+## 0.139.2
+
+### Patch Changes
+
+- 10e5591: A car reading up to an hour old now corrects FTW's charge estimate. FTW anchors the reading at the time it arrived and adds the energy delivered since then. Cloud sources such as the VW Group portal, which reports every 15 minutes, now keep the estimate close to the car's level. Before, FTW used a car reading only in its first five minutes. It also pinned the estimate to the latest reading and dropped the energy delivered after it. A reading from before plug-in, or from before a restart, does not anchor. Display and goal completion still treat readings older than five minutes as old.
+- 1bd74cc: Lua drivers can now sign in through a web login. The new `host.http_request` returns the status, headers and redirect target. The host keeps the session cookies for the driver's allowed hosts, in memory only. A read-only driver may declare several sign-in paths with `auth_post_paths`. This lets the VW Group driver renew its portal session itself, instead of the owner pasting a new cookie every hour.
+
+## 0.139.1
+
+### Patch Changes
+
+- 317e93c: A plugged-in car whose next departure lies past the published prices no longer makes Energyplan reject the plan. The planner puts reachable solar surplus toward that car, as Core DP already did, but a car that leaves before the end of the plan goes first. Before, FTW fell back to Core DP until prices for the departure day arrived or the car was unplugged.
+- 1e80378: Fix Pixii control feedback that reported charging during discharge. Pixii 2.1.8 preserves the measured AC power sign while keeping command and setpoint conversion unchanged.
+
+## 0.139.0
+
+### Minor Changes
+
+- 8386721: Show whether each device FTW controls does what FTW asked. A tap on the battery, charger or solar bubble answers "Are we in control?" first: Following FTW, Waiting, Limited, Not following, No contact or Not controlled, with one sentence and, when you can act, the next step. Manual override moves below it.
+  
+  "How FTW knows" lists the evidence: sent, accepted, measured and confirmed by a separate grid meter, with numbers and response curves for experts. Support reports and the API carry the same status and evidence.
+  
+  The overview stays quiet while FTW is in control and marks only devices that need a look (amber) or attention now (red). Proof follows a device through targets retuned every tick and slow cloud sources, a confirmed step survives later household loads, and a battery that takes less power as it fills is explained instead of flagged.
+- bf85123: The Plan card's forecast slider is now five planning styles, from Very careful to Very bold. A line under them says how much of the spare sun the plan counts on, and another says whether extra sun goes into the battery or to the grid. The default style, Balanced, holds back a smaller forecast margin than before (k 0.3 instead of 1), and a box that still runs the old default moves to it once. Settings → Planner fine-tunes the margin and saves at once. Changing the style or battery sales on one device no longer undoes a change made on another.
+
+### Patch Changes
+
+- 9a46d30: Bundle the ESPHome DSMR driver that declares its host, so setup keeps the address you entered.
+- 68fda43: Forecast error bands and baselines now carry over across Core updates that leave forecasting alone. Before, each update started them over, so the planner's forecast margin always used its widest cold-start bands.
+- 608aad5: The solar and load forecasts keep what they have learned when an update installs the same driver scripts in a new release folder. Before, every native update started them over, so they rarely got past their first two days.
+- 1757ce0: The planner now takes each forecast signal from the source that measured better over the last week, once it has three days of scored hours. Before, it used Energyplan solar even while that model was new, and kept the older load model even when that model overshot by 2 kW at night.
+- 8386721: Pause charging for each battery that reports 100% and allow it again at 99% or lower. Keep discharge available and apply the stop to planned and manual charging, including during ramp limits and dispatch waits. Show the full-battery stop separately from measurement confidence and retain warnings when the device ignores the stop.
+- da0d138: The Home Assistant bridge now connects when the broker comes up after FTW or starts to accept FTW's login. FTW retries a failed start every 5 seconds at first, backing off to once a minute, until it connects, the settings change or FTW stops. Before, the bridge stayed off until a restart or a settings save.
+- 274ace8: Keep the history chart and site energy running when a device can report PV but does not, such as a Zap P1 meter with PV reading off, or while a device identity is still unconfirmed. Before, adding such a device stopped history until it was removed, even across restarts. Forecast learning keeps its stricter checks.
+- a9dc0e3: The load forecast now lowers a heating estimate once each of the last three cold days shows it above what the house used, without waiting weeks for each hour to train. One day with the heating off does not move it.
+- 082e5bb: The plan now includes, for each slot, how far live solar beyond the plan may charge the battery.
+- 63cf608: Save Zap PV and battery reads as off when the boxes are unchecked. Before, setup and Settings left `read_pv` out, so Core waited for PV readings the Zap never sends. Open Settings → Devices and save once to fix a Zap added before this release.
+
+## 0.138.3
+
+### Patch Changes
+
+- 8bb3d81: Fix forecast evaluation stalling after restart. Give score writes and retention separate time budgets, skip retention sorting when the archive is within its limits, and resume after the last committed page when a step fails. Refresh calibration from saved scores even when later work needs a retry.
+- 46ae403: Installer messages now direct users to the new 0.x setup paths and explain that 2.x and 3.x receive no more updates. The scripts still exit without changing the site. Docker's missing-version message asks for an exact published new 0.x tag instead of suggesting an old example.
+  
+  Block retired Docker release workflow dispatches before checkout or registry writes, while keeping native Changesets version PRs running.
+- f46deb1: Display cached vehicle SoC after restart with its source age, without using it for control.
+- 9c26d0e: Make electricity setup clearer: choose three-phase or single-phase, enter the confirmed main fuse rating, and keep voltage under Advanced. Standard connections use 230 V per phase. Show saved custom connections without changing their values. Make the country and price-zone list available during a fresh install.
+- 3cdeb81: Keep private FTW data out of the release Docker build context. Install commands stop on download errors and refuse to overwrite an earlier Docker test. The English and Swedish guides put the physical SD-card swap before installation and treat Docker as a separate path.
+
 ## 0.138.2
 
 ### Patch Changes

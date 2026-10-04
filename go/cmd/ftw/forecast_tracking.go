@@ -35,6 +35,7 @@ type forecastSite struct {
 	HasPVScale            bool
 	Timezone              string
 	Options               telemetry.ForecastOptions
+	HistoryOptions        telemetry.ForecastOptions // chart and site energy; outside every revision
 	PVLearningStartedMS   int64
 	LoadLearningStartedMS int64
 }
@@ -87,6 +88,7 @@ type forecastTracker struct {
 	observationPVValid   bool
 	observationLoadValid bool
 	issueArchiveError    bool
+	sourceChoice         forecastSourceChoice // guarded by mu
 }
 
 func (f *forecastTracker) Start(ctx context.Context) error {
@@ -449,6 +451,9 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 		frozen = fresh
 	}
 	calibrator := forecasting.NewCalibrator(history, site.Revision, origin.UnixMilli())
+	riskCalibrator := forecasting.NewCalibrator(riskEvidence(history), site.Revision, origin.UnixMilli())
+	choice := chooseForecastSources(history, site.Revision, origin.UnixMilli())
+	f.noteSourceChoice(choice)
 	pvFn := mpc.PVPredictor(nil)
 	if f.pv != nil && site.HasLocation {
 		pvFn = func(t time.Time, cloud float64) float64 {
@@ -596,14 +601,21 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 				continue
 			}
 			selected[i].PredictionStartMS = point.PredictionStartMS
-			if usablePrimaryForecast(point.PVKnown, point.PVQuality, point.PVW) {
+			// Measured errors keep legacy PV only where legacy has weather for
+			// this interval; elsewhere the quality rule decides.
+			pvChoice := choice.PV.Source
+			if pvChoice == "legacy" && !selected[i].PVKnown {
+				pvChoice = ""
+			}
+			if pvChoice != "legacy" && usablePrimaryForecast(point.PVKnown, point.PVQuality, point.PVW) {
 				resolved[i].PVW = -point.PVW
 				selected[i].PVW, selected[i].PVKnown, selected[i].PVQuality = point.PVW, true, point.PVQuality
 				selected[i].PVSource, selected[i].ModelPV = "energyplan", point.ModelPV
 			}
-			// A cold load can still be the worker's generic prior. Keep the frozen
-			// profile and heating prior until this interval has learned support.
-			if point.LoadQuality != "cold_start" && usablePrimaryForecast(point.LoadKnown, point.LoadQuality, point.LoadW) {
+			// Without measured evidence a cold load can still be the worker's
+			// generic prior, so the frozen profile and heating prior stay.
+			loadReady := point.LoadQuality != "cold_start" || choice.Load.Source == "energyplan"
+			if choice.Load.Source != "legacy" && loadReady && usablePrimaryForecast(point.LoadKnown, point.LoadQuality, point.LoadW) {
 				resolved[i].LoadW = point.LoadW
 				selected[i].LoadW, selected[i].LoadKnown, selected[i].LoadQuality = point.LoadW, true, point.LoadQuality
 				selected[i].LoadSource, selected[i].ModelLoad = "energyplan", point.ModelLoad
@@ -611,16 +623,21 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 		}
 		return resolved
 	}
-	// Calibrate the actual composed primary. A Rust prediction does not inherit
-	// the old model's residual spread or its training trust threshold.
+	// Calibrate each slot on the errors its own sources made. A Rust
+	// prediction does not inherit the old model's residual spread or its
+	// training trust threshold, and a source switch keeps its history.
 	in.Risk = func(base, planning []mpc.Slot, k float64) {
 		if k <= 0 || math.IsNaN(k) || math.IsInf(k, 0) {
 			return
 		}
 		for i, s := range base {
+			pvSeries, loadSeries := "legacy_shadow", "legacy_shadow"
+			if i < len(selected) {
+				pvSeries, loadSeries = forecastSeriesOf(selected[i].PVSource), forecastSeriesOf(selected[i].LoadSource)
+			}
 			net := s.LoadW + s.PVW
 			end := s.StartMs + int64(s.LenMin)*time.Minute.Milliseconds()
-			band := calibrator.BandForInterval("champion", "net", max(s.StartMs, origin.UnixMilli()), end, net)
+			band := riskCalibrator.BandForInterval(forecastMixSeries(pvSeries, loadSeries), "net", max(s.StartMs, origin.UnixMilli()), end, net)
 			if band.Method == forecasting.BandMethodEmpirical {
 				extra := math.Max(0, k*(band.HighW-net))
 				pvLoss := math.Min(-s.PVW, extra)
@@ -644,7 +661,7 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 			if band.Method != forecasting.BandMethodEmpirical {
 				// Until joint errors can set the margin, cover load upside as
 				// well as PV downside. This also works at night and without PV.
-				loadBand := calibrator.BandForInterval("champion", "load", max(s.StartMs, origin.UnixMilli()), end, s.LoadW)
+				loadBand := riskCalibrator.BandForInterval(loadSeries, "load", max(s.StartMs, origin.UnixMilli()), end, s.LoadW)
 				loadLoss := math.Max(0, loadBand.HighW-s.LoadW)
 				if loadBand.Method != forecasting.BandMethodEmpirical && i < len(selected) && selected[i].ModelLoad != nil {
 					loadLoss = math.Max(loadLoss, selected[i].ModelLoad.UpperW-s.LoadW)

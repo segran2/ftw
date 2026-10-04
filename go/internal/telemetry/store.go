@@ -290,10 +290,12 @@ type MetricSample struct {
 // Store is the central telemetry sink that drivers emit into and that the
 // control loop reads from. Thread-safe.
 type Store struct {
-	mu       sync.RWMutex
-	readings map[string]*DerReading // key = driver + ":" + der_type
-	filters  map[string]*KalmanFilter1D
-	health   map[string]*DriverHealth
+	mu                  sync.RWMutex
+	readings            map[string]*DerReading // key = driver + ":" + der_type
+	filters             map[string]*KalmanFilter1D
+	health              map[string]*DriverHealth
+	commands            map[string]CommandEvidence
+	controlObservations map[string][]ControlObservation
 
 	processNoise     float64
 	measurementNoise float64
@@ -454,6 +456,10 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 		Data:         data,
 		UpdatedAt:    now,
 	}
+
+	s.observeCommand(driver, t, rawW, data, now)
+	s.recordControlObservation(driver, t, rawW, data, now)
+	s.freezeStepWindows(now)
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground
 	// truth and let consumers smooth as they like).
@@ -740,6 +746,18 @@ func (s *Store) Remove(driver string) {
 		delete(s.filters, k)
 	}
 	delete(s.health, driver)
+	for _, kind := range allDerTypes {
+		delete(s.controlObservations, key(driver, kind))
+	}
+	for k, c := range s.commands {
+		c.Baseline, c.StepAfter = nil, nil
+		s.commands[k] = c
+	}
+	for k, command := range s.commands {
+		if command.Driver == driver {
+			delete(s.commands, k)
+		}
+	}
 	s.mu.Unlock()
 
 	prefix := driver + ":"

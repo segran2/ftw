@@ -8,7 +8,7 @@ The [Energyplan contract](../../docs/energyplan-contract.md) defines the shared
 planning and forecast boundary, result meanings, units and failure rules.
 Core owns it; Energyplan keeps an identical copy.
 
-Energyplan 0.4.10 uses the Home Use Binary License in `bundle/LICENSE.txt`. It
+Energyplan 0.5.0 uses the Home Use Binary License in `bundle/LICENSE.txt`. It
 permits private household use with FTW and free noncommercial redistribution
 for that use. Commercial use, OEM bundles, paid installation and services need
 a separate written license from Sourceful Labs AB. FTW's AGPL code has a
@@ -66,6 +66,10 @@ Its result appears in
 `dp_shadow`, tied to the same decision ID. It cannot change the active actions.
 Both plans use Core's grid cost model, with a separate terminal-energy-adjusted
 comparison. A failed comparison reports `rejected`, without a cost verdict.
+After a shadow runs out of time, Core skips shadows with at least as much DP
+work per slot for an hour. Each skip reports `skipped`, with the reason and the
+time of the next try. Smaller shadows still run: a battery-only plan keeps its
+comparison while shadows with a car are skipped.
 
 Energyplan plans from the measured battery energy, including starts below the
 reserve or above the charge limit. Each action must hold or reduce any existing

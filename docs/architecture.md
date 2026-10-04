@@ -243,9 +243,12 @@ a separate versioned contract. At the start of each replan, Core freezes the
 legacy forecast, weather, occupancy and saved model state. It calls the forecast
 worker once under a deadline, outside control and dispatch locks. Core accepts
 PV and load independently for each covered interval. If either signal is
-missing, late, partial or invalid, Core retains the matching legacy value. The
+missing, late, partial or invalid, Core retains the matching legacy value.
+When a week of scored errors shows one source clearly better for a signal,
+Core uses that source; otherwise the worker's quality label decides. The
 resulting `champion` can therefore contain Energyplan PV with legacy load, or
-the reverse. `legacy_shadow` keeps both legacy signals from the same frozen
+the reverse. Each slot's planning margin comes from the errors its own sources
+made on earlier issues. `legacy_shadow` keeps both legacy signals from the same frozen
 capture for a fair later comparison.
 
 Complete qualified 15-minute observations update the local models outside
@@ -255,7 +258,8 @@ state has been saved, and startup restores that saved state. The learning
 revision binds state to forecast inputs and stable hardware identities. A
 binding or input change starts fresh learning, while a compatible program
 upgrade can reuse the state. Issued forecasts use a stricter revision that also
-includes the Core build, worker bytes and pipeline policy.
+includes the worker bytes and pipeline policy, so a Core update that leaves
+forecasting alone keeps its scored errors and bands.
 
 Core keeps issued forecasts, frozen inputs, model-state references and qualified
 truth in a bounded local archive. The read-only `ftw-forecast-evaluate` source

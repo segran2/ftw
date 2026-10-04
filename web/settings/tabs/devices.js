@@ -1186,26 +1186,82 @@
         var isCloudDriver = !isVehicleDriver && !isApiCredsDriver && cap.http != null && !hasHostField &&
           (hasAuthField || Object.keys(dcfg).length === 0);
         if (isVehicleDriver) {
-          // TeslaBLEProxy-style drivers only need the LAN IP of the
-          // proxy and the VIN it's paired to. "Verify connection"
-          // makes the backend issue a one-shot vehicle_data poll so
-          // the operator can confirm pairing before saving.
           var vcfg = d.config || {};
-          html += '<fieldset><legend>Vehicle</legend>' +
-            '<div class="field-row"><div>' +
-            '<label>Proxy IP ' + help('LAN address of the TeslaBLEProxy. Bare IP uses port 8080; append ":port" to override (e.g. 192.168.1.50:1234).') + '</label>' +
-            '<input type="text" class="tesla-ip-input" data-driver-idx="' + idx + '" data-path="drivers.' + idx + '.config.ip" value="' + escHtml(vcfg.ip || '') + '" placeholder="192.168.1.50 (or 192.168.1.50:1234)">' +
-            '</div><div>' +
-            '<label>VIN ' + help('Vehicle Identification Number the proxy is paired to.') + '</label>' +
-            '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="5YJ3E1EA1KF000000">' +
-            '</div></div>' +
-            '<div style="margin-top:8px;display:flex;gap:10px;align-items:center">' +
-            '<button class="btn-add tesla-verify-btn" type="button" data-driver-idx="' + idx + '">Verify connection</button>' +
-            '<span class="tesla-verify-status" data-driver-idx="' + idx + '" style="font-size:0.82rem;color:var(--text-dim)"></span>' +
-            '</div>' +
-            '</fieldset>';
+          // Match both the configured logical path and the catalog entry.
+          // Repository-installed drivers may use a versioned/managed path, so
+          // filename-only detection can misclassify VAG as TeslaBLEProxy and
+          // render Proxy IP while hiding the VAG email fieldset.
+          var isVAGVehicle = (d.lua || '').indexOf('vag_vehicle.lua') >= 0 ||
+            !!(catalogEntry && catalogEntry.id === 'vag_vehicle');
+          if (isVAGVehicle) {
+            // Core merges the driver's DRIVER.http_hosts into the allowlist,
+            // so the UI leaves capabilities.http.allowed_hosts as saved.
+
+            // VAG EU Data Act is a cloud vehicle driver, not a
+            // TeslaBLEProxy-style LAN driver. Brand is required by
+            // vag_vehicle.lua and must be part of the row so the generic
+            // connection probe receives it together with VIN and secrets.
+            var vagBrand = String(vcfg.brand || '').toLowerCase();
+            var vagHasPassword = d.has_password === true ||
+              (typeof vcfg.password === 'string' && vcfg.password !== '');
+            var vagPasswordBadge = vagHasPassword
+              ? '<span class="creds-badge creds-saved">✓ Saved</span>'
+              : '<span class="creds-badge creds-missing">⚠ Not saved</span>';
+            html += '<fieldset><legend>VAG EU Data Act</legend>' +
+              '<div class="field-row"><div>' +
+              '<label>Brand ' + help('Brand account linked to this VIN on the VW Group EU Data Act portal.') + '</label>' +
+              '<select data-path="drivers.' + idx + '.config.brand">' +
+              '<option value=""' + (!vagBrand ? ' selected' : '') + '>Choose brand…</option>' +
+              ['audi', 'volkswagen', 'skoda', 'seat', 'cupra'].map(function (brand) {
+                var labels = { audi: 'Audi', volkswagen: 'Volkswagen', skoda: 'Škoda', seat: 'SEAT', cupra: 'Cupra' };
+                return '<option value="' + brand + '"' + (vagBrand === brand ? ' selected' : '') + '>' + labels[brand] + '</option>';
+              }).join('') +
+              '</select>' +
+              '</div><div>' +
+              '<label>VIN ' + help('Vehicle Identification Number registered to the selected brand account.') + '</label>' +
+              '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="WAUZZZ…">' +
+              '</div></div>' +
+              '<div class="field-row"><div>' +
+              '<label>Email ' + help('Email address for the selected VW Group brand account. VAG driver v0.2.0 and newer use it to renew the portal session automatically.') + '</label>' +
+              '<input type="email" autocomplete="username" data-path="drivers.' + idx + '.config.email" value="' + escHtml(vcfg.email || '') + '" placeholder="name@example.com">' +
+              '</div><div>' +
+              '<label>Password ' + vagPasswordBadge + ' ' + help('Stored as a masked driver secret. Leave empty to keep an already saved password. VAG driver v0.2.0 and newer use it for automatic re-login.') + '</label>' +
+              '<input type="password" autocomplete="current-password" data-path="drivers.' + idx + '.config.password" value="" placeholder="' +
+                (vagHasPassword ? '•••••••• (leave empty to keep)' : 'enter account password') + '">' +
+              '</div></div>' +
+              '<p style="color:var(--text-dim);font-size:0.75rem;margin:8px 0 0">' +
+              'VAG driver v0.2.0+ signs in again automatically when the portal session expires.' +
+              '</p>' +
+              '</fieldset>';
+          } else {
+            // TeslaBLEProxy-style drivers only need the LAN IP of the
+            // proxy and the VIN it's paired to. "Verify connection"
+            // makes the backend issue a one-shot vehicle_data poll so
+            // the operator can confirm pairing before saving.
+            html += '<fieldset><legend>Vehicle</legend>' +
+              '<div class="field-row"><div>' +
+              '<label>Proxy IP ' + help('LAN address of the TeslaBLEProxy. Bare IP uses port 8080; append ":port" to override (e.g. 192.168.1.50:1234).') + '</label>' +
+              '<input type="text" class="tesla-ip-input" data-driver-idx="' + idx + '" data-path="drivers.' + idx + '.config.ip" value="' + escHtml(vcfg.ip || '') + '" placeholder="192.168.1.50 (or 192.168.1.50:1234)">' +
+              '</div><div>' +
+              '<label>VIN ' + help('Vehicle Identification Number the proxy is paired to.') + '</label>' +
+              '<input type="text" data-path="drivers.' + idx + '.config.vin" value="' + escHtml(vcfg.vin || '') + '" placeholder="5YJ3E1EA1KF000000">' +
+              '</div></div>' +
+              '<div style="margin-top:8px;display:flex;gap:10px;align-items:center">' +
+              '<button class="btn-add tesla-verify-btn" type="button" data-driver-idx="' + idx + '">Verify connection</button>' +
+              '<span class="tesla-verify-status" data-driver-idx="' + idx + '" style="font-size:0.82rem;color:var(--text-dim)"></span>' +
+              '</div>' +
+              '</fieldset>';
+          }
         }
         if (isLocalHTTP) {
+          var isZap = (d.lua || '').indexOf('zap.lua') >= 0;
+          if (isZap) {
+            // Zap reads PV and battery only on opt-in. An unchecked box must
+            // save false: Core treats a missing read_pv as PV that may report.
+            d.config = d.config || {};
+            if (d.config.read_pv == null) d.config.read_pv = false;
+            if (d.config.read_battery == null) d.config.read_battery = false;
+          }
           var lcfg = d.config || {};
           // NIBE-style local-API drivers (catalog apicreds + a connection port)
           // also need a username + an optional self-signed cert pin; plain
@@ -1219,7 +1275,7 @@
           html += '<fieldset><legend>HTTP</legend>' +
             '<label>Host / IP ' + help('Hostname (e.g. zap.local) or IP address of the device. Prefer the device\'s mDNS (.local) name when it broadcasts one — it survives DHCP lease changes. If you use a raw IP, reserve it for the device in your router\'s DHCP settings so it can\'t change.') + '</label>' +
             '<input type="text" data-path="drivers.' + idx + '.config.host" value="' + escHtml(lcfg.host || '') + '" placeholder="zap.local">' +
-            ((d.lua || '').indexOf('zap.lua') >= 0
+            (isZap
               ? '<p class="zap-p1-note" style="margin:8px 0 0;font-size:0.82rem;color:var(--text-dim);line-height:1.45">This driver is the P1/HAN site meter by default. Prefer a native driver for inverters and batteries. Turn on a read below only when Zap is the only reader — a SolarEdge whose Modbus is closed, or an inverter on RS-485 that Zap already owns. Zap never writes.</p>' +
                 '<label class="drv-read-pv" style="margin-top:8px;display:flex;align-items:center;gap:6px;font-weight:normal">' +
                 '<input type="checkbox" data-checkbox-path="drivers.' + idx + '.config.read_pv"' +
@@ -1729,6 +1785,16 @@
               return k !== 'client_secret' && k !== 'refresh_token';
             });
           }
+          // VAG v0.2.0+ renders email/password in its dedicated fieldset.
+          // Cookie is retained in config as a legacy fallback for older
+          // Core/driver versions, but it is not part of the normal UI.
+          // Do not delete or overwrite an already saved cookie here.
+          var isVAG = (d.lua || '').indexOf('vag_vehicle.lua') >= 0 ||
+            !!(entry && entry.id === 'vag_vehicle');
+          if (isVAG) {
+            secrets = secrets.filter(function (k) { return k !== 'cookie'; });
+          }
+
           // Cloud credentials already render config.password. A second
           // Secrets field bound to the same path (Easee, Zaptec) saves
           // whichever input is read last and shows the wrong hint.

@@ -664,7 +664,8 @@ class FtwEnergyFlow extends FtwElement {
         socStale: !p.placeholder && !!p.socStale,
         socSource: p.placeholder ? null : p.socSource,
         radius: p._r,
-        clickable: p.clickable === false ? false : (!p.placeholder && !!p.role),
+        clickable: p.clickable === false ? false : (!!p.controlMark || !p.placeholder && !!p.role),
+        controlMark: p.controlMark,
         role: p.role || "",
         name: p.name || "",
         id: p.id,
@@ -706,6 +707,14 @@ class FtwEnergyFlow extends FtwElement {
     super.update();
   }
 
+  _syncLayerAccess() {
+    for (const layer of this.shadowRoot.querySelectorAll('.ef-layer')) {
+      const visible = layer.classList.contains(this._aggregated ? 'ef-layer-agg' : 'ef-layer-ind');
+      layer.setAttribute('aria-hidden', visible ? 'false' : 'true');
+      for (const node of layer.querySelectorAll('.ef-clickable')) node.setAttribute('tabindex', visible ? '0' : '-1');
+    }
+  }
+
   // Called by FtwElement after each render() replaces the shadow DOM.
   // We cancel any in-flight rAF, bind the freshly-rendered <circle>
   // elements to the particle-param list `render()` just built, and
@@ -726,6 +735,7 @@ class FtwEnergyFlow extends FtwElement {
         this._aggregated = !this._aggregated;
         const svgEl = this.shadowRoot.querySelector("svg");
         if (svgEl) svgEl.dataset.agg = this._aggregated ? "on" : "off";
+        this._syncLayerAccess();
         toggleBtn.setAttribute("aria-checked", this._aggregated ? "true" : "false");
         toggleBtn.setAttribute("title", this._aggregated
           ? "Split multi-device corners into individual bubbles"
@@ -738,6 +748,7 @@ class FtwEnergyFlow extends FtwElement {
     // `ftw-planet-click` so callers (app.js) can route per-role
     // (e.g. ev → open EV modal scoped to this driver).
     const svg = this.shadowRoot.querySelector('svg');
+    this._syncLayerAccess();
     if (svg) {
       const fire = (g) => {
         const role = g.getAttribute('data-role') || '';
@@ -1152,7 +1163,7 @@ class FtwEnergyFlow extends FtwElement {
           <span class="ef-toggle-track"></span>
         </button>
       ` : ""}
-      <svg class="${this._svgClass()}" data-agg="${aggAttr}" viewBox="${P.vbX} 0 ${P.vbW} ${P.H}" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+      <svg class="${this._svgClass()}" data-agg="${aggAttr}" viewBox="${P.vbX} 0 ${P.vbW} ${P.H}" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Energy flow">
         <defs>
           <radialGradient id="ef-hub" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stop-color="oklch(0.85 0.18 var(--accent-hue))" stop-opacity="0.55"/>
@@ -1454,7 +1465,7 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
                             clickable = false, role = "", name = "", id = "",
                             aggregated = false,
                             dailyKwh = null, dailyKwhParts = null,
-                            compact = false }) {
+                            compact = false, controlMark = null }) {
   const r = radius;
   const { x, y } = pos;
   // Daily totals line — empty string when no payload was passed (back-
@@ -1468,7 +1479,7 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
   // derived from the visible title/name so the announcement names
   // what activating this node will open.
   const nodeLabel = [title, nameLabel].filter(Boolean).join(" ");
-  const ariaLabel = nodeLabel ? `Open ${nodeLabel}` : "Open node";
+  const ariaLabel = controlMark ? `${nodeLabel}: ${controlMark.label}. Open device` : nodeLabel ? `Open ${nodeLabel}` : "Open node";
   const groupAttrs = clickable
     ? ` class="ef-node ef-clickable" data-role="${escapeXml(role)}" data-name="${escapeXml(name)}" data-id="${escapeXml(id)}" tabindex="0" role="button" aria-label="${escapeXml(ariaLabel)}"`
     : ` class="ef-node"`;
@@ -1595,6 +1606,7 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
               fill="none" stroke="${color}" stroke-width="1"
               stroke-dasharray="2 4"/>
       <g class="ef-icon" transform="translate(${x} ${y}) scale(${iconScale})">${iconSvg}</g>
+      ${controlMark ? renderControlMark(controlMark, x, y, r) : ''}
       ${titleSvg}
       <text x="${x}" y="${y + valueY}" text-anchor="middle" fill="${color}" class="sv-node-value">
         ${value}
@@ -1609,6 +1621,28 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
       </text>
       ${socText}
     </g>`;
+}
+
+// The overview stays quiet while FTW is in control. Core's warning draws an
+// amber triangle and its alarm a red disc; the whole bubble stays the target.
+function renderControlMark(mark, x, y, r) {
+  const alarm = mark.tone === 'alarm';
+  const size = Math.max(7, Math.min(11, r * 0.15));
+  const glyph = alarm
+    ? '<circle r="9" fill="var(--red-e)"/><path d="M0 -4.5 V1.2 M0 4.2 V4.4" stroke="var(--hero-box-fill)" stroke-width="2.2" stroke-linecap="round"/>'
+    : '<path d="M0 -9 L9.5 7.5 H-9.5 Z" fill="var(--amber)" stroke-linejoin="round"/><path d="M0 -3.2 V1.8 M0 4.6 V4.8" stroke="var(--hero-box-fill)" stroke-width="2" stroke-linecap="round"/>';
+  return `<g class="ef-control-mark" data-tone="${escapeXml(mark.tone)}" transform="translate(${x + r * Math.SQRT1_2} ${y - r * Math.SQRT1_2}) scale(${size / 9})">
+    <title>${escapeXml(mark.label)}</title>
+    <circle r="12" fill="var(--hero-box-fill)"/>
+    ${glyph}
+  </g>`;
+}
+function combinedMark(group) {
+  const marks = group.map(p => p.controlMark).filter(Boolean);
+  if (!marks.length) return null;
+  const tone = marks.some(m => m.tone === 'alarm') ? 'alarm' : 'warning';
+  const n = marks.filter(m => m.tone === tone).length;
+  return {tone, label: n === 1 && marks.length === 1 ? marks[0].label : `${n} ${n === 1 ? 'device needs' : 'devices need'} attention`};
 }
 
 // ---------- primitives ----------
@@ -1720,6 +1754,8 @@ function aggregateGroups(groups) {
       socSource,
       name: `${group.length}×`,
       aggregated: true,
+      controlMark: combinedMark(group),
+      placeholder: group.some(p => p.placeholder),
       dailyKwh,
       dailyKwhParts,
     }];

@@ -46,7 +46,12 @@ type forecastIdentityReceipt struct {
 }
 
 const forecastIdentityReceiptKey = "forecast/live_identity_v1"
-const forecastPipelinePolicy = "energyplan-primary-v2"
+
+// forecastPipelinePolicy names how Core composes the forecast it plans with.
+// The evaluation cohort keys on it rather than on the Core version, so error
+// bands and baselines survive updates that leave forecasting alone. Bump it
+// whenever Core changes what reaches the planner.
+const forecastPipelinePolicy = "energyplan-primary-v3"
 
 func newForecastSiteConfig(st *state.Store) *forecastSiteConfig {
 	id, _ := st.LoadConfig("forecast/site_id")
@@ -76,11 +81,12 @@ func (s *forecastSiteConfig) Snapshot() forecastSite {
 	defer s.mu.RUnlock()
 	v := s.value
 	v.Options.ExpectedFlows = append([]telemetry.ForecastFlow(nil), v.Options.ExpectedFlows...)
+	v.HistoryOptions.ExpectedFlows = append([]telemetry.ForecastFlow(nil), v.HistoryOptions.ExpectedFlows...)
 	return v
 }
 
 func (s *forecastSiteConfig) Configure(cfg *config.Config, catalog []drivers.CatalogEntry) bool {
-	v := forecastSite{Meter: cfg.SiteMeterDriver(), Timezone: forecastTimezone(), Options: forecastMeasurementOptions(cfg, catalog)}
+	v := forecastSite{Meter: cfg.SiteMeterDriver(), Timezone: forecastTimezone(), Options: forecastMeasurementOptions(cfg, catalog), HistoryOptions: historyMeasurementOptions(cfg, catalog)}
 	if cfg.Weather != nil && cfg.Weather.Provider != "" && cfg.Weather.Provider != "none" {
 		v.Latitude, v.Longitude = cfg.Weather.Latitude, cfg.Weather.Longitude
 		v.HasLocation = !math.IsNaN(v.Latitude) && !math.IsNaN(v.Longitude) && math.Abs(v.Latitude) <= 90 && math.Abs(v.Longitude) <= 180
@@ -105,9 +111,16 @@ func (s *forecastSiteConfig) Configure(cfg *config.Config, catalog []drivers.Cat
 	sort.Slice(driverInputs, func(i, j int) bool { return driverInputs[i].Name < driverInputs[j].Name })
 	learningDrivers := forecastLearningDrivers(v.Meter, v.Options.ExpectedFlows, driverInputs)
 	baseRevision, err := forecastStaticRevision(v, weather, learningDrivers)
-	// Beta.3 hashed every driver. Verify that exact old contract before
-	// retaining its learning ID under the narrower beta.4 hash policy.
-	legacyRevision, legacyErr := forecastStaticRevision(v, weather, driverInputs)
+	// Earlier policies hashed the resolved script path: beta.4 the measurement
+	// drivers, beta.3 every driver. Verify that exact old contract before
+	// retaining its learning ID. A release that also moved the path cannot
+	// match, so such a site starts over once, as every update did before.
+	earlier := make([]string, 0, 2)
+	for _, inputs := range [][]config.Driver{learningDrivers, driverInputs} {
+		if old, oldErr := forecastResolvedPathRevision(v, weather, inputs); oldErr == nil {
+			earlier = append(earlier, old)
+		}
+	}
 	if err != nil {
 		slog.Warn("forecast configuration is not serializable", "err", err)
 		v.Options.HouseholdInvalidReason = "invalid_forecast_configuration"
@@ -117,12 +130,16 @@ func (s *forecastSiteConfig) Configure(cfg *config.Config, catalog []drivers.Cat
 	weatherData, _ := json.Marshal(weather)
 	weatherRevision := fmt.Sprintf("%x", sha256.Sum256(weatherData))
 	s.mu.Lock()
-	if err == nil && legacyErr == nil && s.accepted.BaseRevision == legacyRevision && legacyRevision != baseRevision {
+	for _, old := range earlier {
+		if err != nil || old == baseRevision || s.accepted.BaseRevision != old {
+			continue
+		}
 		if s.accepted.LearningBaseRevision == "" {
-			s.accepted.LearningBaseRevision = legacyRevision
+			s.accepted.LearningBaseRevision = old
 		}
 		s.accepted.BaseRevision = baseRevision
 		s.bindingDirty = true
+		break
 	}
 	if s.weatherRevision != weatherRevision || s.weatherSinceMS <= 0 {
 		s.weatherRevision = weatherRevision
@@ -200,7 +217,7 @@ func (s *forecastSiteConfig) RefreshIdentity(now time.Time) bool {
 		learningBase = s.accepted.LearningBaseRevision
 	}
 	learning := fmt.Sprintf("site-v2:%x", sha256.Sum256([]byte(learningBase+"/"+string(data))))
-	cohort := learning + "/" + Version + "/" + s.engineVersion + "/" + forecastPipelinePolicy
+	cohort := learning + "/" + s.engineVersion + "/" + forecastPipelinePolicy
 	revision := fmt.Sprintf("forecast-v1:%x", sha256.Sum256([]byte(cohort)))
 	opts := s.baseOptions
 	if pending && opts.HouseholdInvalidReason == "" {
@@ -233,24 +250,56 @@ func (s *forecastSiteConfig) RefreshIdentity(now time.Time) bool {
 	return changed
 }
 
-// Keep this encoding compatible with beta.3 so an upgrade can prove that
-// only the hash policy changed. Never infer compatibility from a driver name.
+// forecastStaticRevision identifies what learned models depend on: meter,
+// zone, measurement options, weather settings, the measurement drivers and
+// their script content. A driver whose content was read is hashed with its
+// configured path (drivers/<name>.lua), not the release directory it resolved
+// to, so an update that only moves the scripts keeps the learning. Without a
+// content digest the resolved path stays, so a different script still resets.
 func forecastStaticRevision(v forecastSite, weather *config.Weather, inputs []config.Driver) (string, error) {
+	scripts := forecastScriptDigests(inputs)
+	portable := config.Config{Drivers: append([]config.Driver(nil), inputs...)}
+	portable.UnresolveDriverPaths("")
+	for i, d := range inputs {
+		if scripts[d.Name] == forecastScriptUnavailable {
+			portable.Drivers[i].Lua = d.Lua
+		}
+	}
+	return forecastRevisionOf(v, weather, portable.Drivers, scripts)
+}
+
+// forecastResolvedPathRevision is the policy before #1488, which hashed the
+// resolved path. It only recognises learning IDs accepted under that policy.
+func forecastResolvedPathRevision(v forecastSite, weather *config.Weather, inputs []config.Driver) (string, error) {
+	return forecastRevisionOf(v, weather, inputs, forecastScriptDigests(inputs))
+}
+
+const forecastScriptUnavailable = "unavailable"
+
+// forecastScriptDigests reads each driver's script through its resolved path.
+func forecastScriptDigests(inputs []config.Driver) map[string]string {
 	scripts := make(map[string]string)
 	for _, d := range inputs {
 		digest, err := forecastReleaseScriptDigest(d.Lua)
 		if err != nil {
-			digest = "unavailable"
+			digest = forecastScriptUnavailable
 		}
 		scripts[d.Name] = digest
 	}
+	return scripts
+}
+
+// forecastRevisionOf hashes the given driver entries and script digests.
+// Keep this encoding compatible with beta.3 so an upgrade can prove that only
+// the hash policy changed. Never infer compatibility from a driver name.
+func forecastRevisionOf(v forecastSite, weather *config.Weather, hashed []config.Driver, scripts map[string]string) (string, error) {
 	data, err := json.Marshal(struct {
 		Meter, Timezone string
 		Options         telemetry.ForecastOptions
 		Weather         *config.Weather
 		Drivers         []config.Driver
 		Scripts         map[string]string
-	}{v.Meter, v.Timezone, v.Options, weather, inputs, scripts})
+	}{v.Meter, v.Timezone, v.Options, weather, hashed, scripts})
 	if err != nil {
 		return "", err
 	}

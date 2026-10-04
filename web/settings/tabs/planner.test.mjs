@@ -10,8 +10,9 @@ import assert from "node:assert/strict";
 
 globalThis.window = {};
 await import("./planner.js");
+const { styleForK } = await import("../../plan-prefs.js");
 const tab = globalThis.window.FTWSettings.tabs.planner;
-const { strategyLabel, hedgeLine, engineSelect } = tab._pure;
+const { strategyLabel, styleNote, formatK, engineSelect, marginModel } = tab._pure;
 
 describe("strategyLabel", () => {
   it("maps every planner mode via the local fallback", () => {
@@ -45,11 +46,16 @@ describe("strategyLabel", () => {
   });
 });
 
-describe("hedgeLine", () => {
-  it("does not infer the active margin from the legacy residual", () => {
-    assert.match(hedgeLine("1", 0), /margin varies by interval/);
-    assert.match(hedgeLine("1", 432), /Plan chart/);
-    assert.equal(hedgeLine("0", 432), "No forecast margin requested.");
+describe("styleNote", () => {
+  it("names the Plan card style a fine-tuned margin belongs to", () => {
+    assert.equal(styleNote(0.3, { styleForK }), "Balanced. Changes apply at once.");
+    assert.equal(styleNote("0.15", { styleForK }), "Bold. Changes apply at once.");
+    assert.equal(styleNote(0.7, { styleForK }), "Between two styles, nearest Careful. Changes apply at once.");
+  });
+
+  it("stays plain without the Plan card's style table", () => {
+    assert.equal(styleNote(0.3, null), "Changes apply at once.");
+    assert.equal(formatK("0.30000000000000004"), "0.3");
   });
 });
 
@@ -68,10 +74,15 @@ describe("render", () => {
     assert.ok(!html.includes("planner.mode"), "planner.mode must not be bound in the form");
   });
 
-  it("renders the active-strategy placeholder and hedge line containers", () => {
+  it("renders the active-strategy placeholder and the live forecast margin above the engine details", () => {
     const html = tab.render(stubCtx());
     assert.ok(html.includes('id="planner-active-strategy"'));
-    assert.ok(html.includes('id="planner-hedge-line"'));
+    const margin = html.indexOf('id="planner-style-k"');
+    assert.ok(margin > 0 && margin < html.indexOf("<details"));
+    assert.match(html, /<input type="range" id="planner-style-k" min="0" max="2" step="0\.05"/);
+    assert.ok(html.includes('id="planner-margin-line"'));
+    // The margin saves through /api/planner/prefs, never through config Save.
+    assert.doesNotMatch(html, /data-path="planner\.pv_forecast_safety_k"/);
   });
 
   it("puts enabled, house reserve, and soc_max above a closed engine disclosure", () => {
@@ -97,14 +108,16 @@ describe("render", () => {
   it("does not bind pv_forecast_safety_k when YAML left it unset", () => {
     const html = tab.render(stubCtx());
     assert.ok(!html.includes("[field:planner.pv_forecast_safety_k]"));
+    assert.ok(!html.includes("config.yaml sets pv_forecast_safety_k"));
   });
 
-  it("binds pv_forecast_safety_k inside engine details when YAML set it", () => {
+  it("says a YAML pv_forecast_safety_k only seeds the first start", () => {
     const ctx = stubCtx();
     ctx.config.planner = { pv_forecast_safety_k: 0.25 };
     const html = tab.render(ctx);
     const rest = html.slice(html.indexOf("<details"));
-    assert.ok(rest.includes("[field:planner.pv_forecast_safety_k]"));
+    assert.ok(!html.includes("[field:planner.pv_forecast_safety_k]"));
+    assert.match(rest, /config\.yaml sets pv_forecast_safety_k to 0\.25\. It only seeds the first start/);
   });
 
   it("renders Energyplan controls without retired Python settings", () => {
@@ -162,4 +175,48 @@ describe("engine selection", () => {
       assert.match(html, /Automatic \(release default\)/);
     });
   }
+});
+
+describe("marginModel", () => {
+  const stored = (k) => {
+    const m = marginModel();
+    m.endRead(m.beginRead(), k);
+    return m;
+  };
+
+  it("ignores a read that started before a confirmed write", () => {
+    const m = marginModel();
+    const read = m.beginRead();
+    m.request(0.6);
+    m.confirm(0.6);
+    m.settle(true);
+    m.endRead(read, 0.3); // the redraw's read answers late with the old value
+    assert.deepEqual(m.view(), { k: 0.6, state: "saved" });
+  });
+
+  it("shows the newest value on its way until every save has answered", () => {
+    const m = stored(0.3);
+    m.request(0.8);
+    m.request(1);
+    assert.deepEqual(m.view(), { k: 1, state: "saving" });
+    m.confirm(0.8);
+    m.settle(true);
+    assert.deepEqual(m.view(), { k: 1, state: "saving" });
+    m.confirm(1);
+    m.settle(true);
+    assert.deepEqual(m.view(), { k: 1, state: "saved" });
+  });
+
+  it("follows a style picked on the Plan card", () => {
+    const m = stored(0.3);
+    m.confirm(0.15);
+    assert.deepEqual(m.view(), { k: 0.15, state: "" });
+  });
+
+  it("keeps the box's value after a failed save", () => {
+    const m = stored(0.3);
+    m.request(0.6);
+    m.settle(false);
+    assert.deepEqual(m.view(), { k: 0.3, state: "failed" });
+  });
 });

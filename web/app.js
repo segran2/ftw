@@ -2,6 +2,7 @@
 
 (function () {
   "use strict";
+  var controlFeedbackExpiry;
 
   const evPlanUI = import("/ev-plan.js").catch(function () { return null; });
   const POLL_INTERVAL = 2000;        // status poll cadence — snappier cards
@@ -521,6 +522,7 @@
   // replay when either the mapper or the element is ready, so the hero
   // does not sit in its loading skeleton until the next two-second poll.
   var lastFlowStatus = null;
+  var lastFlowLive = true;
   var lastFlowReadings = null;
   var flowUpgradeReplayQueued = false;
 
@@ -552,7 +554,9 @@
     }
   }
 
-  function paintEnergyFlow(data) {
+  function paintEnergyFlow(data, live) {
+    if (data !== lastFlowStatus) lastFlowLive = true;
+    if (typeof live === "boolean") lastFlowLive = live;
     lastFlowStatus = data;
     var flowEl = document.getElementById("energy-flow");
     if (!flowEl) return;
@@ -560,7 +564,8 @@
       queueFlowReplay();
       return;
     }
-    lastFlowReadings = window.ftwFlowReadingsFromStatus(data, energyFlowOpts(data));
+    var opts = energyFlowOpts(data); opts.live = lastFlowLive;
+    lastFlowReadings = window.ftwFlowReadingsFromStatus(data, opts);
     (lastFlowReadings.planets || []).forEach(function (p) {
       if (p.role !== "ev" || p.placeholder || !p.name) return;
       var lpEv = loadpointsByDriver && loadpointsByDriver[p.name];
@@ -578,6 +583,7 @@
       p.socStale = !!lpEv.vehicle_stale;
     });
     if (typeof flowEl.setReadings === "function") {
+      if (typeof flowEl.toggleAttribute === "function") flowEl.toggleAttribute("static", !lastFlowLive);
       flowEl.setReadings(lastFlowReadings);
     } else {
       queueFlowReplay();
@@ -1012,6 +1018,11 @@
 
     // Drivers
     renderDrivers(data.drivers || {}, dispatchByDriver);
+    if (window.FTWControlFeedback) {
+      updateControlFeedback(data, true);
+      clearTimeout(controlFeedbackExpiry);
+      controlFeedbackExpiry = setTimeout(function () { updateControlFeedback(data, false); paintEnergyFlow(data, false); }, 15000);
+    }
 
     // Dispatch
     renderDispatch(data.dispatch || []);
@@ -2686,6 +2697,55 @@
   var evModalBody = document.getElementById("ev-modal-body");
   var evModalDriver = null; // captured from the planet click; sent on commands
   var energyFlowEl = document.getElementById("energy-flow");
+  var controlProofModal = document.getElementById("control-proof-modal");
+  var controlProofScope = null;
+  var controlProofLive = false;
+  var batteryProofDriver = "";
+  var pvProofDriver = "";
+  var openPlanetControls = function () {};
+  // Each device sheet answers "Are we in control?" first. Core decides the
+  // status; the shared view only renders it.
+  function updateControlFeedback(data, live) {
+    controlProofLive = live;
+    var feedback = window.FTWControlFeedback;
+    if (!feedback) return;
+    feedback.render(document.getElementById("control-results"), data.control_feedback, live, {compact:true});
+    feedback.render(document.getElementById("battery-control-proof"), feedback.forPlanet(data.control_feedback, {role:"battery", name:batteryProofDriver}), live);
+    feedback.render(document.getElementById("ev-control-proof"), feedback.forPlanet(data.control_feedback, {role:"ev", name:evModalDriver || ""}), live);
+    feedback.render(document.getElementById("pv-control-proof"), feedback.forPlanet(data.control_feedback, {role:"pv", name:pvProofDriver}), live);
+    if (controlProofModal && controlProofModal.hasAttribute("open")) {
+      feedback.render(document.getElementById("control-proof-details"), feedback.forPlanet(data.control_feedback, controlProofScope || {}), live);
+    }
+  }
+  function openControlProof(scope) {
+    var feedback = window.FTWControlFeedback;
+    if (!controlProofModal || !feedback || !lastStatusPayload) return false;
+    var rows = feedback.forPlanet(lastStatusPayload.control_feedback, scope);
+    if (!rows.length) return false;
+    controlProofScope = scope;
+    feedback.render(document.getElementById("control-proof-details"), rows, controlProofLive);
+    controlProofModal.open();
+    return true;
+  }
+  var batteryControls = document.getElementById("battery-control");
+  if (batteryControls) batteryControls.addEventListener("ftw-battery-scope", function (event) {
+    batteryProofDriver = event.detail.driver || "";
+    if (lastStatusPayload) updateControlFeedback(lastStatusPayload, controlProofLive);
+  });
+  var pvControls = document.getElementById("pv-control");
+  if (pvControls) pvControls.addEventListener("ftw-pv-scope", function (event) {
+    pvProofDriver = event.detail.driver || "";
+    if (lastStatusPayload) updateControlFeedback(lastStatusPayload, controlProofLive);
+  });
+  var proofSummary = document.getElementById("control-results");
+  if (proofSummary) proofSummary.addEventListener("click", function (event) {
+    var button = event.target.closest("button[data-driver]");
+    if (button) {
+      var scope = {name:button.dataset.driver, role:button.dataset.kind === "v2x_charger" ? "ev" : button.dataset.kind};
+      if (!openPlanetControls(scope)) openControlProof(scope);
+    }
+  });
+
 
   // Render the EV modal by building DOM nodes (textContent) rather than
   // concatenating strings into innerHTML — d.driver comes from driver
@@ -4601,6 +4661,7 @@
   if (evModal) {
     function openEvModal(driver) {
       evModalDriver = driver || null;
+      if (lastStatusPayload) updateControlFeedback(lastStatusPayload, controlProofLive);
       evModal.open();
       refreshEvModal();
       // Guard against stacked timers if the modal opens again while a
@@ -4621,26 +4682,31 @@
     if (energyFlowEl) {
       energyFlowEl.addEventListener("ftw-planet-click", function (e) {
         var d = (e && e.detail) || {};
-        if (d.role === "ev") openEvModal(d.name || null);
+        if (d.id && d.id.indexOf("agg-") === 0) d = {role:d.role, id:d.id, name:""};
+        if (!openPlanetControls(d)) openControlProof(d);
+      });
+    }
+    openPlanetControls = function (d) {
+        if (d.id && d.id.indexOf("agg-") === 0) d = {role:d.role};
+        if (d.role === "ev") { openEvModal(d.name || null); return true; }
         if (d.role === "battery") {
           var drv = (lastStatusPayload && lastStatusPayload.drivers) || {};
           var clicked = drv[d.name || ""] || {};
           if (clicked.observe_only) return;
           var bc = document.getElementById("battery-control");
-          if (bc && typeof bc.open === "function") bc.open(d.name || d.id || "");
+          if (bc && typeof bc.open === "function") { bc.open(d.name || d.id || ""); return true; }
         }
         if (d.role === "pv") {
           var pc = document.getElementById("pv-control");
           if (pc && typeof pc.open === "function") {
-            // d.id is the driver id when the user clicked an expanded
-            // per-driver bubble; "" / undefined opens at the aggregate
-            // scope from the merged bubble.
-            pc.open(d.id || "");
+            // The node id includes a role prefix; controls take the driver name.
+            pc.open(d.name || "");
+            return true;
           }
         }
-        if (d.role === "grid" && gridModal) gridModal.open();
-      });
-    }
+        if (d.role === "grid" && gridModal) { gridModal.open(); return true; }
+        return false;
+    };
 
     // Tile-mode (numeric cards) parity: when the operator toggles the
     // hero off, the energy-flow planets aren't on screen, so the

@@ -334,6 +334,15 @@ type Action struct {
 	// SoC remain the stable aggregate dispatch/API contract.
 	StoragePowerW   map[string]float64 `json:"storage_power_w,omitempty"`
 	StorageEnergyWh map[string]float64 `json:"storage_energy_wh,omitempty"`
+
+	// LivePVSurplusSoCCap is a 0–1 SoC fraction that Core sets when it
+	// publishes the plan; solver output leaves it zero. Zero means the
+	// planner gives no permission to move live surplus into the battery in
+	// this slot. Above zero, live export beyond plan may charge the battery
+	// up to this SoC. Dispatch still applies its own limits, and an operator
+	// PVSurplusAbsorbSoCCap overrides it. Always sent, so a client can tell
+	// zero from a box that predates the field.
+	LivePVSurplusSoCCap float64 `json:"live_pv_surplus_soc_cap"`
 }
 
 // Baselines are counter-factual dispatch costs over the same horizon,
@@ -718,18 +727,11 @@ func OptimizeContext(ctx context.Context, slots []Slot, p Params) (Plan, error) 
 		}
 	}
 
-	// Deadline slot index for the mid-horizon EV target penalty. A
-	// target beyond horizon end gets clamped to the last slot so
-	// the DP still "sees" it (rather than silently ignoring). A
-	// target of -1 means no deadline — opportunistic charging only.
+	// Deadline slot for the EV target penalty; -1 means opportunistic
+	// charging only. Energyplan receives the same slot.
 	deadlineSlot := -1
-	if evActive && lp.TargetSoC > 0 {
-		deadlineSlot = lp.TargetSlotIdx
-		if deadlineSlot < 0 {
-			deadlineSlot = -1
-		} else if deadlineSlot >= N {
-			deadlineSlot = N - 1
-		}
+	if evActive {
+		deadlineSlot = lp.deadlineSlot(N)
 	}
 
 	// Terminal values. Battery SoC credits stored energy. EV SoC
