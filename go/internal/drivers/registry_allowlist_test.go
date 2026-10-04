@@ -161,7 +161,6 @@ func TestTcpAllowedHostsFor(t *testing.T) {
 	}
 }
 
-
 // A cloud driver owns its fixed network boundary in DRIVER.http_hosts.
 // Existing configs may predate that metadata and therefore carry an empty
 // capabilities.http.allowed_hosts. Both ordinary startup and connection
