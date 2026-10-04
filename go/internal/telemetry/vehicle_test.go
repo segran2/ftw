@@ -335,3 +335,32 @@ func TestCachedVehicleDisplayRequiresValidSourceAgeAndSoC(t *testing.T) {
 		}
 	}
 }
+
+func TestPickVehicleForAnchorAcceptsCloudCadence(t *testing.T) {
+	s := NewStore()
+	pushVehicle(t, s, "cloud", 0.50, 0.80, "Stopped", false, 30*time.Minute)
+
+	if pick := PickBestVehicleForLoadpoint(s, false, time.Now()); pick.Driver != "" {
+		t.Fatalf("30-minute-old SoC is not live: %+v", pick)
+	}
+	pick := PickVehicleForAnchor(s, false, time.Now())
+	if pick.Driver != "cloud" || pick.SoC != 0.50 || !pick.Stale {
+		t.Fatalf("anchor pick: %+v", pick)
+	}
+	if age := time.Since(pick.UpdatedAt); age < 29*time.Minute {
+		t.Fatalf("anchor pick must keep the observation time, age %v", age)
+	}
+}
+
+func TestPickVehicleForAnchorRejectsTooOldAndDriverMarkedStale(t *testing.T) {
+	s := NewStore()
+	pushVehicle(t, s, "old", 0.50, 0.80, "Stopped", false, VehicleAnchorMaxAge+time.Minute)
+	if pick := PickVehicleForAnchor(s, false, time.Now()); pick.Driver != "" {
+		t.Fatalf("reading past VehicleAnchorMaxAge: %+v", pick)
+	}
+	s = NewStore()
+	pushVehicle(t, s, "marked", 0.50, 0.80, "Stopped", true, time.Minute)
+	if pick := PickVehicleForAnchor(s, false, time.Now()); pick.Driver != "" {
+		t.Fatalf("driver-marked stale reading: %+v", pick)
+	}
+}

@@ -2893,22 +2893,21 @@ func main() {
 			// plug-in-anchor + delivered-Wh estimate; when a vehicle driver
 			// (TeslaBLEProxy etc.) is online and matched, its SoC is ground
 			// truth. Runs after Tick's Observe so the per-tick re-anchor
-			// wins over that tick's inference. Same picker the MPC spec and
-			// api.go's loadpoint decoration use, so all three agree on which
-			// vehicle is "the one"; we additionally require !Stale so a
-			// driver serving last-known cache (car asleep) can't pin the
-			// dashboard to a stale value — inference takes over until fresh
-			// BMS data returns.
+			// wins over that tick's inference. The reading is anchored at
+			// the time it arrived, and energy delivered since then moves
+			// the estimate on, so a cloud SoC up to VehicleAnchorMaxAge old
+			// still helps. Driver-marked stale values and replays of a
+			// cached value never anchor.
 			for _, st := range lpMgr.States() {
 				if !st.PluggedIn {
 					continue
 				}
 				delivering := st.CurrentPowerW > loadpoint.DeliveringW
-				pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, time.Now())
-				if pick.Driver == "" || pick.Stale {
+				pick := telemetry.PickVehicleForAnchor(tel, delivering, time.Now())
+				if pick.Driver == "" {
 					continue
 				}
-				lpMgr.AnchorVehicleSoC(st.ID, pick.SoC)
+				lpMgr.AnchorVehicleSoCAt(st.ID, pick.SoC, pick.UpdatedAt)
 			}
 
 			if !freshness.Allowed() {
