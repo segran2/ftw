@@ -16,7 +16,7 @@ func newDriverRegistry(tel *telemetry.Store, st *state.Store) *drivers.Registry 
 		return config.DriverSecretStateKey(owner, key)
 	}
 	reg.SecretPersister = func(owner, key, value string) error {
-		return st.SaveConfig(driverSecretKey(owner, key), value)
+		return st.SaveDriverSecret(owner, key, value)
 	}
 	reg.SecretOverride = func(owner, key string) (string, bool) {
 		return st.LoadConfig(driverSecretKey(owner, key))

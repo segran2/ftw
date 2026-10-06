@@ -139,8 +139,112 @@ func TestSaveStoredWritesExplicitReauthorizationUnderOwner(t *testing.T) {
 	if err := SaveStored(st, path, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := st.LoadConfig(DriverSecretStateKey("owner-1", "refresh_token")); !ok || got != "token-D" {
+	owner := oauthDriver(t, cfg, "myuplink").SecretOwner()
+	if owner == "owner-1" {
+		t.Fatal("reauthorization retained the old token family's owner")
+	}
+	if got, ok := st.LoadConfig(DriverSecretStateKey(owner, "refresh_token")); !ok || got != "token-D" {
 		t.Fatalf("reauth secret = %q ok=%v, want token-D", got, ok)
+	}
+	if err := st.SaveDriverSecret("owner-1", "refresh_token", "late-old-token"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey("myuplink", "refresh_token")); got != "token-D" {
+		t.Fatalf("old token family overwrote reauthorization: %q", got)
+	}
+}
+
+func TestCredentialOwnerRotationSurvivesSettingsSaveAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	path, database := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "state.db")
+	lua := filepath.Join(dir, "oauth.lua")
+	if err := os.WriteFile(lua, []byte("function driver_init() end"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.SaveConfig(DriverSecretStateKey("myuplink", "refresh_token"), "rotated-B"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := oauthSettings(t, dir, database, testOAuthDriver("myuplink", "", "config-A", lua))
+	if err := SaveStored(st, path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	owner := oauthDriver(t, cfg, "myuplink").SecretOwner()
+	if err := st.SaveConfig(DriverSecretStateKey(owner, "refresh_token"), "rotated-C"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveStored(st, path, cfg); err != nil {
+		t.Fatalf("settings save after rotation: %v", err)
+	}
+	if err := BindCredentialOwners(st, path, cfg); err != nil {
+		t.Fatalf("restart after rotation: %v", err)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey(owner, "refresh_token")); got != "rotated-C" {
+		t.Fatalf("rotation changed to %q", got)
+	}
+}
+
+func TestCredentialOwnerSurvivesLegacyCoreRotationAndRename(t *testing.T) {
+	dir := t.TempDir()
+	path, database := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "state.db")
+	lua := filepath.Join(dir, "oauth.lua")
+	if err := os.WriteFile(lua, []byte("function driver_init() end"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.SaveConfig(DriverSecretStateKey("myuplink", "refresh_token"), "rotated-B"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := oauthSettings(t, dir, database, testOAuthDriver("myuplink", "", "config-A", lua))
+	if err := SaveStored(st, path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	owner := oauthDriver(t, cfg, "myuplink").SecretOwner()
+	if err := st.SaveDriverSecret(owner, "refresh_token", "rotated-C"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey("myuplink", "refresh_token")); got != "rotated-C" {
+		t.Fatalf("older Core would reload %q after rollback", got)
+	}
+	// Older Core only knows the display-name key and can rotate it again.
+	if err := st.SaveConfig(DriverSecretStateKey("myuplink", "refresh_token"), "rotated-D"); err != nil {
+		t.Fatal(err)
+	}
+	if err := BindCredentialOwners(st, path, cfg); err != nil {
+		t.Fatalf("return from older Core: %v", err)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey(owner, "refresh_token")); got != "rotated-D" {
+		t.Fatalf("return from older Core lost rotation: %q", got)
+	}
+	oauthDriver(t, cfg, "myuplink").Name = "renamed"
+	if err := SaveStored(st, path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey("renamed", "refresh_token")); got != "rotated-D" {
+		t.Fatalf("renamed legacy lookup got %q", got)
+	}
+	// Reuse the old name for another account. A late callback from the old
+	// owner must update the renamed alias, never the new account's alias.
+	cfg.Drivers = append(cfg.Drivers, testOAuthDriver("myuplink", "", "new-account", lua))
+	if err := SaveStored(st, path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveDriverSecret(owner, "refresh_token", "rotated-E"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey("myuplink", "refresh_token")); got != "new-account" {
+		t.Fatalf("reused name received the other account's token: %q", got)
+	}
+	if got, _ := st.LoadConfig(DriverSecretStateKey("renamed", "refresh_token")); got != "rotated-E" {
+		t.Fatalf("renamed driver lost its new rotation: %q", got)
 	}
 }
 

@@ -96,9 +96,9 @@ function driver_default_mode() end
 				if got := metric(tel, "persist_ok"); got != 1 {
 					t.Errorf("secret persistence during %s failed", scenario.phase)
 				}
-			if got, ok := st.LoadConfig(config.DriverSecretStateKey(cfg.SecretOwner(), "refresh_token")); !ok || got != "synthetic-B" {
-				t.Errorf("rotated token B was not stored")
-			}
+				if got, ok := st.LoadConfig(config.DriverSecretStateKey(cfg.SecretOwner(), "refresh_token")); !ok || got != "synthetic-B" {
+					t.Errorf("rotated token B was not stored")
+				}
 			}()
 			_, tel, stop = start()
 			defer stop()

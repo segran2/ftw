@@ -216,7 +216,10 @@ func (s *Store) SaveConfiguration(document []byte, expected int64, credentials m
 			values[k] = v
 		}
 		values[configurationKey] = string(encoded)
-		return saveConfigValues(tx, values)
+		if err := saveConfigValues(tx, values); err != nil {
+			return err
+		}
+		return mirrorDriverSecrets(tx, document)
 	})
 	if err != nil {
 		return 0, err

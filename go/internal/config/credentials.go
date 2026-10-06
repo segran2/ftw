@@ -12,7 +12,7 @@ const driverSecretPrefix = "driver_secret:"
 
 // DriverSecretStateKey is the unwatched KV row for a rotated driver secret.
 func DriverSecretStateKey(owner, key string) string {
-	return driverSecretPrefix + strings.TrimSpace(owner) + ":" + strings.TrimSpace(key)
+	return state.DriverSecretKey(strings.TrimSpace(owner), strings.TrimSpace(key))
 }
 
 // SecretOwner is the durable credential id for this driver. An assigned
@@ -24,13 +24,22 @@ func (d Driver) SecretOwner() string {
 	return strings.TrimSpace(d.Name)
 }
 
-func assignCredentialOwners(cfg *Config) error {
+func assignCredentialOwners(cfg, previous *Config) error {
 	if cfg == nil {
 		return nil
 	}
 	seen := make(map[string]string, len(cfg.Drivers))
 	for i := range cfg.Drivers {
 		d := &cfg.Drivers[i]
+		if old := previousDriverForSecrets(previous, *d); old != nil && old.CredentialOwner != "" && old.SecretOwner() == d.SecretOwner() {
+			oldToken, _ := old.Config["refresh_token"].(string)
+			newToken, _ := d.Config["refresh_token"].(string)
+			if newToken != oldToken {
+				// Consent starts a new token family. A late callback from the
+				// old driver must not overwrite the replacement account.
+				d.CredentialOwner = ""
+			}
+		}
 		if strings.TrimSpace(d.CredentialOwner) == "" {
 			d.CredentialOwner = uuid.NewString()
 		}
@@ -41,6 +50,7 @@ func assignCredentialOwners(cfg *Config) error {
 		if other, ok := seen[owner]; ok {
 			return fmt.Errorf("drivers %q and %q share credential_owner %s", other, d.Name, owner)
 		}
+		d.CredentialOwner = owner
 		seen[owner] = d.Name
 	}
 	return nil
@@ -81,6 +91,12 @@ func collectDriverSecretCredentials(cfg *Config, previous *Config, stored map[st
 	}
 	for _, d := range cfg.Drivers {
 		prev := previousDriverForSecrets(previous, d)
+		token, hasToken := d.Config["refresh_token"].(string)
+		oldToken := ""
+		if prev != nil {
+			oldToken, _ = prev.Config["refresh_token"].(string)
+		}
+		newToken := hasToken && previous != nil && (token != oldToken || prev == nil || prev.SecretOwner() != d.SecretOwner())
 		// First import has no previous document; still take leftover
 		// name-keyed rows for this display name. A later save only
 		// migrates when this entry continues that same named driver.
@@ -92,7 +108,27 @@ func collectDriverSecretCredentials(cfg *Config, previous *Config, stored map[st
 					continue
 				}
 				owned := DriverSecretStateKey(d.SecretOwner(), secretKey)
-				if existing, ok := stored[owned]; ok && existing != value {
+				if existing, ok := stored[owned]; ok {
+					if existing == value {
+						continue
+					}
+					if secretKey == "refresh_token" && newToken {
+						continue
+					}
+					lastMirror, mirrored := stored[state.DriverSecretLegacyHashKey(d.SecretOwner(), secretKey)]
+					if mirrored && lastMirror == state.DriverSecretValueHash(existing) {
+						// Older Core rotated the name-keyed copy after rollback.
+						credentials[owned] = value
+						continue
+					}
+					if mirrored && lastMirror != state.DriverSecretValueHash(value) {
+						return nil, fmt.Errorf("driver %q: ambiguous %s secret ownership", d.Name, secretKey)
+					}
+					if prev != nil && strings.TrimSpace(prev.CredentialOwner) == d.SecretOwner() {
+						// The owner is already bound. An old leftover must not
+						// overwrite a subsequent owner-keyed rotation.
+						continue
+					}
 					return nil, fmt.Errorf("driver %q: ambiguous %s secret ownership", d.Name, secretKey)
 				}
 				if owned != key {
@@ -100,15 +136,7 @@ func collectDriverSecretCredentials(cfg *Config, previous *Config, stored map[st
 				}
 			}
 		}
-		token, ok := d.Config["refresh_token"].(string)
-		if !ok {
-			continue
-		}
-		oldToken := ""
-		if prev != nil {
-			oldToken, _ = prev.Config["refresh_token"].(string)
-		}
-		if previous != nil && token != oldToken {
+		if newToken {
 			credentials[DriverSecretStateKey(d.SecretOwner(), "refresh_token")] = token
 		}
 	}
@@ -128,8 +156,8 @@ func driversNeedCredentialOwnerBind(cfg *Config, stored map[string]string) bool 
 		if ownerPrefix == prefix {
 			continue
 		}
-		for key := range stored {
-			if strings.HasPrefix(key, prefix) {
+		for key, value := range stored {
+			if suffix, ok := strings.CutPrefix(key, prefix); ok && stored[ownerPrefix+suffix] != value {
 				return true
 			}
 		}
@@ -143,7 +171,7 @@ func BindCredentialOwners(st *state.Store, path string, cfg *Config) error {
 	if st == nil || cfg == nil {
 		return nil
 	}
-	stored, err := st.LoadConfigByPrefix(driverSecretPrefix)
+	stored, err := st.LoadConfigByPrefix("driver_secret")
 	if err != nil {
 		return err
 	}

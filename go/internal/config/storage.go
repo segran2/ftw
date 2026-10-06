@@ -276,7 +276,7 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 			return errors.New("move the state database offline; its path cannot change in Settings")
 		}
 	}
-	if err := assignCredentialOwners(cfg); err != nil {
+	if err := assignCredentialOwners(cfg, previous); err != nil {
 		return err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -293,7 +293,7 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 	if cfg.EVCharger != nil {
 		password = cfg.EVCharger.Password
 	}
-	storedSecrets, err := st.LoadConfigByPrefix(driverSecretPrefix)
+	storedSecrets, err := st.LoadConfigByPrefix("driver_secret")
 	if err != nil {
 		return err
 	}
