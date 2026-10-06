@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -308,6 +309,39 @@ func TestBindCredentialOwnersMigratesExistingNameKeyedSecret(t *testing.T) {
 	}
 	if oauthDriver(t, cfg, "old-name").CredentialOwner != owner {
 		t.Fatalf("second bind reminted owner %q", oauthDriver(t, cfg, "old-name").CredentialOwner)
+	}
+}
+
+func TestBindCredentialOwnersPreservesRotationFromPreviousCore(t *testing.T) {
+	dir := t.TempDir()
+	path, database := filepath.Join(dir, "config.yaml"), filepath.Join(dir, "state.db")
+	lua := filepath.Join(dir, "oauth.lua")
+	if err := os.WriteFile(lua, []byte("function driver_init() end"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cfg := oauthSettings(t, dir, database, testOAuthDriver("myuplink", "", "original-A", lua))
+	raw, err := json.Marshal(storedSettings{Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Revision, err = st.SaveConfiguration(raw, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveConfig(DriverSecretStateKey("myuplink", "refresh_token"), "current-B"); err != nil {
+		t.Fatal(err)
+	}
+	if err := BindCredentialOwners(st, path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	owner := oauthDriver(t, cfg, "myuplink").SecretOwner()
+	if got, _ := st.LoadConfig(DriverSecretStateKey(owner, "refresh_token")); got != "current-B" {
+		t.Fatalf("upgrade replaced the current rotation with %q", got)
 	}
 }
 
