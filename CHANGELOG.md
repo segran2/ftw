@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.139.5
+
+### Patch Changes
+
+- de87cfa: Keep rotated OAuth tokens with a stable driver owner so a rename or reused name cannot attach the wrong account.
+- c62073f: Let Test connection reuse the saved driver's OAuth tokens and its exact loopback URL.
+
 ## 0.139.4
 
 ### Patch Changes
