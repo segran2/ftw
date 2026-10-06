@@ -293,11 +293,12 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 		if probeAdded {
 			reg.RemoveProbe(cfg.Name)
 		}
-		if !probeChangedSharedSecret() || s.deps.Registry == nil {
+		restartName := probeChangedSharedSecret()
+		if restartName == "" || s.deps.Registry == nil {
 			return
 		}
-		if err := s.deps.Registry.RestartByName(context.Background(), probe.Name); err != nil {
-			slog.Warn("driver probe secret changed but restart failed", "driver", probe.Name, "err", err)
+		if err := s.deps.Registry.RestartByName(context.Background(), restartName); err != nil {
+			slog.Warn("driver probe secret changed but restart failed", "driver", restartName, "err", err)
 		}
 	}()
 	if err := reg.AddProbe(ctx, cfg); err != nil {
@@ -377,13 +378,17 @@ func probePostedDifferentSecret(probe, live config.Driver, key string) bool {
 	return posted != saved
 }
 
-func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string, probe config.Driver) func() bool {
+func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string, probe config.Driver) func() string {
 	var mu sync.Mutex
 	changed := false
-	changedSharedSecret := func() bool {
+	restartName := ""
+	changedSharedSecret := func() string {
 		mu.Lock()
 		defer mu.Unlock()
-		return changed
+		if changed {
+			return restartName
+		}
+		return ""
 	}
 	if s.deps.State == nil {
 		return changedSharedSecret
@@ -392,7 +397,8 @@ func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string,
 	if !ok {
 		return changedSharedSecret
 	}
-	secretOwner := live.Name
+	restartName = live.Name
+	secretOwner := live.SecretOwner()
 	ownerFor := func(driverName string) string {
 		if driverName == probeName {
 			return secretOwner
@@ -414,7 +420,7 @@ func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string,
 		if old, ok := s.deps.State.LoadConfig(stateKey); ok && old == value {
 			return nil
 		}
-		if err := s.deps.State.SaveConfig(stateKey, value); err != nil {
+		if err := s.deps.State.SaveDriverSecret(owner, key, value); err != nil {
 			return err
 		}
 		if driverName == probeName && owner == secretOwner {

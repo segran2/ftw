@@ -604,6 +604,8 @@ function driver_init(config)
     if config and config.rotate_secret then
         host.persist_secret("refresh_token", config.persist_value)
     end
+    host.emit_metric("probe_ready", 1)
+    host.emit_metric("used_rotated_token", config.refresh_token == "rotated-token" and 1 or 0)
 end
 function driver_poll() end
 function driver_command() end
@@ -627,7 +629,7 @@ func TestHandleDriverTestRestartsRunningDriverAfterRefreshTokenRotation(t *testi
 	t.Cleanup(func() { _ = st.Close() })
 
 	const secretKey = "refresh_token"
-	if err := st.SaveConfig(driverSecretStateKey("myuplink", secretKey), "fresh-token"); err != nil {
+	if err := st.SaveConfig(driverSecretStateKey("credential-myuplink", secretKey), "fresh-token"); err != nil {
 		t.Fatalf("save secret: %v", err)
 	}
 
@@ -642,8 +644,9 @@ func TestHandleDriverTestRestartsRunningDriverAfterRefreshTokenRotation(t *testi
 	t.Cleanup(reg.ShutdownAll)
 
 	liveDriver := config.Driver{
-		Name: "myuplink",
-		Lua:  luaPath,
+		Name:            "myuplink",
+		CredentialOwner: "credential-myuplink",
+		Lua:             luaPath,
 		Config: map[string]any{
 			"refresh_token": "stale-token",
 		},
@@ -684,7 +687,7 @@ func TestHandleDriverTestRestartsRunningDriverAfterRefreshTokenRotation(t *testi
 		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
 	}
 
-	if got, ok := st.LoadConfig(driverSecretStateKey("myuplink", secretKey)); !ok || got != "rotated-token" {
+	if got, ok := st.LoadConfig(driverSecretStateKey("credential-myuplink", secretKey)); !ok || got != "rotated-token" {
 		t.Fatalf("persisted secret = %q ok=%v, want rotated-token", got, ok)
 	}
 
@@ -695,6 +698,9 @@ func TestHandleDriverTestRestartsRunningDriverAfterRefreshTokenRotation(t *testi
 	if after.Generation <= before.Generation {
 		t.Fatalf("generation = %d after probe, want greater than %d after rotated shared secret",
 			after.Generation, before.Generation)
+	}
+	if got, _, ok := tel.LatestMetric("myuplink", "used_rotated_token"); !ok || got != 1 {
+		t.Fatalf("restarted driver did not read the owner's new token: %v %v", got, ok)
 	}
 }
 
@@ -709,7 +715,7 @@ func TestHandleDriverTestDoesNotRestartRunningDriverWhenSecretUnchanged(t *testi
 	t.Cleanup(func() { _ = st.Close() })
 
 	const secretKey = "refresh_token"
-	if err := st.SaveConfig(driverSecretStateKey("myuplink", secretKey), "same-token"); err != nil {
+	if err := st.SaveConfig(driverSecretStateKey("credential-myuplink", secretKey), "same-token"); err != nil {
 		t.Fatalf("save secret: %v", err)
 	}
 
@@ -724,8 +730,9 @@ func TestHandleDriverTestDoesNotRestartRunningDriverWhenSecretUnchanged(t *testi
 	t.Cleanup(reg.ShutdownAll)
 
 	liveDriver := config.Driver{
-		Name: "myuplink",
-		Lua:  luaPath,
+		Name:            "myuplink",
+		CredentialOwner: "credential-myuplink",
+		Lua:             luaPath,
 		Config: map[string]any{
 			"refresh_token": "stale-token",
 		},
