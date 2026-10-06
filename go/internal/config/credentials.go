@@ -96,7 +96,7 @@ func collectDriverSecretCredentials(cfg *Config, previous *Config, stored map[st
 		if prev != nil {
 			oldToken, _ = prev.Config["refresh_token"].(string)
 		}
-		newToken := hasToken && previous != nil && (token != oldToken || prev == nil || prev.SecretOwner() != d.SecretOwner())
+		newToken := hasToken && previous != nil && (token != oldToken || prev == nil || (prev.CredentialOwner != "" && prev.SecretOwner() != d.SecretOwner()))
 		// First import has no previous document; still take leftover
 		// name-keyed rows for this display name. A later save only
 		// migrates when this entry continues that same named driver.
