@@ -1834,7 +1834,1077 @@
     driversGrid.addEventListener("click", function (ev) {
       var v2xBtn = ev.target.closest("[data-v2x-action]");
       if (v2xBtn) {
-        var v2xNa…13607 tokens truncated…     text = "The car confirmed this charging goal is complete.";
+        var v2xName = v2xBtn.getAttribute("data-drv");
+        var v2xAction = v2xBtn.getAttribute("data-v2x-action");
+        var panel = v2xBtn.closest(".v2x-control-panel");
+        var input = panel ? panel.querySelector(".v2x-power-input") : null;
+        var status = panel ? panel.querySelector(".v2x-command-status") : null;
+        if (!v2xName || !v2xAction) return;
+
+        var requested = input ? Math.abs(Number(input.value || 0)) : 0;
+        var max = input ? Number(input.max || 50000) : 50000;
+        if (!Number.isFinite(requested)) requested = 0;
+        requested = Math.min(Math.max(requested, 0), max);
+        var powerW = v2xAction === "stop" ? 0 : requested;
+        if (v2xAction === "discharge") powerW = -powerW;
+        if (v2xAction === "discharge" && powerW < 0) {
+          if (!window.confirm("Discharge " + v2xName + " at " + formatW(powerW) + "?")) return;
+        }
+
+        v2xBtn.disabled = true;
+        if (status) {
+          status.className = "v2x-command-status";
+          status.textContent = "Sending " + formatW(powerW) + "…";
+        }
+        v2xCommand(v2xName, powerW)
+          .then(function () {
+            if (status) {
+              status.className = "v2x-command-status ok";
+              status.textContent = powerW === 0 ? "Stopped" : "Sent " + formatW(powerW);
+            }
+            setTimeout(fetchStatus, 600);
+          })
+          .catch(function (err) {
+            if (status) {
+              status.className = "v2x-command-status error";
+              status.textContent = err.message;
+            }
+            alert("V2X command failed: " + err.message);
+          })
+          .finally(function () { v2xBtn.disabled = false; });
+        return;
+      }
+
+      var btn = ev.target.closest("[data-drv-action]");
+      if (!btn) return;
+      var name = btn.getAttribute("data-drv");
+      var action = btn.getAttribute("data-drv-action");
+      if (!name || !action) return;
+      // Diagnose is a UI-only action: no API mutation, just open the
+      // modal and let it poll /api/drivers/{name} on its own cadence.
+      if (action === "diagnose") {
+        if (window.FTWDiagnostics) window.FTWDiagnostics.open(name);
+        return;
+      }
+      if (action === "restart" && !window.confirm("Restart driver \"" + name + "\"? It will briefly stop reporting while it reconnects.")) return;
+      if (action === "disable" && !window.confirm("Disable driver \"" + name + "\"? It will be stopped and won't auto-start until re-enabled.")) return;
+      btn.disabled = true;
+      btn.textContent = action + "ing…";
+      driverLifecycleCall(name, action)
+        .then(function () { fetchStatus(); })
+        .catch(function (err) { alert("Driver " + action + " failed: " + err.message); })
+        .finally(function () { btn.disabled = false; });
+    });
+  }
+
+  function renderDrivers(drivers, dispatchByDriver) {
+    driversGrid.innerHTML = "";
+    var names = Object.keys(drivers).sort();
+    names.forEach(function (name) {
+      var d = drivers[name];
+      var card = document.createElement("div");
+      card.className = "driver-card";
+      if (d.disabled === true || d.status === "disabled") card.className += " driver-card-disabled";
+      if (d.not_running === true) card.className += " driver-card-warn";
+
+      var ticks = d.tick_count != null ? d.tick_count : 0;
+      var errors = d.consecutive_errors != null ? d.consecutive_errors : 0;
+
+      // Detect driver kind from telemetry shape. Vehicle drivers
+      // (e.g. tesla_vehicle) emit DerVehicle which carries SoC +
+      // charge_limit + charging_state but no power; render a vehicle-
+      // specific body. EV chargers emit DerEV with power. Anything
+      // else falls through to the legacy meter/pv/battery layout.
+      var isVehicle = (d.vehicle_soc != null || d.vehicle_charge_limit_pct != null);
+      var isEV = !isVehicle && (d.ev_w != null || d.ev_connected != null || d.ev_charging != null);
+      var isV2X = !isVehicle && (d.v2x_w != null || d.v2x_connected != null || d.v2x_vehicle_soc != null);
+
+      var body;
+      if (isVehicle) {
+        var vSoc = d.vehicle_soc != null ? Math.round(d.vehicle_soc) : null;
+        var vLimit = d.vehicle_charge_limit_pct != null ? Math.round(d.vehicle_charge_limit_pct) : null;
+        var vState = d.vehicle_charging_state || "—";
+        var vTtf = d.vehicle_time_to_full_min;
+        var vStale = !!d.vehicle_stale;
+        var vAmps = d.vehicle_charge_amps;             // car's in-app current limit
+        var vActual = d.vehicle_charger_actual_current; // current actually flowing
+        var socDisplay = (vSoc != null && vLimit != null)
+          ? vSoc + " / " + vLimit + " %"
+          : (vSoc != null ? vSoc + " %" : "—");
+        if (vStale) socDisplay = "⚠ " + socDisplay;
+        var stateClassV = (vState === "Charging") ? "stat-ok" : (vState === "Disconnected" ? "stat-dim" : "stat-warn");
+        var ttfStr = (vTtf != null && vTtf > 0)
+          ? (vTtf >= 60 ? Math.floor(vTtf / 60) + "h " + (vTtf % 60) + "m" : vTtf + " min")
+          : "—";
+        // Amps row reads "5 / 16 A" (actual / in-app limit) when both
+        // present; flags as warn when actual lags the limit (vehicle
+        // throttled itself or wallbox limit is lower than what the
+        // car would accept). Skipped entirely when neither field is
+        // reported (older proxies).
+        var ampsRow = "";
+        if (vAmps != null || vActual != null) {
+          var ampsText = (vActual != null ? Math.round(vActual) : "?") +
+                         " / " +
+                         (vAmps != null ? Math.round(vAmps) : "?") +
+                         " A";
+          var ampsCls = (vActual != null && vAmps != null && vActual + 0.5 < vAmps)
+            ? "stat-warn" : "stat-value";
+          ampsRow =
+            '  <span class="stat-label">Amps (actual/limit)</span>' +
+            '<span class="stat-value ' + ampsCls + '">' + ampsText + '</span>';
+        }
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">SoC</span><span class="stat-value">' + socDisplay + '</span>' +
+          '  <span class="stat-label">State</span><span class="stat-value ' + stateClassV + '">' + escHtml(vState) + '</span>' +
+          ampsRow +
+          '  <span class="stat-label">Time to full</span><span class="stat-value">' + ttfStr + '</span>' +
+          (vStale ? '  <span class="stat-label">Note</span><span class="stat-value stat-warn">data stale</span>' : '') +
+          '  <span class="stat-label">Ticks</span><span class="stat-value">' + ticks + '</span>' +
+          '  <span class="stat-label">Errors</span><span class="stat-value">' + errors + '</span>' +
+          '</div>' +
+          (vSoc != null
+            ? '<div class="driver-soc-bar"><div class="driver-soc-fill" style="width:' + vSoc + '%"></div></div>'
+            : '');
+      } else if (isV2X) {
+        var v2xWVal = d.v2x_w != null ? d.v2x_w : 0;
+        var connected = d.v2x_connected === true;
+        var statusLabel = d.v2x_status
+          || (v2xWVal > 100 ? "charging" : (v2xWVal < -100 ? "discharging" : (connected ? "connected" : "idle")));
+        var v2xClass = v2xWVal < -100 ? "stat-ok" : (v2xWVal > 100 ? "stat-warn" : (connected ? "stat-warn" : "stat-dim"));
+        var vehicleSoc = d.v2x_vehicle_soc != null ? formatSoc(d.v2x_vehicle_soc) : "—";
+        var dcSummary = (d.v2x_dc_w != null || d.v2x_dc_v != null || d.v2x_dc_a != null)
+          ? formatOptionalW(d.v2x_dc_w) + " · " +
+            (d.v2x_dc_v != null ? d.v2x_dc_v.toFixed(0) + " V" : "—") + " · " +
+            (d.v2x_dc_a != null ? d.v2x_dc_a.toFixed(1) + " A" : "—")
+          : "—";
+        var sessionParts = [];
+        if (d.v2x_session_charge_wh != null) sessionParts.push("in " + formatKwh(d.v2x_session_charge_wh));
+        if (d.v2x_session_discharge_wh != null) sessionParts.push("out " + formatKwh(d.v2x_session_discharge_wh));
+        var session = sessionParts.length ? sessionParts.join(" / ") : "—";
+        var limitParts = [];
+        if (d.v2x_charge_power_max_w != null) limitParts.push("charge " + formatW(d.v2x_charge_power_max_w));
+        if (d.v2x_discharge_power_max_w != null) limitParts.push("discharge " + formatW(d.v2x_discharge_power_max_w));
+        if (!limitParts.length && d.v2x_rated_power_w != null) limitParts.push("rated " + formatW(d.v2x_rated_power_w));
+        var limits = limitParts.length ? limitParts.join(" / ") : "—";
+        var mode = d.v2x_control_mode || d.v2x_protocol || "—";
+
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">State</span><span class="stat-value ' + v2xClass + '">' + escHtml(statusLabel) + '</span>' +
+          '  <span class="stat-label">Power</span><span class="stat-value">' + formatW(v2xWVal) + '</span>' +
+          '  <span class="stat-label">Vehicle SoC</span><span class="stat-value">' + vehicleSoc + '</span>' +
+          '  <span class="stat-label">DC</span><span class="stat-value">' + escHtml(dcSummary) + '</span>' +
+          '  <span class="stat-label">Session</span><span class="stat-value">' + escHtml(session) + '</span>' +
+          '  <span class="stat-label">Limits</span><span class="stat-value">' + escHtml(limits) + '</span>' +
+          '  <span class="stat-label">Mode</span><span class="stat-value">' + escHtml(mode) + '</span>' +
+          '  <span class="stat-label">Ticks</span><span class="stat-value">' + ticks + '</span>' +
+          '  <span class="stat-label">Errors</span><span class="stat-value">' + errors + '</span>' +
+          '</div>' +
+          renderV2XControls(name, d);
+      } else if (isEV) {
+        var evWVal = d.ev_w != null ? d.ev_w : 0;
+        // state_label + reason_no_current_label come from the driver —
+        // UI renders them verbatim. Protocol knowledge stays in Lua.
+        var opLabel = d.ev_state_label
+          || (d.ev_charging ? "charging" : (d.ev_connected ? "connected" : "idle"));
+        var stateClass =
+          (d.ev_charging ? "stat-ok"
+          : (d.ev_connected ? "stat-warn" : "stat-dim"));
+        var sessionKwh = d.ev_session_wh != null ? (d.ev_session_wh / 1000).toFixed(2) + " kWh" : "—";
+        var maxA = d.ev_max_a != null ? d.ev_max_a.toFixed(0) + " A" : "—";
+        var reason = d.ev_reason_no_current_label || null;
+
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">State</span><span class="stat-value ' + stateClass + '">' + escHtml(opLabel) + '</span>' +
+          '  <span class="stat-label">Power</span><span class="stat-value">' + formatW(evWVal) + '</span>' +
+          '  <span class="stat-label">Session</span><span class="stat-value">' + sessionKwh + '</span>' +
+          '  <span class="stat-label">Max current</span><span class="stat-value">' + maxA + '</span>' +
+          (reason
+            ? '  <span class="stat-label">Reason</span><span class="stat-value stat-warn">' + escHtml(reason) + '</span>'
+            : '') +
+          (d.ev_cable_locked === false && d.ev_connected
+            ? '  <span class="stat-label">Cable</span><span class="stat-value stat-warn">unlocked</span>'
+            : '') +
+          (d.ev_is_online === false
+            ? '  <span class="stat-label">Cloud</span><span class="stat-value stat-warn">offline</span>'
+            : '') +
+          '  <span class="stat-label">Ticks</span><span class="stat-value">' + ticks + '</span>' +
+          '  <span class="stat-label">Errors</span><span class="stat-value">' + errors + '</span>' +
+          '</div>';
+      } else if (d.meter_w != null || d.pv_w != null || d.bat_w != null || d.bat_soc != null) {
+        var meterW = d.meter_w != null ? d.meter_w : 0;
+        var pvWVal = d.pv_w != null ? d.pv_w : 0;
+        var batWVal = d.bat_w != null ? d.bat_w : 0;
+        var batSocVal = d.bat_soc != null ? d.bat_soc : 0;
+
+        // Battery target + tracking deviation. Skip if no dispatch (planner
+        // hasn't run) OR this driver has no battery (target meaningless).
+        var batteryRow =
+          '  <span class="stat-label">Battery</span><span class="stat-value">' + formatW(batWVal) + "</span>";
+        var disp = (dispatchByDriver || {})[name];
+        if (disp && d.bat_w != null && !d.observe_only) {
+          var dev = batWVal - disp.target_w;
+          var devClass = Math.abs(dev) > 200 ? "stat-warn" : "stat-dim";
+          batteryRow =
+            '  <span class="stat-label">Battery</span><span class="stat-value">' + formatW(batWVal) +
+            '    <span class="stat-target">→ ' + formatW(disp.target_w) + '</span>' +
+            '    <span class="' + devClass + '">Δ ' + formatW(dev) + '</span>' +
+            "</span>";
+        }
+
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">Meter</span><span class="stat-value">' + formatW(meterW) + "</span>" +
+          '  <span class="stat-label">PV</span><span class="stat-value">' + formatW(-pvWVal) + "</span>" +
+          batteryRow +
+          (d.observe_only
+            ? '  <span class="stat-label">Control</span><span class="stat-value stat-dim">observe only</span>'
+            : "") +
+          '  <span class="stat-label">SoC</span><span class="stat-value">' + formatSoc(batSocVal) + "</span>" +
+          '  <span class="stat-label">Ticks</span><span class="stat-value">' + ticks + "</span>" +
+          '  <span class="stat-label">Errors</span><span class="stat-value">' + errors + "</span>" +
+          "</div>" +
+          '<div class="driver-soc-bar"><div class="driver-soc-fill" style="width:' + Math.round(batSocVal * 100) + '%"></div></div>';
+      } else {
+        // Metrics-only driver (e.g. MyUplink heat-pump telemetry): emits
+        // scalar metrics via emit_metric, no meter/pv/battery DER reading.
+        // Don't render phantom 0 W / 0 % PV+battery+SoC rows — show liveness
+        // and point at the per-driver metrics view (Diagnose) instead.
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">Type</span><span class="stat-value stat-dim">telemetry only</span>' +
+          '  <span class="stat-label">Ticks</span><span class="stat-value">' + ticks + "</span>" +
+          '  <span class="stat-label">Errors</span><span class="stat-value">' + errors + "</span>" +
+          "</div>";
+      }
+
+      // For disabled drivers the body is minimal — just show the label.
+      if (d.disabled === true || d.status === "disabled") {
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">State</span><span class="stat-value stat-dim">disabled</span>' +
+          '</div>';
+      } else if (d.not_running === true || (d.status === "offline" && d.tick_count == null)) {
+        // Configured in yaml but never successfully spawned — most often
+        // a cloud auth failure. Offer Restart to retry with fresh creds.
+        body =
+          '<div class="driver-stats">' +
+          '  <span class="stat-label">State</span><span class="stat-value stat-warn">not running (spawn failed)</span>' +
+          '  <span class="stat-label">Hint</span><span class="stat-value stat-dim">check credentials, then restart</span>' +
+          '</div>';
+      }
+
+      card.innerHTML =
+        '<div class="driver-header">' +
+        '  <span class="driver-name">' + escHtml(name) + "</span>" +
+        '  <span class="status-dot ' + statusClass(d.status) + '" title="' + escHtml(d.status || "unknown") + '"></span>' +
+        "</div>" +
+        body +
+        renderDriverActions(name, d);
+
+      driversGrid.appendChild(card);
+    });
+  }
+
+  function renderDispatch(dispatch) {
+    // index.html no longer has #dispatch-list — graceful no-op if missing
+    if (!dispatchList) return;
+    dispatchList.innerHTML = "";
+    dispatch.forEach(function (d) {
+      var item = document.createElement("div");
+      item.className = "dispatch-item";
+      item.innerHTML =
+        '<span class="dispatch-driver">' + escHtml(d.driver) + "</span>" +
+        "<span>" +
+        '<span class="dispatch-target">' + formatW(d.target_w) + "</span>" +
+        (d.clamped ? '<span class="dispatch-clamped">CLAMPED</span>' : "") +
+        "</span>";
+      dispatchList.appendChild(item);
+    });
+    if (dispatch.length === 0) {
+      dispatchList.innerHTML = '<div class="dispatch-item" style="color:var(--text-dim)">No dispatch targets</div>';
+    }
+  }
+
+  function escHtml(str) {
+    var div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // ---- API ----
+  var firstLoad = true;
+  var setupBannerShown = false;
+  // Loadpoint cache — keyed by driver_name so the EV-planet builder
+  // in render() can look up vehicle SoC + charge-limit without a
+  // second round of fetches per status tick. Refreshed in parallel
+  // with /api/status. `null` until the first fetch lands; missing
+  // entries mean "no loadpoint for this driver" and the planet
+  // falls back to legacy kW-only rendering.
+  var loadpointsByDriver = null;
+  var chargingNoticePoints = [];
+  var chargingNoticeRows = new Map();
+  var chargingNoticeTimer = null;
+  function updateChargingNotice(payload) {
+    var fresh = !!(payload && Array.isArray(payload.loadpoints));
+    if (fresh) {
+      chargingNoticePoints = payload.loadpoints.map(function (lp) {
+        var previous = chargingNoticePoints.find(function (old) { return old.id === lp.id; });
+        // Offline telemetry cannot establish that the cable was removed.
+        return previous && previous.plugged_in && lp.charger && !lp.charger.available
+          ? Object.assign({}, lp, { plugged_in: true }) : lp;
+      });
+      if (chargingNoticeTimer) clearTimeout(chargingNoticeTimer);
+      chargingNoticeTimer = setTimeout(function () { updateChargingNotice(null); }, 15000);
+    }
+    fresh = fresh && !document.hidden;
+    var host = document.getElementById("charging-notices");
+    var anchor = document.getElementById("power-now");
+    if (!anchor) return;
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "charging-notices";
+      anchor.parentNode.insertBefore(host, anchor);
+    }
+    var keep = new Set();
+    chargingNoticePoints.filter(function (lp) { return lp.plugged_in; }).forEach(function (lp) {
+      keep.add(lp.id);
+      var row = chargingNoticeRows.get(lp.id);
+      if (!row) {
+        var section = document.createElement("section");
+        section.className = "overview-card";
+        section.setAttribute("aria-label", "Car connection");
+        var title = document.createElement("strong");
+        var status = document.createElement("p");
+        status.setAttribute("role", "status");
+        var button = document.createElement("button");
+        button.type = "button";
+        section.append(title, status, button);
+        host.appendChild(section);
+        row = { section: section, title: title, status: status, button: button };
+        chargingNoticeRows.set(lp.id, row);
+      }
+      var available = fresh && (!lp.charger || lp.charger.available);
+      row.title.textContent = available ? "Car connected" : "Car status is out of date";
+      var message = available ? renderEvPlanStatus(lp, null) : null;
+      row.status.textContent = message ? message.textContent : "Waiting for current charger status. The last reading cannot confirm charging.";
+      row.button.textContent = "Check charging" + (lp.soc_source !== "vehicle" ? " and battery level" : "");
+      row.button.onclick = function () {
+        if (energyFlowEl) energyFlowEl.dispatchEvent(new CustomEvent("ftw-planet-click", { detail: { role: "ev", name: lp.driver_name } }));
+      };
+    });
+    chargingNoticeRows.forEach(function (row, id) {
+      if (!keep.has(id)) { row.section.remove(); chargingNoticeRows.delete(id); }
+    });
+    host.hidden = keep.size === 0;
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) updateChargingNotice(null);
+  });
+  // Last successful /api/status payload — surfaced so secondary
+  // consumers (e.g. the EV modal's 5 s refresh) can read derived
+  // facts like siteHasPV() without re-fetching. `null` until the
+  // first fetch lands; consumers MUST handle null.
+  var lastStatusPayload = null;
+  var statusPollTimer = null;
+  var statusPollInFlight = false;
+  var liveHistoryPollTimer = null;
+  function fetchStatus() {
+    return Promise.all([
+      boundedApiRead("/api/status", function (r) {
+        if (!r.ok) return r.json().catch(function () { return {}; }).then(function (body) {
+          var error = new Error("HTTP " + r.status);
+          error.starting = body.error === "starting";
+          throw error;
+        });
+        return r.json();
+      }),
+      boundedApiRead("/api/loadpoints", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; }),
+      boundedApiRead("/api/health", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; })
+        .then(function (health) {
+          updateHistoryMigration(health);
+          return health;
+        }),
+    ])
+      .then(function (results) {
+        var data = results[0];
+        var lp = results[1];
+        var health = results[2];
+        lastStatusPayload = data;
+        // Surface DB corruption-recovery events (boot-time, immutable per
+        // process) as a top banner. Tolerant: health may be null.
+        try { updateStorageBanner(health && health.storage); }
+        catch (eSb) { /* silent */ }
+        if (lp && Array.isArray(lp.loadpoints)) {
+          var idx = {};
+          lp.loadpoints.forEach(function (l) {
+            if (l && l.driver_name) idx[l.driver_name] = l;
+          });
+          loadpointsByDriver = idx;
+        }
+        updateChargingNotice(lp);
+        setConnected(true);
+        if (firstLoad) { firstLoad = false; }
+        if (setupBannerShown) { hideSetupBanner(); }
+        // Always refresh timestamp on successful fetch
+        lastUpdate.textContent = "Last update: " + new Date().toLocaleTimeString();
+        // Isolate render errors from connection state / timestamp
+        try { render(data); }
+        catch (e) { console.error("render error:", e); }
+        // Show a subtle prompt when no drivers are configured
+        try { updateNoDevicesPrompt(data.drivers); }
+        catch (e2) { /* silent */ }
+      })
+      .catch(function (e) {
+        console.warn("status fetch failed:", e);
+        updateChargingNotice(null);
+        setConnected(false);
+        if (firstLoad && !e.starting) { showSetupBanner(); }
+      });
+  }
+
+  // Only the visibility-owned poll is coalesced. Command handlers still call
+  // fetchStatus directly so an operator action can refresh without waiting for
+  // the next timer. Settling a hidden poll only releases the lock; returning to
+  // the tab or a later timer tick decides when the next poll starts.
+  function pollStatus() {
+    if (document.hidden || statusPollInFlight) return;
+    statusPollInFlight = true;
+    fetchStatus().finally(function () {
+      statusPollInFlight = false;
+    });
+  }
+
+  function syncStatusPolling() {
+    if (document.hidden) {
+      if (statusPollTimer !== null) {
+        clearInterval(statusPollTimer);
+        statusPollTimer = null;
+      }
+      if (liveHistoryPollTimer !== null) {
+        clearInterval(liveHistoryPollTimer);
+        liveHistoryPollTimer = null;
+      }
+      return;
+    }
+
+    // Refresh both live surfaces at once after returning to the tab, then keep
+    // exactly one foreground timer for each. These reads are useless while
+    // hidden; history's minute poll used to remain after status polling paused.
+    pollStatus();
+    loadHistory(chartRange, true);
+    fetchLiveHistory(true);
+    if (statusPollTimer === null) {
+      statusPollTimer = setInterval(pollStatus, POLL_INTERVAL);
+    }
+    if (liveHistoryPollTimer === null) {
+      liveHistoryPollTimer = setInterval(function () { fetchLiveHistory(true); }, 60_000);
+    }
+  }
+
+  // ---- Storage-health banner (DB corruption auto-recovered) ----
+  // storage = { state, cache, last_event_ms, detail } from /api/health.
+  // Heal events are set once at boot and never change, so a session-scoped
+  // dismissal (keyed on the event) hides it without losing a fresh alert
+  // after a later restart.
+  function updateStorageBanner(storage) {
+    var existing = document.getElementById("storage-banner");
+    var bad = !!storage && (
+      (storage.state && storage.state !== "ok") ||
+      (storage.cache && storage.cache !== "ok")
+    );
+    if (!bad) { if (existing) existing.remove(); return; }
+
+    var key = String(storage.last_event_ms || storage.detail || "1");
+    try {
+      if (sessionStorage.getItem("ftw-storage-banner-dismissed") === key) {
+        if (existing) existing.remove();
+        return;
+      }
+    } catch (e) { /* sessionStorage unavailable — show anyway */ }
+
+    var detail = storage.detail || "Database recovered from a problem.";
+    if (existing) {
+      var t = existing.querySelector(".storage-banner-text");
+      if (t) t.textContent = detail;
+      existing.setAttribute("data-key", key);
+      return;
+    }
+
+    var banner = document.createElement("div");
+    banner.id = "storage-banner";
+    banner.className = "storage-banner";
+    banner.setAttribute("data-key", key);
+
+    var tag = document.createElement("span");
+    tag.className = "storage-banner-tag";
+    tag.textContent = "Storage";
+
+    var text = document.createElement("span");
+    text.className = "storage-banner-text";
+    text.textContent = detail;
+
+    var dismiss = document.createElement("button");
+    dismiss.className = "storage-banner-dismiss";
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.innerHTML = "&times;";
+    dismiss.addEventListener("click", function () {
+      try { sessionStorage.setItem("ftw-storage-banner-dismissed", banner.getAttribute("data-key") || "1"); }
+      catch (e) { /* ignore */ }
+      banner.remove();
+    });
+
+    banner.appendChild(tag);
+    banner.appendChild(text);
+    banner.appendChild(dismiss);
+    var main = document.querySelector("main");
+    if (main) main.parentNode.insertBefore(banner, main);
+  }
+
+  // ---- Setup banner (bootstrap mode — no config yet) ----
+  function showSetupBanner() {
+    if (setupBannerShown) return;
+    var banner = document.createElement("div");
+    banner.id = "setup-banner";
+    banner.className = "setup-banner";
+    banner.innerHTML = 'No devices configured yet. <a href="/setup">Run the setup wizard &rarr;</a>';
+    var main = document.querySelector("main");
+    if (main) main.parentNode.insertBefore(banner, main);
+    setupBannerShown = true;
+  }
+  function hideSetupBanner() {
+    var el = document.getElementById("setup-banner");
+    if (el) el.remove();
+    setupBannerShown = false;
+  }
+
+  // ---- "Add a device" prompt when drivers object is empty ----
+  function updateNoDevicesPrompt(drivers) {
+    var existing = document.getElementById("no-devices-prompt");
+    var hasDrivers = drivers && typeof drivers === "object" && Object.keys(drivers).length > 0;
+    if (hasDrivers) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) return; // already showing
+    var prompt = document.createElement("div");
+    prompt.id = "no-devices-prompt";
+    prompt.className = "no-devices-prompt";
+    // The wizard's Save replaces config (it doesn't merge yet), so the copy
+    // says "Run setup wizard" rather than "Add a device". ?step=3 is honored
+    // by setup.js init (deep-link → scan step).
+    prompt.innerHTML = 'No devices connected. <a href="/setup?step=3">Run setup wizard &rarr;</a>';
+    var cards = document.querySelector(".summary-cards");
+    if (cards) cards.parentNode.insertBefore(prompt, cards.nextSibling);
+  }
+
+  function setMode(mode) {
+    markModeActive(mode);
+    revealManualModes(mode);
+    pendingMode = mode;
+    pendingModeUntil = Date.now() + 4000;
+    apiFetch("/api/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: mode }),
+    })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        // Immediately poll to reflect change
+        fetchStatus();
+      })
+      .catch(function () {
+        pendingMode = null; // the write failed — show server truth again
+        setConnected(false);
+      });
+  }
+
+  function markModeActive(mode) {
+    document.querySelectorAll("#mode-buttons-primary button, #mode-buttons button").forEach(function (btn) {
+      if (btn.dataset.mode === mode) btn.classList.add("active");
+      else btn.classList.remove("active");
+    });
+  }
+
+  // Open the manual drawer when the live mode lives there, so a reload
+  // (or a change made from the phone app / HA) never leaves the current
+  // setting with no button on screen.
+  //
+  // Only on a transition. The status poll repeats the same mode every couple
+  // of seconds; re-opening on every repeat would undo an explicit "Hide
+  // manual" a second after the user pressed it. A move to a *different*
+  // manual mode still opens the drawer — that button has to be on screen.
+  function revealManualModes(mode) {
+    if (!mode || mode === lastRevealedMode) return;
+    var panel = document.getElementById("mode-buttons");
+    if (!panel) return;
+    var match = panel.querySelector('button[data-mode="' + mode + '"]');
+    // Before the catalog paints, a missing button means "not rendered yet",
+    // not "not a manual mode" — don't record it, or the catalog's own call
+    // would come back as a repeat and never open the drawer.
+    if (!match && !modeCatalogRendered) return;
+    lastRevealedMode = mode;
+    if (!match) return;
+    panel.style.display = "flex";
+    var advBtn = document.getElementById("mode-advanced-btn");
+    if (advBtn) advBtn.textContent = "Hide manual";
+  }
+
+  // ---- Mode buttons, built from the server's canonical catalog ----
+  // The dashboard no longer hard-codes which modes exist or how they're
+  // labelled. GET /api/modes returns every selectable mode with a label,
+  // tooltip, and tier; we render `primary` into the strategy row and
+  // `advanced` behind the "Manual…" toggle (hidden modes are valid but not
+  // shown). This is the UI-side counterpart to the HA discovery fix — both
+  // surfaces derive from control.AllModes, so they can't drift.
+  //
+  // /api/modes is static, non-sensitive metadata, so it rides a plain fetch
+  // (not the frequently-polled status path). If it fails — offline
+  // at first paint — modeCatalogRendered stays false and fetchStatus retries
+  // it on the next successful poll, so the buttons appear as soon as the host
+  // is reachable, with no hard-coded fallback list.
+  var modeCatalogRendered = false;
+  function renderModeCatalog() {
+    if (modeCatalogRendered) return Promise.resolve(true);
+    var primary = document.getElementById("mode-buttons-primary");
+    var advanced = document.getElementById("mode-buttons");
+    if (!primary || !advanced) return Promise.resolve(false);
+    return fetch("/api/modes", { headers: { Accept: "application/json" } })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        var modes = (data && data.modes) || [];
+        if (!modes.length) return false;
+        var frags = { primary: document.createDocumentFragment(), advanced: document.createDocumentFragment() };
+        modes.forEach(function (m) {
+          if (m.tier !== "primary" && m.tier !== "advanced") return; // skip hidden
+          // Household prefs on the Plan card replaced Passive/Active as
+          // the primary knobs. Catalog keys stay primary for HA/app.
+          if (String(m.key || "").indexOf("planner_") === 0) return;
+          var btn = document.createElement("button");
+          btn.dataset.mode = m.key;
+          btn.textContent = m.label;
+          if (m.tooltip) btn.title = m.tooltip;
+          if (currentMode && m.key === currentMode) btn.classList.add("active");
+          frags[m.tier].appendChild(btn);
+        });
+        primary.replaceChildren(frags.primary);
+        advanced.replaceChildren(frags.advanced);
+        primary.hidden = !primary.childElementCount;
+        modeCatalogRendered = true;
+        revealManualModes(currentMode);
+        return true;
+      })
+      .catch(function () {
+        // Leave modeCatalogRendered false so a later poll retries.
+        return false;
+      });
+  }
+
+  // Fire-and-forget wrappers around postJson. postJson itself rethrows
+  // so callers that chain .then/.finally behave correctly;
+  // here we explicitly mark the rejection handled so the browser
+  // doesn't log "Uncaught (in promise)" on every network hiccup.
+  // postJson has already console.warn'd the failure.
+  function setTarget(w) {
+    postJson("/api/target", { grid_target_w: w }).catch(function () {});
+  }
+
+  function setPeakLimit(w) {
+    postJson("/api/peak_limit", { peak_limit_w: w }).catch(function () {});
+  }
+
+  // POST the new hard-rule peak ceiling. 0 = disabled (operator opted
+  // out of tariff protection — only the physical fuse applies).
+  // Returns the postJson promise so callers can clear dirty + show
+  // success on resolution.
+  function setPeakImportCeiling(w) {
+    return postJson("/api/peak_import_ceiling", { peak_import_ceiling_w: w });
+  }
+
+  function setBatteryCoversEV(enabled) {
+    postJson("/api/battery_covers_ev", { enabled: !!enabled }).catch(function () {});
+  }
+
+  function postJson(url, body) {
+    // CONTROL write — strict (FIX-B). Covers /api/target, /api/peak_limit,
+    // /api/peak_import_ceiling, /api/battery_covers_ev,
+    // /api/ev/command, … (every state-changing dashboard knob routes here).
+    return apiFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        fetchStatus();
+        return res;
+      })
+      .catch(function (e) {
+        console.warn("POST failed:", url, e);
+        // Don't flip connection state on POST failures —
+        // connection state reflects read polling, not write commands
+        throw e;
+      });
+  }
+
+  function setConnected(ok) {
+    // update-badge.js is deferred, so on the first tick or two the element
+    // may not have upgraded yet and the method is absent. Polling re-asserts
+    // this every cycle and the component defaults to connected, which is
+    // what the old #conn-status markup shipped as.
+    if (updateBadge && typeof updateBadge.setConnected === "function") {
+      updateBadge.setConnected(ok);
+    }
+    if (ok) {
+      if (overviewHealth) overviewHealth.classList.add("is-connected");
+      if (overviewHealthLabel) overviewHealthLabel.textContent = "Live";
+      // render() will update lastUpdate with timestamp
+    } else {
+      if (overviewHealth) overviewHealth.classList.remove("is-connected");
+      if (overviewHealthLabel) overviewHealthLabel.textContent = "Connection lost";
+      lastUpdate.textContent = "Connection lost";
+    }
+  }
+
+  // ---- Events ----
+  modeButtons.addEventListener("click", function (e) {
+    if (e.target.tagName === "BUTTON" && e.target.dataset.mode) {
+      setMode(e.target.dataset.mode);
+    }
+  });
+  var primaryButtons = document.getElementById("mode-buttons-primary");
+  if (primaryButtons) {
+    primaryButtons.addEventListener("click", function (e) {
+      if (e.target.tagName === "BUTTON" && e.target.dataset.mode) {
+        setMode(e.target.dataset.mode);
+      }
+    });
+  }
+  // Permission to sell from the battery is a deliberate household answer, so
+  // a prefs read that fails or answers with nothing usable lands on the mode
+  // that never exports.
+  var PLANNER_FALLBACK_MODE = "planner_passive_arbitrage";
+  // "Use the plan" — the one control that hands a manually-driven house back
+  // to the planner. Which planner mode that is follows from the household's
+  // own prefs, and the server already maps them (mapped_mode), so the two
+  // surfaces cannot drift. setMode() from here on, so the optimistic paint,
+  // the pending-mode hold and the drawer all behave as they do for a tap.
+  var planUseBtn = document.getElementById("plan-use-btn");
+  if (planUseBtn) {
+    planUseBtn.addEventListener("click", function () {
+      apiFetch("/api/planner/prefs", { headers: { Accept: "application/json" } })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (prefs) {
+          var mapped = prefs && prefs.mapped_mode;
+          setMode(typeof mapped === "string" && mapped.indexOf("planner_") === 0
+            ? mapped
+            : PLANNER_FALLBACK_MODE);
+        })
+        .catch(function () {
+          setMode(PLANNER_FALLBACK_MODE);
+        });
+    });
+  }
+  var advBtn = document.getElementById("mode-advanced-btn");
+  if (advBtn) {
+    advBtn.addEventListener("click", function () {
+      var panel = document.getElementById("mode-buttons");
+      if (!panel) return;
+      var shown = panel.style.display !== "none";
+      panel.style.display = shown ? "none" : "flex";
+      advBtn.textContent = shown ? "Manual…" : "Hide manual";
+    });
+  }
+
+  // Grid target slider: dirty on input, Save enabled while dirty,
+  // poll skips overwrite while dirty. Mirrors the peak slider pattern.
+  if (gridTargetSlider) {
+    gridTargetSlider.addEventListener("input", function () {
+      gridTargetValue.textContent = formatW(Number(gridTargetSlider.value));
+      gridTargetDirty = true;
+      if (gridTargetSend) gridTargetSend.disabled = false;
+    });
+  }
+  if (gridTargetSend) {
+    gridTargetSend.addEventListener("click", function () {
+      const w = Number(gridTargetSlider.value);
+      gridTargetSend.disabled = true;
+      postJson("/api/target", { grid_target_w: w })
+        .then(function () { gridTargetDirty = false; })
+        .catch(function () { gridTargetSend.disabled = false; /* keep dirty so user can retry */ });
+    });
+  }
+
+  // Peak slider: same dirty pattern, plus an enable/disable checkbox.
+  // Off → POST 0 (backend reads 0 = disabled). On → POST slider value.
+  // The slider is disabled when the toggle is off so the operator can't
+  // accidentally drag a dead control.
+  if (peakLimitSlider) {
+    peakLimitSlider.addEventListener("input", function () {
+      const w = Number(peakLimitSlider.value);
+      peakLimitValue.textContent = formatW(w);
+      peakLimitDirty = true;
+      if (peakLimitSend) peakLimitSend.disabled = false;
+    });
+  }
+  if (peakLimitEnableToggle) {
+    peakLimitEnableToggle.addEventListener("change", function () {
+      const enabled = peakLimitEnableToggle.checked;
+      if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
+      if (peakLimitSlider) peakLimitSlider.disabled = !enabled;
+      // Show the value the toggle is about to enable (last known)
+      // without committing — the operator still has to press Save
+      // unless the toggle is being switched OFF, which is a destructive
+      // change worth one extra click confirmation. Wait — the spec
+      // calls for the toggle itself to be the on/off control, so flip
+      // straight through: post immediately on toggle change.
+      const w = enabled ? Number(peakLimitSlider.value) || readLastPeakLimitW() : 0;
+      if (enabled && peakLimitSlider) peakLimitSlider.value = w;
+      if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      peakLimitEnableToggle.disabled = true;
+      setPeakImportCeiling(w)
+        .then(function () { peakLimitDirty = false; if (peakLimitSend) peakLimitSend.disabled = true; })
+        .catch(function () { /* leave dirty so user can retry */ })
+        .finally(function () { peakLimitEnableToggle.disabled = false; });
+    });
+  }
+  if (peakLimitSend) {
+    peakLimitSend.addEventListener("click", function () {
+      const w = Number(peakLimitSlider.value);
+      writeLastPeakLimitW(w);
+      peakLimitSend.disabled = true;
+      setPeakImportCeiling(w)
+        .then(function () { peakLimitDirty = false; })
+        .catch(function () { peakLimitSend.disabled = false; /* keep dirty */ });
+    });
+  }
+
+  // EV detail modal — <ftw-modal> handles ESC / backdrop / close button;
+  // we only drive open()/close() and refresh the body on a timer. Opened
+  // by clicking an EV planet in the energy-flow hero (no card-ev tile).
+  var evModal = document.getElementById("ev-modal");
+  var evModalBody = document.getElementById("ev-modal-body");
+  var evModalDriver = null; // captured from the planet click; sent on commands
+  var energyFlowEl = document.getElementById("energy-flow");
+  var controlProofModal = document.getElementById("control-proof-modal");
+  var controlProofScope = null;
+  var controlProofLive = false;
+  var batteryProofDriver = "";
+  var pvProofDriver = "";
+  var openPlanetControls = function () {};
+  // Each device sheet answers "Are we in control?" first. Core decides the
+  // status; the shared view only renders it.
+  function updateControlFeedback(data, live) {
+    controlProofLive = live;
+    var feedback = window.FTWControlFeedback;
+    if (!feedback) return;
+    feedback.render(document.getElementById("control-results"), data.control_feedback, live, {compact:true});
+    feedback.render(document.getElementById("battery-control-proof"), feedback.forPlanet(data.control_feedback, {role:"battery", name:batteryProofDriver}), live);
+    feedback.render(document.getElementById("ev-control-proof"), feedback.forPlanet(data.control_feedback, {role:"ev", name:evModalDriver || ""}), live);
+    feedback.render(document.getElementById("pv-control-proof"), feedback.forPlanet(data.control_feedback, {role:"pv", name:pvProofDriver}), live);
+    if (controlProofModal && controlProofModal.hasAttribute("open")) {
+      feedback.render(document.getElementById("control-proof-details"), feedback.forPlanet(data.control_feedback, controlProofScope || {}), live);
+    }
+  }
+  function openControlProof(scope) {
+    var feedback = window.FTWControlFeedback;
+    if (!controlProofModal || !feedback || !lastStatusPayload) return false;
+    var rows = feedback.forPlanet(lastStatusPayload.control_feedback, scope);
+    if (!rows.length) return false;
+    controlProofScope = scope;
+    feedback.render(document.getElementById("control-proof-details"), rows, controlProofLive);
+    controlProofModal.open();
+    return true;
+  }
+  var batteryControls = document.getElementById("battery-control");
+  if (batteryControls) batteryControls.addEventListener("ftw-battery-scope", function (event) {
+    batteryProofDriver = event.detail.driver || "";
+    if (lastStatusPayload) updateControlFeedback(lastStatusPayload, controlProofLive);
+  });
+  var pvControls = document.getElementById("pv-control");
+  if (pvControls) pvControls.addEventListener("ftw-pv-scope", function (event) {
+    pvProofDriver = event.detail.driver || "";
+    if (lastStatusPayload) updateControlFeedback(lastStatusPayload, controlProofLive);
+  });
+  var proofSummary = document.getElementById("control-results");
+  if (proofSummary) proofSummary.addEventListener("click", function (event) {
+    var button = event.target.closest("button[data-driver]");
+    if (button) {
+      var scope = {name:button.dataset.driver, role:button.dataset.kind === "v2x_charger" ? "ev" : button.dataset.kind};
+      if (!openPlanetControls(scope)) openControlProof(scope);
+    }
+  });
+
+
+  // Render the EV modal by building DOM nodes (textContent) rather than
+  // concatenating strings into innerHTML — d.driver comes from driver
+  // config and would otherwise be an XSS vector if the config is edited
+  // by a lower-trust user.
+  function renderEvStatusTable(d) {
+    var status = d.charging ? "Charging" : (d.connected ? "Connected" : "Idle");
+    var rows = [
+      ["Status", status],
+      ["Power", formatW(d.w || 0)],
+    ];
+    if (d.session_wh != null) rows.push(["Session", (d.session_wh / 1000).toFixed(1) + " kWh"]);
+    if (d.driver) rows.push(["Driver", String(d.driver)]);
+
+    var table = document.createElement("table");
+    table.style.width = "100%";
+    table.style.borderCollapse = "collapse";
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      var tdLabel = document.createElement("td");
+      tdLabel.style.padding = "0.3rem 0";
+      tdLabel.style.color = "var(--text-dim)";
+      tdLabel.textContent = r[0];
+      var tdVal = document.createElement("td");
+      tdVal.style.padding = "0.3rem 0";
+      tdVal.style.textAlign = "right";
+      tdVal.style.fontWeight = "600";
+      tdVal.textContent = r[1];
+      tr.appendChild(tdLabel);
+      tr.appendChild(tdVal);
+      table.appendChild(tr);
+    });
+    return table;
+  }
+
+  function setEvModalMessage(text) {
+    evModalBody.textContent = "";
+    var p = document.createElement("p");
+    p.style.color = "var(--text-dim)";
+    p.textContent = text;
+    evModalBody.appendChild(p);
+  }
+
+  function evFmtClock(ms) {
+    // 24-hour clock, matching plan-brief.js's formatClock — the rest of
+    // the plan UI speaks 24 h regardless of browser locale.
+    var d = new Date(ms);
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  function evFmtElapsed(ms) {
+    var s = Math.max(0, Math.round(ms / 1000));
+    if (s < 90) return s + " s";
+    var m = Math.round(s / 60);
+    if (m < 90) return m + " min";
+    return Math.round(m / 60) + " h";
+  }
+
+  // manualStatusText is the one sentence the Manual tab and the plan strip
+  // show while an operator hold runs. It follows the charger, not the
+  // request: sent, taken by the charger, charging, not drawing, stalled or
+  // limited by the fuse, each with the time elapsed. The box derives the
+  // state (loadpoint.manual); this only puts words on it. Returns null
+  // when no hold is active.
+  function manualStatusText(lp, d) {
+    if (lp && lp.manual_restore_unconfirmed) return "Confirm how to continue charging. FTW could not confirm the charger or connection.";
+    var m = lp && lp.manual;
+    if (!lp || !lp.manual_active || !m || !m.active) return null;
+    var reqA = m.requested_a > 0 ? Math.round(m.requested_a) + " A" : formatW(m.requested_w || lp.manual_charge_w || 0);
+    var cmdA = m.commanded_a > 0 ? Math.round(m.commanded_a) + " A" : formatW(m.commanded_w || 0);
+    var since = m.since_ms > 0 ? evFmtElapsed(Date.now() - m.since_ms) : "";
+    var sinceP = since ? " (" + since + ")" : "";
+    var reason = m.charger_reason ? " Charger reports: " + m.charger_reason + "." : "";
+    var end = lp.manual_release_soc > 0
+      ? " Returns to the plan at the estimated " + Math.round(lp.manual_release_soc * 100) + " % target."
+      : " Continues until the car stops drawing, you return to the plan, or unplug.";
+    switch (m.state) {
+      case "pausing":
+        return "Pause requested. " + ((lp.current_power_w || 0) >= 100 ? formatW(lp.current_power_w) + " is still flowing. " : "") + "Waiting for the charger to stop.";
+      case "paused":
+        return "Paused by you. Charging stays off until you resume the plan, choose Charge now, or unplug.";
+      case "unavailable":
+        return "Charger status is out of date. FTW cannot confirm whether the car is charging.";
+      case "charging":
+        return ((lp.current_power_w || 0) >= 100
+          ? "Charging at " + formatW(lp.current_power_w) + " — " + reqA + " requested."
+          : "The charger reports charging. Waiting for a power reading.") + end;
+      case "sent":
+        return "FTW received " + reqA + ". Waiting for the charger to confirm the new limit." + sinceP + ((lp.current_power_w || 0) >= 100 ? " Still charging at " + formatW(lp.current_power_w) + "." : "") + end;
+      case "accepted":
+        return "Charger reports a " + cmdA + " limit. Waiting for the car to start drawing…" + sinceP + reason + end;
+      case "not_drawing":
+        return "Charger offers " + cmdA + " but the car is not drawing" + sinceP + "." +
+          (reason || " It may be full, or held by its own charge limit or schedule.");
+      case "stalled":
+        if (evIsPaused(lp)) return "The charger has not stopped after your pause request. Check the charger’s app.";
+        return "The charger has not acted on " + reqA + (since ? " after " + since : "") + "." +
+          ((lp.current_power_w || 0) >= 100 ? " Still charging at " + formatW(lp.current_power_w) + "." : "") +
+          (reason || " Check the car's own charge limit or schedule, then the charger's app.");
+      case "limited":
+        if (m.limit_reason === "charger_limit") return "The charger limits this request to " + cmdA + " (" + reqA + " requested).";
+        if (m.limit_reason === "fuse_cooldown") {
+          return "Paused: main-fuse protection — " + reqA + " requested; charging resumes on its own." + sinceP;
+        }
+        if (m.limit_reason === "site_meter_stale") {
+          return "Paused for safety: site-meter data is stale — " + reqA + " requested; charging resumes when telemetry recovers.";
+        }
+        return "Main fuse limits this charge to " + cmdA + " right now (" + reqA + " requested)." + sinceP;
+    }
+    return "FTW received " + reqA + ". Waiting for charger status." + end;
+  }
+
+  // renderEvPlanStatus answers the question the status table can't:
+  // "why isn't it charging right now, and when will it?" Field
+  // experience: a car plugged in against a schedule sits at 0 W until
+  // the cheap slots arrive, the modal looks dead, and the operator
+  // presses Start — which overrides the plan for the whole session.
+  // One honest sentence here is what prevents that. Returns null when
+  // there is nothing worth saying (no loadpoint, or unplugged — the
+  // schedule note covers that case).
+  function renderEvPlanStatus(lp, d) {
+    if (!lp || (!lp.plugged_in && !lp.manual_restore_unconfirmed)) return null;
+    var text = null;
+    var tone = "var(--text-dim)";
+    var kwPlanned = lp.plan_total_wh > 0 ? " ~" + (lp.plan_total_wh / 1000).toFixed(1) + " kWh planned." : "";
+    var winActive = !lp.plan_pending && !lp.plan_outdated && lp.plan_next_start_ms > 0 && lp.plan_next_start_ms <= Date.now() && Date.now() < lp.plan_next_end_ms;
+    var charging = (lp.current_power_w || 0) >= 100;
+    // API current_soc is the controller estimate, even when a car reports
+    // a separate vehicle_soc. Use the same level as the battery card.
+    var statusSoC = lp.soc_source === "vehicle"
+      ? (lp.vehicle_driver && !lp.vehicle_stale ? (lp.vehicle_soc == null ? 0 : lp.vehicle_soc) : NaN)
+      : lp.current_soc;
+    var hasSchedule = lp.schedule && (lp.schedule.finish_at_vehicle_limit === true || lp.schedule.soc > 0);
+    if (lp.manual_restore_unconfirmed) {
+      text = manualStatusText(lp, d);
+    } else if (lp.charger && !lp.charger.available) {
+      text = lp.charger.known
+        ? "Charger status is out of date. FTW cannot confirm whether the car is charging."
+        : "Waiting for the charger's first status report.";
+      tone = "var(--text)";
+    } else if (lp.power_unavailable) {
+      text = "Paused: charger power data is out of date. Charging resumes when readings recover.";
+      tone = "var(--text)";
+    } else if (lp.manual_active) {
+      // The same sentence as the charge controls, so the charger's own reason is
+      // never hidden behind "manual charge is running".
+      text = manualStatusText(lp, d) || "Manual charge requested. Waiting for charger status.";
+      if (lp.manual && (lp.manual.state === "not_drawing" || lp.manual.state === "stalled")) {
+        tone = "var(--text)";
+      }
+    } else if (charging) {
+      text = winActive
+        ? "Charging on plan until " + evFmtClock(lp.plan_next_end_ms) + "." + kwPlanned
+        : "Charging.";
+      if (lp.commanded_reason === "fuse_limit") {
+        text += " Rate is limited by the main fuse right now.";
+      }
+    } else if (lp.goal_complete === true) {
+      text = "The car confirmed this charging goal is complete.";
     } else if (lp.finish_at_vehicle_limit !== true && !(lp.schedule && lp.schedule.finish_at_vehicle_limit === true) &&
         lp.commanded_known && lp.commanded_w === 0 && !lp.power_unavailable &&
         typeof lp.target_soc === "number" && lp.target_soc > 0 && lp.target_soc <= 1 &&
