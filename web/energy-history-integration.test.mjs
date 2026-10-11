@@ -27,6 +27,19 @@ test('EV costs ignore charging outside the period and days without charging', ()
   assert.equal(calculate([point(1800000, 1500)], [], 1800000, 3600000).incomplete, true);
 });
 
+test('EV charging cost does not double count overlapping price slots', () => {
+  const calculatorSource = source.slice(source.indexOf('  function calculateEVChargeCost('),
+    source.indexOf('  function renderEVCharging('));
+  const calculate = vm.runInNewContext('(' + calculatorSource.trim() + ')');
+  const point = { flow: 'vehicle_charge', bucket_start_ms: 0,
+    bucket_len_ms: 1800000, energy_wh: 1000, quality: 'measured' };
+  const slot = { slot_ts_ms: 0, slot_len_min: 30, total_ore_kwh: 200 };
+  const result = calculate([point], [slot, { ...slot }], 0, 1800000);
+  assert.equal(result.energyWh, 1000);
+  assert.equal(result.costMinor, 200);
+  assert.equal(result.incomplete, false);
+});
+
 test('History leads with a daily energy story and keeps raw data optional', () => {
   const history = html.match(/<main id="view-history"[\s\S]*?<main id="view-more"/)?.[0] || '';
   for (const id of [
