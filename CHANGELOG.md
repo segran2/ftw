@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.140.9
+
+### Patch Changes
+
+- 0bba433: Build chart summaries before selecting converted DuckDB history so the first Core start retains every series when it retires raw rows.
+- e615535: Fix the offline DuckDB history converter build by keeping its separate module in step with Core's dependencies. CI now checks conversion, resume and the Linux ARM64 and AMD64 builds.
+
+## 0.140.8
+
+### Patch Changes
+
+- 1cc469c: Move internal file paths with restored data, including active SQLite settings and old backup formats. Stop a move with unresolved external paths before replacing the destination.
+- 3c2d0f2: Keep absorbed Parquet summaries in stored-resolution history exports after restart, with their recorded count and hourly resolution.
+
+## 0.140.7
+
+### Patch Changes
+
+- d002bbc: Report elapsed write phases and the SQL step when a history write fails, so field timeouts can be traced without logging measurements or changing the write deadline.
+
+## 0.140.6
+
+### Patch Changes
+
+- 6ac681f: Keep imported chart history visible after restart when Core retires raw telemetry samples.
+- b261625: Recover inherited charts from the original state database or a retained history file after an earlier beta lost access to them. Keep new history and accounting.
+
 ## 0.140.5
 
 ### Patch Changes
