@@ -141,15 +141,19 @@
       if (['measured', 'integrated'].indexOf(point.quality) < 0) result.incomplete = true;
 
       var duration = end - start;
-      var coveredMs = 0;
+      var coveredUntil = start;
       slots.forEach(function (slot) {
-        var overlap = Math.max(0, Math.min(end, slot.end) - Math.max(start, slot.start));
-        if (!overlap) return;
-        var shareWh = energyWh * overlap / duration;
+        // Price slots can overlap in malformed or duplicated responses.
+        // Count each millisecond only once, preferring the earliest slot.
+        var overlapStart = Math.max(start, slot.start, coveredUntil);
+        var overlapEnd = Math.min(end, slot.end);
+        if (overlapEnd <= overlapStart) return;
+        if (overlapStart > coveredUntil) result.incomplete = true;
+        var shareWh = energyWh * (overlapEnd - overlapStart) / duration;
         result.costMinor += shareWh * slot.total / 1000;
-        coveredMs += overlap;
+        coveredUntil = overlapEnd;
       });
-      if (coveredMs < duration) result.incomplete = true;
+      if (coveredUntil < end) result.incomplete = true;
     });
     return result;
   }
