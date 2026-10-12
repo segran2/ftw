@@ -1390,15 +1390,25 @@ func (m *Manager) SetScheduleChecked(id string, s Schedule) (bool, error) {
 	m.mu.RLock()
 	lp, ok := m.byID[id]
 	saver := m.scheduleSaver
+	now, loc := m.now(), m.loc
 	m.mu.RUnlock()
 	if !ok {
 		return false, nil
 	}
 	s.Normalize()
+	// Keep the household clock the owner picked: time_of_day_min when the
+	// request has it, else the UTC minute read on today's date. Clients
+	// still read its UTC minute today. A cleared goal has no ready time.
+	if s.Empty() {
+		s = s.withoutClock()
+	} else {
+		s.readClock(now, loc)
+		s.TimeOfDayMinUTC = utcMinuteToday(now, s.clock, loc)
+	}
 	if s.FinishAtVehicleLimit {
 		s.IntentID = rand.Text()
 		if !s.Recurring {
-			s.FirstDeadlineMS = s.NextDeadlineUTC(m.now(), m.loc).UnixMilli()
+			s.FirstDeadlineMS = s.NextDeadlineUTC(now, loc).UnixMilli()
 		} else {
 			s.FirstDeadlineMS = 0
 		}
@@ -1483,11 +1493,21 @@ func (m *Manager) ClearScheduleChecked(id string) (bool, error) {
 // silently ignored — the operator may have renamed a loadpoint, and
 // resurrecting a schedule under the new ID would be surprising.
 //
-// Does NOT invoke the saver — this is a load path. Does NOT call
-// RollSchedules either; the controller's first tick will handle that.
-func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) {
+// A row saved before Core kept the household clock holds only a UTC
+// minute, which does not say what offset it was saved with. It is read
+// on today's date — the time the owner sees now — and saved back once so
+// the next DST change cannot move it. A clock out of range is read the
+// same way. The first failed save is returned; the goal is used either
+// way and read again at the next boot. Does NOT call RollSchedules; the
+// controller's first tick will handle that.
+func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) error {
 	m.intentMu.Lock()
 	defer m.intentMu.Unlock()
+	var failed error
+	m.mu.RLock()
+	saver := m.scheduleSaver
+	now, loc := m.now(), m.loc
+	m.mu.RUnlock()
 	for _, state := range m.States() {
 		id := state.ID
 		s, found := loader(id)
@@ -1495,10 +1515,16 @@ func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) {
 			continue
 		}
 		s.Normalize()
+		if s.readClock(now, loc) && saver != nil {
+			if err := saver(id, s); err != nil && failed == nil {
+				failed = err
+			}
+		}
 		m.mu.Lock()
 		m.byID[id].schedule = s
 		m.mu.Unlock()
 	}
+	return failed
 }
 
 // RollSchedules brings each loadpoint's one-shot target_soc / target_time

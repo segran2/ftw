@@ -47,13 +47,13 @@
   }
 
   function sum(days, key) {
-    return days.reduce(function (total, day) {
-      var value = Number(day[key] || 0);
-      return total + (Number.isFinite(value) && value > 0 ? value : 0);
-    }, 0);
+    var known = days.filter(function (day) { return day[key] != null && Number.isFinite(Number(day[key])); });
+    if (!known.length) return null;
+    return known.reduce(function (total, day) { return total + Math.max(0, Number(day[key])); }, 0);
   }
 
   function formatKWh(wh) {
+    if (wh == null) return "Unknown";
     var kwh = Math.max(0, Number(wh) || 0) / 1000;
     var digits = kwh < 10 ? 1 : 0;
     return kwh.toLocaleString(undefined, {
@@ -95,7 +95,8 @@
     ];
     summary.innerHTML = cards.map(function (card) {
       return '<article><span>' + card.label + '</span><strong>' +
-        formatKWh(sum(days, card.key)) + '</strong><small>' + card.note + '</small></article>';
+        formatKWh(sum(days, card.key)) + '</strong><small>' +
+        (days.some(function (day) { return day[card.key] == null; }) ? 'Incomplete period · known days only' : card.note) + '</small></article>';
     }).join('');
   }
 
@@ -237,6 +238,10 @@
       target.innerHTML = '<h3>What stands out</h3><p>No energy history is available for this period.</p>';
       return;
     }
+    if (days.some(function (day) { return dailySeries.some(function (series) { return day[series.key] == null; }) || day.history_quality === 'balance_mismatch'; })) {
+      target.innerHTML = '<h3>Incomplete measurements</h3><p>Working devices keep recording. Missing values are unknown; totals cover known days only. Home use needs all measured flows to balance.</p>';
+      return;
+    }
     var totalLoad = sum(days, 'load_wh');
     var totalPV = sum(days, 'pv_wh');
     var charged = sum(days, 'bat_charged_wh');
@@ -275,7 +280,7 @@
     if (legend) {
       legend.innerHTML = dailySeries.map(function (series) {
         return '<span><i style="background:' + series.color + '"></i>' + series.label + '</span>';
-      }).join('');
+      }).join('') + (days.some(function (day) { return dailySeries.some(function (series) { return day[series.key] == null; }); }) ? '<span>? Unknown</span>' : '');
     }
     if (!days.length) {
       ctx.fillStyle = C.muted;
@@ -314,6 +319,11 @@
       var totalBarsW = dailySeries.length * barW + (dailySeries.length - 1) * barGap;
       var startX = pad.left + groupW * dayIndex + (groupW - totalBarsW) / 2;
       dailySeries.forEach(function (series, seriesIndex) {
+        if (day[series.key] == null) {
+          ctx.fillStyle = C.muted; ctx.textAlign = 'center';
+          ctx.fillText('?', startX + seriesIndex * (barW + barGap) + barW / 2, pad.top + plotH - 4);
+          return;
+        }
         var value = Math.max(0, Number(day[series.key]) || 0);
         var barH = plotH * value / maxWh;
         ctx.fillStyle = series.color;
@@ -417,7 +427,7 @@
       } else if (uncertain) {
         note.className = 'energy-history-quality-note';
         note.textContent = uncertain + ' gap or counter reset marker' + (uncertain === 1 ? ' is' : 's are') +
-          ' recorded in this period. Trusted daily totals stay above.';
+          ' recorded in this period. Daily totals and missing measurements stay above.';
       } else {
         note.className = 'energy-history-quality-note good';
         note.textContent = 'No counter jumps or data gaps were found in this selection.';

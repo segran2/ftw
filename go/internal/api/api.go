@@ -46,6 +46,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/ha"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/notifications"
 	"github.com/srcfl/ftw/go/internal/ocpp"
@@ -73,6 +74,7 @@ const (
 // One instance is shared across all handlers; mutations use the contained
 // mutexes from each package.
 type Deps struct {
+	HistoryMeasurementSources func() telemetry.ForecastOptions
 	// SiteMeasurementSources reuses the configured physical-flow inventory.
 	// These are source declarations, never forecast values or derived load.
 	SiteMeasurementSources func() telemetry.ForecastOptions
@@ -1139,12 +1141,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			// instead of "no data yet". Mirror the old `len(pts) > 1` guard.
 			if d.Intervals > 0 {
 				energyToday = map[string]any{
-					"import_wh":         d.ImportWh,
-					"export_wh":         d.ExportWh,
-					"pv_wh":             d.PVWh,
-					"bat_charged_wh":    d.BatChargedWh,
-					"bat_discharged_wh": d.BatDischargedWh,
-					"load_wh":           d.LoadWh,
+					"import_wh":         d.Missing.Value(state.MissingGrid, d.ImportWh),
+					"export_wh":         d.Missing.Value(state.MissingGrid, d.ExportWh),
+					"pv_wh":             d.Missing.Value(state.MissingPV, d.PVWh),
+					"bat_charged_wh":    d.Missing.Value(state.MissingBattery, d.BatChargedWh),
+					"bat_discharged_wh": d.Missing.Value(state.MissingBattery, d.BatDischargedWh),
+					"load_wh":           d.Missing.Value(state.MissingLoad, d.LoadWh),
 				}
 			}
 		} else {
@@ -1252,6 +1254,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		resp["energy"] = energy
 	}
+	s.qualifyStatusHistory(resp, ctrl.SiteMeterDriver)
 	writeJSON(w, 200, resp)
 }
 
@@ -1271,14 +1274,17 @@ func currentGridEnergySlot(st *state.Store, now time.Time) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
+	if d.Intervals == 0 {
+		d.Missing |= state.MissingGrid
+	}
 	return map[string]any{
 		"slot_start_ms": slotStart.UnixMilli(),
 		"slot_end_ms":   slotEnd.UnixMilli(),
 		"elapsed_s":     now.Sub(slotStart).Seconds(),
-		"import_wh":     d.ImportWh,
-		"export_wh":     d.ExportWh,
+		"import_wh":     d.Missing.Value(state.MissingGrid, d.ImportWh),
+		"export_wh":     d.Missing.Value(state.MissingGrid, d.ExportWh),
 		// Observational only — see comment above. Do not bill against this.
-		"net_wh": d.ImportWh - d.ExportWh,
+		"net_wh": d.Missing.Value(state.MissingGrid, d.ImportWh-d.ExportWh),
 	}, nil
 }
 
@@ -2273,11 +2279,18 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		inner["ts"] = row.TsMs
 		// Fill from flat columns for charting
-		inner["grid_w"] = row.GridW
-		inner["pv_w"] = row.PVW
-		inner["bat_w"] = row.BatW
-		inner["load_w"] = row.LoadW
-		inner["bat_soc"] = row.BatSoC
+		inner["grid_w"] = row.Missing.Value(state.MissingGrid, row.GridW)
+		inner["pv_w"] = row.Missing.Value(state.MissingPV, row.PVW)
+		inner["bat_w"] = row.Missing.Value(state.MissingBattery, row.BatW)
+		inner["load_w"] = row.Missing.Value(state.MissingLoad, row.LoadW)
+		inner["bat_soc"] = row.Missing.Value(state.MissingSoC, row.BatSoC)
+		inner["load_house_w"] = inner["load_w"]
+		for field, flag := range map[string]state.HistoryMissing{"ev_w": state.MissingEV, "v2x_w": state.MissingV2X} {
+			if row.Missing&flag != 0 {
+				inner[field] = nil
+			}
+		}
+		inner["history_quality"] = row.Missing.Quality()
 		inner["n"] = row.N
 		inner["resolution_ms"] = row.ResolutionMS
 		inner["first_ms"] = row.FirstMS
@@ -2342,7 +2355,7 @@ func parseRange(s string) int64 {
 // Response: {"days": [{"day":"YYYY-MM-DD","import_wh":..., "export_wh":...,
 //
 //	"pv_wh":..., "bat_charged_wh":..., "bat_discharged_wh":...,
-//	"load_wh":...}], "tz": "Local"}
+//	"load_wh":...}], "tz": "Europe/Stockholm"}
 //
 // Buckets are local-day. Today is the last entry. Mirrors the integration
 // loop in handleStatus's energy-today block — same site convention, same
@@ -2425,17 +2438,21 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if de.Intervals == 0 {
+			de.Missing |= state.MissingPower
+		}
 		out = append(out, map[string]any{
+			"history_quality":   de.Missing.Quality(),
 			"day":               dayKey,
-			"import_wh":         de.ImportWh,
-			"export_wh":         de.ExportWh,
-			"pv_wh":             de.PVWh,
-			"bat_charged_wh":    de.BatChargedWh,
-			"bat_discharged_wh": de.BatDischargedWh,
-			"load_wh":           de.LoadWh,
+			"import_wh":         de.Missing.Value(state.MissingGrid, de.ImportWh),
+			"export_wh":         de.Missing.Value(state.MissingGrid, de.ExportWh),
+			"pv_wh":             de.Missing.Value(state.MissingPV, de.PVWh),
+			"bat_charged_wh":    de.Missing.Value(state.MissingBattery, de.BatChargedWh),
+			"bat_discharged_wh": de.Missing.Value(state.MissingBattery, de.BatDischargedWh),
+			"load_wh":           de.Missing.Value(state.MissingLoad, de.LoadWh),
 		})
 	}
-	writeJSON(w, 200, map[string]any{"days": out, "tz": loc.String()})
+	writeJSON(w, 200, map[string]any{"days": out, "tz": localzone.Name()})
 }
 
 // ---- /api/prices ----
@@ -3937,6 +3954,9 @@ func (s *Server) applyLoadpointSchedule(id string, raw json.RawMessage) (int, st
 	if sched.TimeOfDayMinUTC < 0 || sched.TimeOfDayMinUTC >= 1440 {
 		return 400, "time_of_day_min_utc must be 0..1439"
 	}
+	if min, ok := sched.TimeOfDayMin(); ok && (min < 0 || min >= 1440) {
+		return 400, "time_of_day_min must be 0..1439"
+	}
 	if sched.Days > 0x7F {
 		return 400, "days must be a 7-bit weekday mask (0..127, bit 0 = Monday)"
 	}
@@ -3989,7 +4009,11 @@ func (s *Server) replanForScheduleChange(id string) {
 // PUT /api/loadpoints/{id}/schedule replaces the loadpoint's schedule.
 // The body is the schedule object itself:
 //
-//	{"soc_pct": 80, "time_of_day_min_utc": 360, "recurring": true, "days": 31}
+//	{"soc": 0.8, "time_of_day_min": 420, "time_of_day_min_utc": 300, "recurring": true, "days": 31}
+//
+// time_of_day_min is the ready time on the household clock and wins
+// when present. Older clients send only time_of_day_min_utc, the UTC
+// minute of that time on today's date.
 //
 // Priced Configure where its sibling POST …/target is Actuate, because
 // a schedule is a standing instruction about future days: saved late,

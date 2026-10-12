@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.141.3
+
+### Patch Changes
+
+- 3d07f27: Export stopped older split SQLite history without requiring the later partial-history tables. Refuse incomplete quality tables and preserve the source during backup.
+
+## 0.141.2
+
+### Patch Changes
+
+- fd9540c: Pulse only the latest known sample in the Live chart. Earlier points before a missing measurement stay still, and an unknown latest sample has no live marker.
+
+## 0.141.1
+
+### Patch Changes
+
+- 51bf2d6: Name the box's time zone, for example Europe/Stockholm, wherever Core reports it: the app hello, daily energy, savings and the load research export. A box without TZ set said "Local", which the app and web client cannot use to show plan times in the household's zone.
+- 851eaee: Keep the EV ready time on the household clock. A goal set to 07:00 stays 07:00 when summer time starts or ends; before, it moved an hour until saved again. A goal saved by an older version keeps the time it shows on the day of the update.
+- 97ff226: Show and save the EV ready time on the household clock, even from a browser in another time zone. `GET /api/loadpoints` now sends `time_of_day_min`, minutes after midnight in the box's zone, and the schedule routes accept it. It wins over `time_of_day_min_utc`, which Core still sends and accepts for older clients.
+- afaa603: Keep history for working devices when another device is offline. Show missing power, state of charge and energy as unknown, preserve gaps through retention and backup, and flag incomplete measurements or an invalid household balance. Separate additive schema-7 tables keep partial rows out of older readers and preserve them across a native rollback.
+- af22b48: Accept Core backup timestamps with nanoseconds in the native migration CLI on older Python versions. Keep the verified bytes and backup age checks.
+
+## 0.141.0
+
+### Minor Changes
+
+- 8ac0b4c: Add an offline Home Assistant backup exporter that keeps internal driver links, checks protected archives and leaves existing data in place on failure.
+
+### Patch Changes
+
+- 2f47f63: Record complete restore points before activation. Refuse incomplete or older unverified points before reverting, and retain moved data if rollback fails. Full backups from older releases still import normally.
+- f4f3af0: Bind each restore stage to its own phase so a later extraction-only retry can keep older complete safety points without accepting partial activation.
+- 9618f8f: Keep interrupted revert state separate from complete active data. Retain abandoned extraction copies after a successful retry so normal restore and revert can continue.
+
+## 0.140.11
+
+### Patch Changes
+
+- 4d00c26: Keep managed driver selections and their undo paths when restoring a full backup to a new data directory. Refuse unknown external driver paths before activating the restored data.
+
+## 0.140.10
+
+### Patch Changes
+
+- 644f872: Merge retained Parquet readings before beta history conversion publishes its
+  summaries. Preserve distinct and late rows, keep the selected beta value on
+  overlap, and verify archive fingerprints before Core retires duplicate files.
+
+## 0.140.9
+
+### Patch Changes
+
+- 0bba433: Build chart summaries before selecting converted DuckDB history so the first Core start retains every series when it retires raw rows.
+- e615535: Fix the offline DuckDB history converter build by keeping its separate module in step with Core's dependencies. CI now checks conversion, resume and the Linux ARM64 and AMD64 builds.
+
+## 0.140.8
+
+### Patch Changes
+
+- 1cc469c: Move internal file paths with restored data, including active SQLite settings and old backup formats. Stop a move with unresolved external paths before replacing the destination.
+- 3c2d0f2: Keep absorbed Parquet summaries in stored-resolution history exports after restart, with their recorded count and hourly resolution.
+
+## 0.140.7
+
+### Patch Changes
+
+- d002bbc: Report elapsed write phases and the SQL step when a history write fails, so field timeouts can be traced without logging measurements or changing the write deadline.
+
+## 0.140.6
+
+### Patch Changes
+
+- 6ac681f: Keep imported chart history visible after restart when Core retires raw telemetry samples.
+- b261625: Recover inherited charts from the original state database or a retained history file after an earlier beta lost access to them. Keep new history and accounting.
+
 ## 0.140.5
 
 ### Patch Changes
