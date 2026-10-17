@@ -6,7 +6,8 @@ package protocol
 const ContractVersion = 1
 
 // Fid is a telemetry field id. 1-9 are frozen permanently as of v1, so an
-// app of any age can draw the core view from them alone.
+// app of any age can draw the core view from them alone. Ids after the
+// frozen set are depth for a node's own view.
 type Fid uint32
 
 const (
@@ -30,6 +31,14 @@ const (
 	FidSrcBattery Fid = 9
 	// FidEvW — power, unit W.
 	FidEvW Fid = 10
+	// FidGridL1Da — current, unit dA.
+	FidGridL1Da Fid = 11
+	// FidGridL2Da — current, unit dA.
+	FidGridL2Da Fid = 12
+	// FidGridL3Da — current, unit dA.
+	FidGridL3Da Fid = 13
+	// FidGridFuseDa — current, unit dA.
+	FidGridFuseDa Fid = 14
 )
 
 // FrozenFieldNames maps a frozen field id to its registry name.
@@ -60,6 +69,42 @@ var FrozenFieldUnits = map[Fid]string{
 	FidEvW:        "W",
 }
 
+// FieldNames maps every field id, frozen or extra, to its registry name.
+var FieldNames = map[Fid]string{
+	FidMode:       "mode",
+	FidGridW:      "grid_w",
+	FidPvW:        "pv_w",
+	FidBatteryW:   "battery_w",
+	FidBatterySoc: "battery_soc",
+	FidLoadW:      "load_w",
+	FidSrcGrid:    "src_grid",
+	FidSrcPv:      "src_pv",
+	FidSrcBattery: "src_battery",
+	FidEvW:        "ev_w",
+	FidGridL1Da:   "grid_l1_da",
+	FidGridL2Da:   "grid_l2_da",
+	FidGridL3Da:   "grid_l3_da",
+	FidGridFuseDa: "grid_fuse_da",
+}
+
+// FieldUnits maps every field id, frozen or extra, to its unit, empty when it has none.
+var FieldUnits = map[Fid]string{
+	FidMode:       "",
+	FidGridW:      "W",
+	FidPvW:        "W",
+	FidBatteryW:   "W",
+	FidBatterySoc: "permille",
+	FidLoadW:      "W",
+	FidSrcGrid:    "",
+	FidSrcPv:      "",
+	FidSrcBattery: "",
+	FidEvW:        "W",
+	FidGridL1Da:   "dA",
+	FidGridL2Da:   "dA",
+	FidGridL3Da:   "dA",
+	FidGridFuseDa: "dA",
+}
+
 // Capabilities are presence, not levels. An app hides what is absent and
 // never compares versions.
 const (
@@ -79,6 +124,11 @@ const (
 	CapNetWebrtc       = "net.webrtc"
 	CapPriceSpot       = "price.spot"
 	CapApiPassthrough  = "api.passthrough"
+	CapCloudLink       = "cloud.link"
+	CapCloudTun        = "cloud.tun"
+	CapCmdExchange     = "cmd.exchange"
+	CapAccessAgents    = "access.agents"
+	CapDerCar          = "der.car"
 )
 
 // AllCapabilities is every capability name the registry defines.
@@ -99,10 +149,15 @@ var AllCapabilities = []string{
 	CapNetWebrtc,
 	CapPriceSpot,
 	CapApiPassthrough,
+	CapCloudLink,
+	CapCloudTun,
+	CapCmdExchange,
+	CapAccessAgents,
+	CapDerCar,
 }
 
-// Scopes are one object axis and two verb axes. Roles are a projection over
-// these, never a replacement for them.
+// Scopes are an object and a verb. Roles are a projection over these,
+// never a replacement for them.
 const (
 	// ScopeLiveRead — Current readings and freshness.
 	ScopeLiveRead = "ftw.live.read"
@@ -114,6 +169,8 @@ const (
 	ScopeHealthRead = "ftw.health.read"
 	// ScopeAssetsRead — Devices and their capabilities.
 	ScopeAssetsRead = "ftw.assets.read"
+	// ScopeEventsRead — Events behind notifications.
+	ScopeEventsRead = "ftw.events.read"
 	// ScopeDispatchWrite — Control energy assets.
 	ScopeDispatchWrite = "ftw.dispatch.write"
 	// ScopeModeWrite — Change site operating mode.
@@ -122,13 +179,83 @@ const (
 	ScopeMembersRead = "ftw.members.read"
 	// ScopeMembersWrite — Invite and revoke.
 	ScopeMembersWrite = "ftw.members.write"
+	// ScopeLogsRead — Log excerpts the box redacts.
+	ScopeLogsRead = "ftw.logs.read"
+	// ScopeConfigRead — Configuration the box redacts.
+	ScopeConfigRead = "ftw.config.read"
+	// ScopeDiagRun — Checks that change nothing.
+	ScopeDiagRun = "ftw.diag.run"
+	// ScopeDispatchHold — Hold energy assets for a capped time.
+	ScopeDispatchHold = "ftw.dispatch.hold"
+	// ScopeGoalsRequest — Ask an owner to change a durable goal.
+	ScopeGoalsRequest = "ftw.goals.request"
+	// ScopeUpdateRequest — Ask an owner to install a version.
+	ScopeUpdateRequest = "ftw.update.request"
+	// ScopeCarsRead — See the owner's cars with their VINs and identifiers and sources.
+	ScopeCarsRead = "ftw.cars.read"
+	// ScopeCarsWrite — Keep the owner's list of cars.
+	ScopeCarsWrite = "ftw.cars.write"
 )
 
-// WriteScopes is every scope that changes something.
+// WriteScopes is every scope that changes something, now or once an
+// owner confirms it.
 var WriteScopes = []string{
 	ScopeDispatchWrite,
 	ScopeModeWrite,
 	ScopeMembersWrite,
+	ScopeDispatchHold,
+	ScopeGoalsRequest,
+	ScopeUpdateRequest,
+	ScopeCarsWrite,
+}
+
+// Roles, as the registry names them. apiauth holds what each carries.
+const (
+	// RoleAgent — Assistant.
+	RoleAgent = "agent"
+	// RoleOwner — Owner.
+	RoleOwner = "owner"
+	// RoleRelease — Release check.
+	RoleRelease = "release"
+	// RoleSupport — Sourceful support.
+	RoleSupport = "support"
+	// RoleViewer — Viewer.
+	RoleViewer = "viewer"
+	// RoleWatch — Watch.
+	RoleWatch = "watch"
+)
+
+// CloudScopes are the scopes an FTW Cloud grant may name.
+var CloudScopes = []string{
+	ScopeLiveRead,
+	ScopeHistoryRead,
+	ScopePlanRead,
+	ScopeHealthRead,
+	ScopeEventsRead,
+}
+
+// What an FTW Cloud grant lets the service use the data for.
+const (
+	CloudPurposeServe = "serve"
+	CloudPurposeStats = "stats"
+)
+
+// CloudPurposes is every purpose an FTW Cloud grant may name.
+var CloudPurposes = []string{
+	CloudPurposeServe,
+	CloudPurposeStats,
+}
+
+// What a session with FTW Cloud travels over, under its carrier.
+const (
+	CloudTransportQuic      = "quic"
+	CloudTransportWebsocket = "websocket"
+)
+
+// CloudTransports lists them in the registry's order.
+var CloudTransports = []string{
+	CloudTransportQuic,
+	CloudTransportWebsocket,
 }
 
 // RegistryOps is the app's copy of the operations a cmd frame may name,
@@ -150,6 +277,103 @@ var RegistryOps = map[string]string{
 	"loadpoint.soc.set": "ftw.dispatch.write",
 	// loadpoint.surplus_only.set — Charge the car from surplus PV only.
 	"loadpoint.surplus_only.set": "ftw.dispatch.write",
+	// car.goal.set — Set how and when a car charges.
+	"car.goal.set": "ftw.dispatch.write",
+	// car.soc.set — Set a car's level by hand.
+	"car.soc.set": "ftw.dispatch.write",
+	// session.car.set — Say which car is on a charger.
+	"session.car.set": "ftw.dispatch.write",
+	// car.add — Add a car to the owner's list.
+	"car.add": "ftw.cars.write",
+	// car.update — Change what the box knows about a car.
+	"car.update": "ftw.cars.write",
+	// car.remove — Remove a car from the owner's list.
+	"car.remove": "ftw.cars.write",
+}
+
+// RegistryAgentOps maps each op an agent may name to the scope that opens
+// it. ftw.dispatch.hold runs as a cmd within the grant's caps;
+// ftw.goals.request waits as an agent.request for an owner. An op not
+// listed is never open to an agent.
+var RegistryAgentOps = map[string]string{
+	"site.mode.set":              "ftw.goals.request",
+	"planner.prefs.set":          "ftw.goals.request",
+	"loadpoint.hold":             "ftw.dispatch.hold",
+	"loadpoint.soc.set":          "ftw.goals.request",
+	"loadpoint.surplus_only.set": "ftw.goals.request",
+	"car.goal.set":               "ftw.goals.request",
+	"car.soc.set":                "ftw.goals.request",
+}
+
+// RegistryAgentArgs is what an agent may put in each op it can name. The
+// box refuses any other key, kind or range, in a cmd and in an
+// agent.request, as it arrives.
+var RegistryAgentArgs = map[string][]AgentArg{
+	"car.goal.set": {
+		{Name: "id", Kind: "car", Unit: "", Required: false, Cap: "", Label: "Car"},
+		{Name: "charger_id", Kind: "loadpoint", Unit: "", Required: false, Cap: "", Label: "Charger"},
+		{Name: "target", Kind: "ratio", Unit: "", Min: bound(0), Max: bound(1), Required: false, Cap: "", Label: "The level to reach"},
+		{Name: "ready_by_min", Kind: "number", Unit: "", Min: bound(0), Max: bound(1439), Required: false, Cap: "", Label: "Ready by"},
+		{Name: "days", Kind: "number", Unit: "", Min: bound(0), Max: bound(127), Required: false, Cap: "", Label: "Weekdays"},
+		{Name: "finish_at_limit", Kind: "bool", Unit: "", Required: false, Cap: "", Label: "Charge on to the car's own limit"},
+		{Name: "clear", Kind: "bool", Unit: "", Required: false, Cap: "", Label: "Remove the goal"},
+		{Name: "surplus_only", Kind: "bool", Unit: "", Required: false, Cap: "", Label: "Charge from solar only"},
+	},
+	"car.soc.set": {
+		{Name: "id", Kind: "car", Unit: "", Required: false, Cap: "", Label: "Car"},
+		{Name: "charger_id", Kind: "loadpoint", Unit: "", Required: false, Cap: "", Label: "Charger"},
+		{Name: "soc", Kind: "ratio", Unit: "", Min: bound(0), Max: bound(1), Required: true, Cap: "", Label: "The car's charge level"},
+	},
+	"loadpoint.hold": {
+		{Name: "id", Kind: "loadpoint", Unit: "", Required: true, Cap: "", Label: "Charger"},
+		{Name: "power_w", Kind: "power", Unit: "W", Min: bound(0), Required: false, Cap: "maxW", Label: "Charging power"},
+		{Name: "hold_s", Kind: "duration", Unit: "s", Min: bound(1), Required: false, Cap: "holdS", Label: "For how long"},
+		{Name: "phase_mode", Kind: "enum", Unit: "", Values: []string{"auto", "1p", "3p"}, Required: false, Cap: "", Label: "Phases"},
+		{Name: "clear", Kind: "bool", Unit: "", Required: false, Cap: "", Label: "Stop the agent's own hold"},
+	},
+	"loadpoint.soc.set": {
+		{Name: "id", Kind: "loadpoint", Unit: "", Required: true, Cap: "", Label: "Charger"},
+		{Name: "soc", Kind: "ratio", Unit: "", Min: bound(0), Max: bound(1), Required: true, Cap: "", Label: "The car's charge level"},
+	},
+	"loadpoint.surplus_only.set": {
+		{Name: "id", Kind: "loadpoint", Unit: "", Required: true, Cap: "", Label: "Charger"},
+		{Name: "surplus_only", Kind: "bool", Unit: "", Required: true, Cap: "", Label: "Charge from solar only"},
+	},
+	"planner.prefs.set": {
+		{Name: "safety_k", Kind: "number", Unit: "", Min: bound(0), Max: bound(2), Required: false, Cap: "", Label: "How cautious the plan is"},
+		{Name: "battery_export", Kind: "enum", Unit: "", Values: []string{"unknown", "not_allowed", "allowed"}, Required: false, Cap: "", Label: "Whether the battery may sell to the grid"},
+	},
+	"site.mode.set": {
+		{Name: "mode", Kind: "mode", Unit: "", Required: true, Cap: "", Label: "Operating mode"},
+	},
+}
+
+// RegistryReads maps each read an agent may send to the scope it needs.
+var RegistryReads = map[string]string{
+	// live.get — Readings and freshness now.
+	"live.get": "ftw.live.read",
+	// loadpoints.get — Each charger and the car on it.
+	"loadpoints.get": "ftw.live.read",
+	// cars.get — Each car's level and goal.
+	"cars.get": "ftw.live.read",
+	// plan.get — The plan and its reasons.
+	"plan.get": "ftw.plan.read",
+	// price.get — Electricity prices.
+	"price.get": "ftw.plan.read",
+	// hist.query — Stored history.
+	"hist.query": "ftw.history.read",
+	// health.get — The health summary.
+	"health.get": "ftw.health.read",
+	// drivers.get — Each driver's state.
+	"drivers.get": "ftw.health.read",
+	// events.get — Recent events.
+	"events.get": "ftw.events.read",
+	// logs.get — A log excerpt the box redacts.
+	"logs.get": "ftw.logs.read",
+	// config.get — A configuration section the box redacts.
+	"config.get": "ftw.config.read",
+	// diag.run — A check that changes nothing.
+	"diag.run": "ftw.diag.run",
 }
 
 // Error codes. The box sends the code and machine-readable args; the app
@@ -185,6 +409,26 @@ const (
 	ErrWholeDocument = "E_WHOLE_DOCUMENT"
 	// ErrLocalOnly — Route is served only on the box's own page.
 	ErrLocalOnly = "E_LOCAL_ONLY"
+	// ErrGrantExpired — Access ran out at its expiry.
+	ErrGrantExpired = "E_GRANT_EXPIRED"
+	// ErrOpNotGranted — The grant does not list this operation.
+	ErrOpNotGranted = "E_OP_NOT_GRANTED"
+	// ErrCapExceeded — An argument or a count is past its cap.
+	ErrCapExceeded = "E_CAP_EXCEEDED"
+	// ErrRateLimited — Too many commands for the grant's rate.
+	ErrRateLimited = "E_RATE_LIMITED"
+	// ErrNeedsOwner — A durable change waits for an owner as agent.request.
+	ErrNeedsOwner = "E_NEEDS_OWNER"
+	// ErrBadSignature — The approval signature is missing or does not verify.
+	ErrBadSignature = "E_BAD_SIGNATURE"
+	// ErrNoApprovalKey — This phone has no approval key on the box.
+	ErrNoApprovalKey = "E_NO_APPROVAL_KEY"
+	// ErrNotFound — Nothing by that id or name.
+	ErrNotFound = "E_NOT_FOUND"
+	// ErrClockSkew — The approval's time is too far from the box's.
+	ErrClockSkew = "E_CLOCK_SKEW"
+	// ErrDuplicate — Another car already has that VIN or identifier.
+	ErrDuplicate = "E_DUPLICATE"
 )
 
 // ErrorRetryable reports whether the app should offer a retry for a code.
@@ -204,6 +448,16 @@ var ErrorRetryable = map[string]bool{
 	ErrUnsupportedMedia:   false,
 	ErrWholeDocument:      false,
 	ErrLocalOnly:          false,
+	ErrGrantExpired:       false,
+	ErrOpNotGranted:       false,
+	ErrCapExceeded:        false,
+	ErrRateLimited:        true,
+	ErrNeedsOwner:         false,
+	ErrBadSignature:       false,
+	ErrNoApprovalKey:      false,
+	ErrNotFound:           false,
+	ErrClockSkew:          true,
+	ErrDuplicate:          false,
 }
 
 // SourceState says whether a device is answering. It is orthogonal to the
@@ -252,4 +506,61 @@ var RegistryModeTiers = map[string]string{
 	"charge":                    "advanced",
 	"planner_self":              "hidden",
 	"planner_cheap":             "hidden",
+}
+
+// Where a car's level comes from: the registry's car_soc_sources.
+const (
+	CarSoCVehicle = "vehicle"
+	CarSoCManual  = "manual"
+	CarSoCAssumed = "assumed"
+)
+
+// How the box knows which car is on a charger: the registry's
+// car_identified_by.
+const (
+	CarIdentifiedByCharger = "charger"
+	CarIdentifiedByCar     = "car"
+	CarIdentifiedByOnly    = "only"
+	CarIdentifiedByTap     = "tap"
+	CarIdentifiedByAsking  = "asking"
+	CarIdentifiedByNone    = "none"
+)
+
+// CarFields is every name in the registry's car_fields. A dotted name is a
+// field of the object before the dot.
+var CarFields = []string{
+	"id",                  // 128 bits as 32 lowercase hex digits that the owner's app mints and every box keeps
+	"boxMinted",           // The box minted the id when it made the car from its old settings
+	"ownerId",             // Reserved for the owner the car belongs to. Empty until owners are principals
+	"name",                // The owner's name for the car
+	"make",                // The maker when a source or the owner gave one
+	"vin",                 // The vehicle identification number that binds a source to the car
+	"capacityWh",          // Usable battery capacity
+	"maxW",                // The most the car's own charger takes. 0 when unknown
+	"phases",              // The phases the car's own charger uses. 0 when unknown
+	"socPermille",         // The level. The car's own number while socEstimate is false. Absent when the box has none
+	"socSource",           // Where the level comes from. One of car_soc_sources
+	"socAgeS",             // Seconds since the car reported the level or someone set it
+	"energySinceWh",       // Energy delivered to the car since then. Negative when a V2X session took energy out
+	"socEstimate",         // The box counts the level as an estimate
+	"chargeLimitPermille", // The charge limit the car reported with its level
+	"goal",                // What the car should reach and when. Absent when none
+	"goal.targetPermille", // The level to reach
+	"goal.readyByMin",     // Ready time in minutes after midnight in the box's time zone
+	"goal.days",           // ISO weekdays with Monday in bit 0. 0 is once at the next ready time and 127 every day
+	"goal.finishAtLimit",  // Charge on to the car's own limit rather than to targetPermille
+	"surplusOnly",         // The car charges from surplus PV only wherever it is plugged in
+	"identifiers",         // RFID tags and MAC addresses and eMAIDs that name the car to a charger
+	"sources",             // The vehicle drivers on this box that report the car's level. Each box has its own
+}
+
+// ChargerCarFields is every name in the registry's charger_car_fields. A dotted name is a
+// field of the object before the dot.
+var ChargerCarFields = []string{
+	"session",          // This plug-in's id. A tap names it and is refused once it has changed
+	"carId",            // The car on the charger. Empty when the box does not know which
+	"carIdentifiedBy",  // How the box knows. One of car_identified_by
+	"carCorrected",     // A better rule replaced the car the box first named
+	"carCorrectedFrom", // The car the box named before that
+	"choose",           // While asking the cars a tap may pick. At most four
 }

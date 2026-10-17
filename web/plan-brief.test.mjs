@@ -15,6 +15,31 @@ const slot = (offsetMinutes, overrides = {}) => ({
 });
 
 describe("plan brief normalization", () => {
+  it("shows the actual planning failure before a first plan exists", () => {
+    const error = 'loadpoints[0].capacity_wh must be finite and greater than zero';
+    const brief = derivePlanBrief({ enabled: true, planning: { error },
+      status: { mode: 'planner_arbitrage', bat_soc: 0.84 }, now });
+    assert.equal(brief.state.label, 'Cannot plan');
+    assert.equal(brief.reason, error);
+    assert.equal(brief.planner.detail, error);
+    assert.doesNotMatch(brief.next.action, /Preparing/);
+  });
+
+  it("keeps a capped charger warning beside an active plan", () => {
+    const warning = 'Charger "Easee": charging steps above the 11000 W limit were reduced to 11000 W.';
+    const brief = derivePlanBrief({ enabled: true, plan: { actions: [slot(-7)] },
+      planning: { warnings: [warning] }, status: { mode: 'planner_arbitrage' }, now });
+    assert.equal(brief.state.key, 'active');
+    assert.match(brief.constraint, /Easee.*11000 W/);
+    assert.doesNotMatch(brief.constraint, /schedule is old/);
+  });
+
+  it("does not label a new pending attempt as a previous failure", () => {
+    const brief = derivePlanBrief({ enabled: true, planning: { error: 'old error', replanning: true }, now });
+    assert.equal(brief.state.key, 'preparing');
+    assert.doesNotMatch(brief.reason, /old error/);
+  });
+
   it("describes planner-off operation as manual and omits battery copy when absent", () => {
     const brief = derivePlanBrief({
       enabled: false,
@@ -154,6 +179,32 @@ describe("plan brief normalization", () => {
     assert.equal(brief.state.label, "Built-in plan active");
     assert.equal(brief.planner.label, "Built-in fallback");
     assert.equal(brief.planner.detail, "Worker unavailable");
+  });
+
+  it("says when the plan does without the forecast caution the household chose", () => {
+    const warning = "Forecast caution is invalid; using the point forecast: pv_uncertainty_w must be finite and non-negative";
+    const brief = derivePlanBrief({
+      enabled: true,
+      plan: { actions: [slot(8), slot(23)], solver: {}, caution_off: true },
+      planning: { warnings: [warning] },
+      status: { mode: "planner_arbitrage" },
+      now,
+    });
+
+    assert.equal(brief.state.key, "caution_off");
+    assert.equal(brief.state.tone, "warn");
+    assert.equal(brief.forecast.label, "Point forecast");
+    assert.match(brief.forecast.detail, /^No margin for forecast error in this plan\. Plan until /);
+    assert.match(brief.constraint, /point forecast/);
+
+    const kept = derivePlanBrief({
+      enabled: true,
+      plan: { actions: [slot(8)], solver: {} },
+      status: { mode: "planner_arbitrage" },
+      now,
+    });
+    assert.equal(kept.state.key, "active");
+    assert.equal(kept.forecast.label, "Published prices");
   });
 
   it("surfaces active safety clamps and how far the published prices reach", () => {

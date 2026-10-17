@@ -2,6 +2,7 @@ package mpc
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
@@ -155,6 +157,9 @@ type Service struct {
 	PVForecastSafetyK float64
 	Loadpoint         LoadpointProbe // optional — when non-nil, the DP extends its state with EV dimensions
 	Loadpoints        LoadpointsProbe
+	// LoadpointStates supplies current saved goals without taking the control
+	// lock. It is independent of forecasts, prices and battery qualification.
+	LoadpointStates func() []loadpoint.State
 
 	// SaveDiag is called synchronously after every successful replan that
 	// remains the newest request, with the same Diagnostic the
@@ -213,8 +218,17 @@ type Service struct {
 	// before Start; config reload replaces them with UpdateSiteEconomics.
 	SiteEconomics
 
-	lastReplanAt time.Time
-	lastReason   string // reason paired with the currently published plan
+	lastReplanAt        time.Time
+	lastReason          string // reason paired with the currently published plan
+	lastPlanningError   string
+	lastPlanningFailure *PlanningFailure
+	// Failure writes serialize outside mu so support I/O cannot hold up
+	// dispatch readers or let an older write replace newer evidence.
+	failurePersistMu            sync.Mutex
+	persistedPlanningFailure    *PlanningFailure
+	planningFailureRestored     bool
+	planningFailureStorageError string
+	planningWarnings            []string
 	// latestReplanGeneration identifies the newest requested solve. Starting a
 	// newer generation cancels the older request; the generation check remains
 	// the final guard for work that does not stop promptly on context cancel.
@@ -229,6 +243,9 @@ type Service struct {
 	// decisionIDFactory is a test seam. Production uses a random UUID for every
 	// accepted plan. It is read only while mu is held at the publish gate.
 	decisionIDFactory func() string
+	// planChanged are told when what a plan reader sees moves. Guarded by
+	// mu; only ever appended to.
+	planChanged []func()
 
 	// MinArbitrageSpreadOreKwh flows in from config.Planner. Copied into
 	// Params so the DP applies the arbitrage cycle deadband. See
@@ -276,6 +293,7 @@ type plannedPredictions struct {
 // particular, mode and reason must stay paired while a slower solve runs.
 type replanRequest struct {
 	generation uint64
+	startedAt  time.Time
 	params     Params
 	fleet      []BatteryFleetMember
 	// site, safetyK and minSpread are copied with params, so one plan never
@@ -331,9 +349,19 @@ func overlayLiveHouseLoad(slots []Slot, loadW float64, ok bool) {
 	slots[0].LoadW = loadW
 }
 
+// recoveredLoads marks the published loads Core replaced after the selected
+// forecast failed. point already holds the live meter's in-flight load.
+func recoveredLoads(point, published []Slot) []bool {
+	out := make([]bool, len(published))
+	for i := range published {
+		out[i] = i < len(point) && published[i].LoadW != point[i].LoadW
+	}
+	return out
+}
+
 // New constructs a service. Caller wires it in main.go after store + telemetry.
 func New(st *state.Store, tl *telemetry.Store, zone string, p Params) *Service {
-	return &Service{
+	s := &Service{
 		Store:            st,
 		Tele:             tl,
 		Zone:             zone,
@@ -358,6 +386,8 @@ func New(st *state.Store, tl *telemetry.Store, zone string, p Params) *Service {
 		done:                  make(chan struct{}),
 		stopped:               make(chan struct{}),
 	}
+	s.restorePlanningFailure()
+	return s
 }
 
 // SetSiteMeter updates the grid-boundary driver used by reactive replanning.
@@ -443,6 +473,25 @@ func (s *Service) UpdatePlannerScalars(p Params, baseLoad float64, horizon, inte
 	s.mu.Unlock()
 }
 
+// OnPlanChange adds fn to those called each time what a plan reader sees
+// moves: a replan starts and the plan becomes pending, a plan is published,
+// or the newest replan ends without one. fn runs on the replanning or
+// requesting goroutine without the service lock and must not block.
+func (s *Service) OnPlanChange(fn func()) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planChanged = append(s.planChanged, fn)
+}
+
+func tell(fns []func()) {
+	for _, fn := range fns {
+		fn()
+	}
+}
+
 // Latest returns the most recently computed plan (nil before first run).
 func (s *Service) Latest() *Plan {
 	if s == nil {
@@ -456,11 +505,16 @@ func (s *Service) Latest() *Plan {
 // PlanSnapshot keeps the visible plan and its freshness in one read. Outdated
 // remains true if the latest request fails; Pending only describes active work.
 type PlanSnapshot struct {
-	Plan        *Plan
-	ReplanAt    time.Time
-	Reason      string
-	Pending     bool
-	Outdated    bool
+	Plan     *Plan
+	ReplanAt time.Time
+	Reason   string
+	Pending  bool
+	Outdated bool
+	// Unproven is set when the plan needs fresh physical inputs or PV
+	// control before the box may act on it. Outdated is set with it.
+	Unproven    bool
+	Error       string
+	Warnings    []string
 	loadpointID string
 }
 
@@ -475,11 +529,13 @@ func (s *Service) PlanSnapshot() PlanSnapshot {
 	out := PlanSnapshot{
 		Plan: s.last, ReplanAt: s.lastReplanAt, Reason: s.lastReason,
 		Pending: outdated && s.activeReplanCancel != nil, Outdated: outdated,
+		Error: s.lastPlanningError, Warnings: slices.Clone(s.planningWarnings),
 		loadpointID: s.lastLoadpointID,
 	}
 	s.mu.RUnlock()
 	if !s.planExecutionAllowed(out.Plan, proof, currentContract) {
 		out.Outdated = true
+		out.Unproven = true
 		out.Reason = "Plan requires fresh physical inputs or PV control"
 	}
 	return out
@@ -578,6 +634,8 @@ type SlotDirective struct {
 	// remaining_s` formula it uses for the battery.
 	LoadpointEnergyWh  map[string]float64
 	LoadpointMaxPowerW map[string]float64
+	LoadpointFallback  map[string]bool
+	EVOnly             bool // Current goal reserve; never an accepted battery plan.
 
 	// LoadpointSoCTarget is the plan's EV SoC at SlotEnd per
 	// loadpoint. Used by the per-loadpoint divergence check.
@@ -602,10 +660,10 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 	params := s.directiveParamsLocked(s.lastParams)
 	s.mu.RUnlock()
 	if p == nil || failedReplacement || !s.planExecutionAllowed(p, params.PVCurtailment, currentContract) {
-		return SlotDirective{}, false
+		return s.withDeadlineReserve(now, SlotDirective{}, false)
 	}
 	if time.Since(time.UnixMilli(p.GeneratedAtMs)) > MaxPlanAge {
-		return SlotDirective{}, false
+		return s.withDeadlineReserve(now, SlotDirective{}, false)
 	}
 	nowMs := now.UnixMilli()
 	for _, a := range p.Actions {
@@ -644,7 +702,7 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 				d.LoadpointEnergyWh[id] = powerW * a.DurationHours()
 				d.LoadpointSoCTarget[id] = a.LoadpointSoCByID[id]
 			}
-		} else if a.LoadpointW > 0 && lpID != "" {
+		} else if lpID != "" {
 			lpEnergyWh := a.LoadpointW * a.DurationHours()
 			d.LoadpointEnergyWh = map[string]float64{
 				lpID: lpEnergyWh,
@@ -653,9 +711,9 @@ func (s *Service) SlotDirectiveAt(now time.Time) (SlotDirective, bool) {
 				lpID: a.LoadpointSoC,
 			}
 		}
-		return d, true
+		return s.withDeadlineReserve(now, d, true)
 	}
-	return SlotDirective{}, false
+	return s.withDeadlineReserve(now, SlotDirective{}, false)
 }
 
 // PlanWindow is one contiguous run of plan slots in which the active
@@ -1290,7 +1348,9 @@ func (s *Service) requestReplan(reason string, change func()) {
 	s.queuedReplan = &request
 	startWorker := !s.requestedReplanRunning
 	s.requestedReplanRunning = true
+	changed := s.planChanged
 	s.mu.Unlock()
+	tell(changed)
 	if previous != nil {
 		s.finishReplan(*previous)
 	}
@@ -1331,8 +1391,14 @@ func (s *Service) replan(ctx context.Context, reason string) *Plan {
 
 func (s *Service) beginReplan(ctx context.Context, reason string) replanRequest {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.beginReplanLocked(ctx, reason)
+	request := s.beginReplanLocked(ctx, reason)
+	var changed []func()
+	if request.accepted {
+		changed = s.planChanged
+	}
+	s.mu.Unlock()
+	tell(changed)
+	return request
 }
 
 // beginReplanLocked assigns the generation and snapshots the effective
@@ -1368,10 +1434,13 @@ func (s *Service) beginReplanLocked(ctx context.Context, reason string) replanRe
 		cancel()
 	}
 	s.latestReplanGeneration++
+	s.lastPlanningError = ""
+	s.planningWarnings = nil
 	s.activeReplanCancel = serviceCancel
 	s.replanWG.Add(1)
 	return replanRequest{
 		generation:        s.latestReplanGeneration,
+		startedAt:         time.Now(),
 		params:            s.Defaults,
 		fleet:             append([]BatteryFleetMember(nil), s.BatteryFleet...),
 		site:              s.SiteEconomics,
@@ -1391,18 +1460,29 @@ func (r replanRequest) wasCanceledByService() bool {
 
 func (s *Service) finishReplan(request replanRequest) {
 	defer s.replanWG.Done()
+	contextErr := request.ctx.Err()
 	request.cancel()
+	var changed []func()
 	s.mu.Lock()
 	if request.generation == s.latestReplanGeneration {
 		s.activeReplanCancel = nil
 		if s.publishedReplanGeneration != request.generation {
+			if s.lastPlanningError == "" {
+				if contextErr != nil {
+					s.lastPlanningError = "Planning stopped: " + contextErr.Error()
+				} else {
+					s.lastPlanningError = "Planning did not produce a usable plan"
+				}
+			}
 			// Keep the last plan during a normal recalculation, but stop using
 			// it when the replacement fails. A later retry must publish a new
 			// plan before dispatch resumes; queuing work alone is not enough.
 			s.failedReplanGeneration = request.generation
+			changed = s.planChanged
 		}
 	}
 	s.mu.Unlock()
+	tell(changed)
 }
 
 func (s *Service) canceledReplan(request replanRequest, stage string) *Plan {
@@ -1444,7 +1524,22 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		return s.Latest()
 	}
 	defer s.finishReplan(request)
+	defer s.persistPlanningFailure()
 	ctx := request.ctx
+	p := request.params
+	var slots, forecastInputs, solverInputs []Slot
+	var optimizerErr error
+	fail := func(stage, message string) *Plan {
+		inputs := slots
+		if solverInputs != nil {
+			inputs = solverInputs
+		}
+		if len(inputs) == 0 {
+			inputs = forecastInputs
+		}
+		s.recordPlanningFailure(request, stage, message, inputs, p, optimizerErr)
+		return s.failedReplan(request, message)
+	}
 	if request.wasCanceledByService() {
 		return s.canceledReplan(request, "start")
 	}
@@ -1456,7 +1551,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			"mode", request.params.Mode,
 			"reason", request.reason,
 			"err", err)
-		return s.Latest()
+		return fail("inputs", err.Error())
 	}
 	now := s.planningNow()
 	s.mu.RLock()
@@ -1472,7 +1567,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	prices, err := s.Store.LoadPrices(s.Zone, sinceMs, untilMs)
 	if err != nil {
 		slog.Warn("mpc: load prices", "err", err)
-		return nil
+		return fail("inputs", "Could not load electricity prices: "+err.Error())
 	}
 	if request.wasCanceledByService() {
 		return s.canceledReplan(request, "load-prices")
@@ -1480,7 +1575,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// The plan covers the published prices and nothing beyond them.
 	if len(prices) == 0 {
 		slog.Info("mpc: no prices available yet")
-		return nil
+		return fail("inputs", "Waiting for electricity prices")
 	}
 
 	// Price rows may start up to 15 minutes before now, while weather rows
@@ -1504,10 +1599,10 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			forecasts = captured.Weather
 		}
 	}
-	slots := buildSlots(prices, forecasts, baseLoad, now.UnixMilli(), pv, correct, load, captured.PVWeight)
+	slots = buildSlots(prices, forecasts, baseLoad, now.UnixMilli(), pv, correct, load, captured.PVWeight)
 	// Resolve receives the complete legacy forecast, so its frozen shadow
 	// matches what the previous pipeline would have used.
-	sanitizeSlotLoads(slots)
+	legacySlots := append([]Slot(nil), slots...)
 	if captured.Resolve != nil && len(slots) > 0 {
 		if request.wasCanceledByService() {
 			return s.canceledReplan(request, "forecast-start")
@@ -1520,34 +1615,48 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		}
 		if len(resolved) != len(slots) {
 			slog.Error("mpc: forecast changed horizon length; keeping previous plan")
-			return s.Latest()
+			return fail("inputs", "The forecast changed the planning horizon")
 		}
 		for i := range slots {
 			if resolved[i].StartMs != slots[i].StartMs || resolved[i].LenMin != slots[i].LenMin {
 				slog.Error("mpc: forecast changed interval; keeping previous plan", "slot", i)
-				return s.Latest()
+				return fail("inputs", fmt.Sprintf("The forecast changed planning slot %d", i))
 			}
 			// Forecast selection cannot replace market data or physical limits.
 			slots[i].PVW, slots[i].LoadW = resolved[i].PVW, resolved[i].LoadW
 		}
 	}
-	sanitizeSlotLoads(slots)
-	{
-		loadW, ok := s.liveHouseLoadW()
-		overlayLiveHouseLoad(slots, loadW, ok)
+	forecastInputs = append([]Slot(nil), slots...)
+	liveLoadW, liveLoadOK := s.liveHouseLoadW()
+	liveLoadOK = liveLoadOK && finite(liveLoadW) && liveLoadW >= 0
+	overlayLiveHouseLoad(slots, liveLoadW, liveLoadOK)
+	// The point forecast as selected, with the live meter's in-flight load.
+	// A published load that differs from it is Core's recovery.
+	pointInputs := append([]Slot(nil), slots...)
+	var forecastWarnings []string
+	admitted, forecastErr := recoverInvalidForecastLoads(slots, legacySlots, baseLoad)
+	if forecastErr != nil {
+		s.recordPlanningFailure(request, "forecast_inputs", forecastErr.Error(), slots, p, nil)
+		forecastWarnings = append(forecastWarnings, forecastErr.Error())
 	}
+	slots = admitted
 	// Qualified load models own their level. Unqualified historic daily
 	// totals must not impose a floor on a changed or low-load household.
 	if len(slots) == 0 {
-		return nil
+		return fail("inputs", "No current electricity price slots are available")
 	}
-	if err := validateSlotChronology(slots); err != nil {
-		slog.Error("mpc: invalid slot chronology; keeping previous plan", "err", err)
-		return s.Latest()
+	requestedSlots := len(slots)
+	var inputErr error
+	slots, inputErr = planningInputPrefix(slots)
+	if inputErr != nil {
+		s.recordPlanningFailure(request, "forecast_inputs", inputErr.Error(), forecastInputs, p, nil)
 	}
-	// Keep the point forecast and a downside-PV copy. The Core DP and the
-	// Energyplan worker both plan against the downside copy; the point
-	// forecast stays for diagnostics and forecast calibration.
+	if len(slots) == 0 {
+		slog.Error("mpc: invalid current planning input; keeping previous plan", "err", inputErr)
+		return fail("inputs", inputErr.Error())
+	}
+	// Keep point and caution inputs separate. Both planners retain a valid
+	// point plan before trying caution; calibration still uses point errors.
 	fallbackSlots := append([]Slot(nil), slots...)
 	var pvUncertaintyW, pvRelativeUncertainty float64
 	pvUncertainty := s.PVUncertaintyW
@@ -1584,7 +1693,6 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	limitNearImportForPhases(slots, now, fuseMaxW, phaseImbalanceW)
 	limitNearImportForPhases(fallbackSlots, now, fuseMaxW, phaseImbalanceW)
 
-	p := request.params
 	if s.PVCurtailmentProbe != nil {
 		p.PVCurtailment = s.PVCurtailmentProbe()
 	}
@@ -1595,16 +1703,20 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	if len(fleet) > 0 {
 		if err := validateBatteryFleetMembers(fleet); err != nil {
 			slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
-			return s.Latest()
+			return fail("inputs", err.Error())
 		}
 		var ok bool
 		p, ok = s.onlineFleetParams(p, fleet, fuseMaxW)
 		if !ok {
 			slog.Warn("mpc: no online battery capacity with SoC — keeping previous plan")
-			return s.Latest()
+			return fail("inputs", "Waiting for an online battery with capacity and charge level")
 		}
 	} else if p.CapacityWh > 0 {
-		p.InitialSoC = currentSoC(s.Tele, p.InitialSoC)
+		var ok bool
+		p.InitialSoC, ok = currentSoC(s.Tele, p.InitialSoC)
+		if !ok {
+			return fail("inputs", "Waiting for an online battery with a fresh charge level")
+		}
 	} else {
 		p.InitialSoC = 0
 	}
@@ -1633,10 +1745,30 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	if pvRelative != nil || s.ForecastSnapshot != nil {
 		p.PVRelativeUncertainty = pvRelativeUncertainty
 	}
-	applyPVDownsidePerSlot(fallbackSlots, p.PVForecastSafetyK,
-		p.PVRelativeUncertainty, p.PVUncertaintyW)
-	if captured.Risk != nil {
-		captured.Risk(slots, fallbackSlots, p.PVForecastSafetyK)
+	// Set when the plan does without its caution forecast. It reaches the
+	// published plan only when the planning style asks for caution.
+	cautionOff := false
+	if cautionErr := validateForecastCaution(p); cautionErr != nil {
+		// Preserve the raw optional model/preference before disabling caution.
+		// Hardware, telemetry, prices and goals still pass their strict gates.
+		s.recordPlanningFailure(request, "risk_inputs", cautionErr.Error(), fallbackSlots, p, nil)
+		forecastWarnings = append(forecastWarnings, "Forecast caution is invalid; using the point forecast: "+cautionErr.Error())
+		cautionOff = true
+		p.PVForecastSafetyK, p.PVUncertaintyW, p.PVRelativeUncertainty = 0, 0, 0
+	} else {
+		applyPVDownsidePerSlot(fallbackSlots, p.PVForecastSafetyK,
+			p.PVRelativeUncertainty, p.PVUncertaintyW)
+		if captured.Risk != nil {
+			captured.Risk(slots, fallbackSlots, p.PVForecastSafetyK)
+		}
+	}
+	if recovered, err := recoverInvalidForecastLoads(fallbackSlots, slots, baseLoad); err != nil {
+		s.recordPlanningFailure(request, "risk_inputs", err.Error(), fallbackSlots, p, nil)
+		// The replacements here are the point loads, not legacy or the prior.
+		forecastWarnings = append(forecastWarnings, "Forecast caution had invalid load values; using the point forecast for those slots")
+		fallbackSlots = recovered
+		// Point loads in every slot leave no caution; some slots leave some.
+		cautionOff = cautionOff || sameForecast(fallbackSlots, slots)
 	}
 	// Keep the point forecast distinct from the downside inputs passed to the
 	// solver. Calibrating point errors against the risk adjustment biases them.
@@ -1652,9 +1784,16 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// tomorrow" (because discharging loses η_rt while the extra retail-
 	// priced terminal credit is never realised).
 	if p.TerminalSoCPrice <= 0 {
+		terminalPrices := prices
+		if inputErr != nil {
+			terminalPrices = make([]state.PricePoint, len(slots))
+			for i, slot := range slots {
+				terminalPrices[i] = state.PricePoint{TotalOreKwh: slot.PriceOre, SpotOreKwh: slot.SpotOre}
+			}
+		}
 		switch p.Mode {
 		case ModeSelfConsumption, ModeCheapCharge, ModePassiveArbitrage:
-			p.TerminalSoCPrice = selfConsumptionTerminalPrice(prices,
+			p.TerminalSoCPrice = selfConsumptionTerminalPrice(terminalPrices,
 				site.ExportBonusOreKwh, site.ExportFeeOreKwh)
 		default:
 			// Arbitrage: stored SoC at horizon end will be discharged at
@@ -1672,7 +1811,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			// terminal value from ~262 to ~310, much closer to the
 			// realisable discharge value, without being naive about
 			// always discharging at the peak.
-			p.TerminalSoCPrice = upperHalfMeanPrice(prices)
+			p.TerminalSoCPrice = upperHalfMeanPrice(terminalPrices)
 		}
 	}
 
@@ -1692,12 +1831,18 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 				p.Loadpoints = []*LoadpointSpec{spec}
 			}
 		}
-		// Check the probe output before activeLoadpoints filters it. A plugged-in
-		// spec with broken physics must stop planning, not disappear and make the
-		// service silently solve a different battery-only problem.
+	}
+	warnings := append(forecastWarnings, limitPlanningLoadpointSteps(&p)...)
+	s.mu.Lock()
+	if request.generation == s.latestReplanGeneration {
+		s.planningWarnings = warnings
+	}
+	s.mu.Unlock()
+	if s.Loadpoints != nil || s.Loadpoint != nil {
+		// Invalid physics must not disappear into a battery-only problem.
 		if err := validateLoadpointSpecs(planningLoadpointSpecs(p), make(map[string]string)); err != nil {
 			slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
-			return s.Latest()
+			return fail("inputs", err.Error())
 		}
 		active := p.activeLoadpoints()
 		if len(active) > 0 {
@@ -1708,17 +1853,28 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		}
 	}
 
-	if err := validatePlanningSlots(slots); err != nil {
-		slog.Error("mpc: invalid optimization inputs; keeping previous plan", "basis", "primary", "err", err)
-		return s.Latest()
+	prefix, slotErr := planningInputPrefix(slots)
+	if slotErr != nil {
+		s.recordPlanningFailure(request, "forecast_inputs", slotErr.Error(), slots, p, nil)
 	}
-	if err := validatePlanningSlots(fallbackSlots); err != nil {
-		slog.Error("mpc: invalid optimization inputs; keeping previous plan", "basis", "go-fallback", "err", err)
-		return s.Latest()
+	if len(prefix) == 0 {
+		return s.failedReplan(request, slotErr.Error())
+	}
+	if len(prefix) < len(slots) {
+		slots, fallbackSlots = slots[:len(prefix)], fallbackSlots[:len(prefix)]
+		baseForecastSlots = baseForecastSlots[:len(prefix)]
+		inputErr = slotErr
+	}
+	// Optional risk inputs cannot invalidate or shorten a valid point forecast.
+	if riskErr := validatePlanningSlots(fallbackSlots); riskErr != nil {
+		s.recordPlanningFailure(request, "risk_inputs", riskErr.Error(), fallbackSlots, p, nil)
+		warnings = append(warnings, "Forecast caution inputs are invalid; using the point forecast: "+riskErr.Error())
+		fallbackSlots = append([]Slot(nil), slots...)
+		cautionOff = true
 	}
 	if err := validatePlanningParams(p); err != nil {
 		slog.Error("mpc: invalid optimization parameters; keeping previous plan", "err", err)
-		return s.Latest()
+		return fail("inputs", err.Error())
 	}
 	recoveryRequired := planningParamsRequireRecovery(p)
 	if recoveryRequired && s.Optimizer == nil {
@@ -1731,7 +1887,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 				"soc_start", p.InitialSoC,
 				"soc_min", p.SoCMin,
 				"soc_max", p.SoCMax)
-			return s.Latest()
+			return fail("inputs", "Battery charge level cannot be represented within its limits")
 		}
 		if clamped {
 			slog.Warn("mpc: planning from clamped SoC",
@@ -1769,15 +1925,81 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 		slots = fallbackSlots
 	}
 	if coreChampion {
-		// Core is the planner. It solves the downside-PV slots — forecast
-		// minus k·σ per slot — so the plan it publishes is the one that does
-		// not bet on sun that may not arrive.
+		// Keep a point plan before trying optional forecast caution.
 		slots = fallbackSlots
+		solverInputs = baseForecastSlots
 		solveStart := time.Now()
-		plan = coreReservePlan(context.WithoutCancel(ctx), slots, p)
+		choice, err := corePlanWithForecastRecovery(context.WithoutCancel(ctx), slots, baseForecastSlots, p, baseLoad, liveLoadOK, s.planningNow)
+		plan, slots = choice.plan, choice.slots
+		cautionOff = cautionOff || choice.withoutCaution
+		if choice.warning != "" {
+			s.recordPlanningFailure(request, "forecast_recovery", choice.warning, fallbackSlots, p, nil)
+			warnings = append(warnings, choice.warning)
+			if choice.warning == forecastPriorWarning {
+				baseForecastSlots = append([]Slot(nil), slots...)
+			}
+		}
+		fallbackSlots = append([]Slot(nil), slots...)
+		if request.wasCanceledByService() {
+			return s.canceledReplan(request, "core-recovery")
+		}
+		if err != nil {
+			return fail("core_optimizer", "Core could not build a safe plan: "+err.Error())
+		}
 		setCoreReserveSolver(&plan, p, msSince(solveStart))
 	} else {
-		candidate, err := s.Optimizer.Optimize(ctx, slots, p)
+		solverInputs = slots
+		var candidate Plan
+		var err error
+		if downsidePrimary {
+			choice, solveErr := planWithForecastMargin(ctx, baseForecastSlots, fallbackSlots, p, s.planningNow,
+				func(ctx context.Context, inputs []Slot, p Params) (Plan, []Slot, error) {
+					plan, err := s.Optimizer.Optimize(ctx, inputs, p)
+					return plan, inputs, err
+				})
+			candidate, slots, err = choice.plan, choice.slots, solveErr
+			cautionOff = cautionOff || choice.withoutCaution
+			if choice.warning != "" {
+				s.recordPlanningFailure(request, "forecast_caution", choice.warning, fallbackSlots, p, choice.marginErr)
+				warnings = append(warnings, choice.warning)
+			}
+			if err == nil {
+				fallbackSlots = append([]Slot(nil), slots...)
+			}
+		} else {
+			candidate, err = s.Optimizer.Optimize(ctx, slots, p)
+		}
+		solverInputs = slots
+		optimizerErr = err
+		if forecastInfeasible(err) && !request.wasCanceledByService() {
+			// Preserve the original failed exchange even when a simpler forecast
+			// lets this same optimiser recover. Goals and limits stay unchanged.
+			s.recordPlanningFailure(request, "primary_optimizer", err.Error(), slots, p, err)
+			retryCtx, cancelRetry := context.WithTimeout(ctx, forecastRecoveryBudget)
+			for _, attempt := range forecastRecoveryAttempts(slots, baseForecastSlots, baseLoad, liveLoadOK) {
+				if retryCtx.Err() != nil {
+					break
+				}
+				recovered, retryErr := s.Optimizer.Optimize(retryCtx, attempt.slots, p)
+				if request.wasCanceledByService() {
+					break
+				}
+				if retryErr == nil {
+					// Only a downside planner solved the caution forecast.
+					cautionOff = cautionOff || (downsidePrimary && !sameForecast(fallbackSlots, baseForecastSlots))
+					candidate, slots, err = recovered, attempt.slots, nil
+					baseForecastSlots = append([]Slot(nil), attempt.base...)
+					fallbackSlots = append([]Slot(nil), attempt.slots...)
+					warnings = append(warnings, attempt.reason)
+					slog.Warn("mpc: optimiser recovered with a simpler forecast", "reason", attempt.reason)
+					break
+				}
+				if !forecastInfeasible(retryErr) {
+					break
+				}
+			}
+			cancelRetry()
+		}
 		if request.wasCanceledByService() {
 			return s.canceledReplan(request, "primary-solve")
 		}
@@ -1845,24 +2067,58 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 					"soc_start", p.InitialSoC,
 					"soc_min", p.SoCMin,
 					"soc_max", p.SoCMax)
-				return s.Latest()
+				return fail("core_fallback", "Optimizer failed: "+err.Error())
 			}
 			if modelErr := coreDPModelError(p); modelErr != nil {
 				slog.Error("mpc: primary failed and fallback cannot represent this site; keeping previous plan", "err", err, "fallback", modelErr)
-				return s.Latest()
+				return fail("core_fallback", "Optimizer failed: "+err.Error()+"; fallback unavailable: "+modelErr.Error())
 			}
+			s.recordPlanningFailure(request, "primary_optimizer", err.Error(), slots, p, optimizerErr)
 			slog.Error("mpc: primary optimizer failed; using Core DP fallback", "err", err)
 			slots = fallbackSlots
+			solverInputs = baseForecastSlots
 			solveStart := time.Now()
-			plan = coreReservePlan(context.WithoutCancel(ctx), slots, p)
+			choice, fallbackErr := corePlanWithForecastRecovery(context.WithoutCancel(ctx), slots, baseForecastSlots, p, baseLoad, liveLoadOK, s.planningNow)
+			plan, slots = choice.plan, choice.slots
+			cautionOff = cautionOff || choice.withoutCaution
+			if choice.warning != "" {
+				warnings = append(warnings, choice.warning)
+				if choice.warning == forecastPriorWarning {
+					baseForecastSlots = append([]Slot(nil), slots...)
+				}
+			}
+			fallbackSlots = append([]Slot(nil), slots...)
+			if request.wasCanceledByService() {
+				return s.canceledReplan(request, "core-recovery")
+			}
+			if fallbackErr != nil {
+				return fail("core_fallback", "Optimizer failed: "+err.Error()+"; Core could not build a safe plan: "+fallbackErr.Error())
+			}
 			setCoreReserveSolver(&plan, p, msSince(solveStart))
-			// Same solver, different standing: the operator asked for the
-			// external planner and did not get it. Everything that warns about
-			// a degraded optimizer keys on this flag, not on the engine name.
+			// Mark Core's reserve as a fallback when the operator requested
+			// the external planner. Clients use the flag to show that change.
 			plan.Solver.Status = "fallback"
 			plan.Solver.Fallback = true
-			plan.Solver.FallbackReason = err.Error()
+			if plan.Solver.FallbackReason != "" {
+				plan.Solver.FallbackReason = err.Error() + "; " + plan.Solver.FallbackReason
+			} else {
+				plan.Solver.FallbackReason = err.Error()
+			}
 		}
+	}
+	solverInputs = slots
+	var horizonWarning string
+	if inputErr != nil {
+		horizonWarning = markShortenedPlan(&plan, slots, "Later planning inputs are invalid: "+inputErr.Error()+".")
+	}
+	if len(slots) < requestedSlots {
+		if horizonWarning == "" {
+			horizonWarning = plan.Solver.FallbackReason
+		}
+		warnings = append(warnings, horizonWarning)
+		slog.Warn("mpc: publishing a shorter safe plan", "slots", len(slots), "requested_slots", requestedSlots, "reason", horizonWarning)
+		baseForecastSlots = baseForecastSlots[:len(slots)]
+		fallbackSlots = fallbackSlots[:len(slots)]
 	}
 	if err := validatePlanSlotAlignment(slots, plan.Actions); err != nil {
 		slog.Error("mpc: rejected plan with invalid slot timeline",
@@ -1870,7 +2126,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			"mode", p.Mode,
 			"reason", request.reason,
 			"err", err)
-		return s.Latest()
+		return fail("plan_timeline", err.Error())
 	}
 	if err := ValidatePlan(slots, p, &plan); err != nil {
 		engine := "go-dp"
@@ -1883,7 +2139,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 			"reason", request.reason,
 			"engine", engine,
 			"err", err)
-		return s.Latest()
+		return fail("plan_validation", err.Error())
 	}
 
 	// Tag each action with the effective EMS mode so the UI can render
@@ -1901,7 +2157,7 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// self-consumption mode: the SC baseline is the plan itself, which
 	// makes the badge trivially zero and distracts from the price
 	// signal. For SC runs the UI still has the plan cost on its own.
-	if p.Mode != ModeSelfConsumption && !recoveryRequired && coreDPModelError(p) == nil && (plan.Solver == nil || plan.Solver.Backend != "ev_reserve") {
+	if p.Mode != ModeSelfConsumption && !recoveryRequired && coreDPModelError(p) == nil && (plan.Solver == nil || (!plan.Solver.Fallback && plan.Solver.Backend != "ev_reserve")) {
 		bl := ComputeBaselines(slots, p)
 		plan.Baselines = &bl
 	}
@@ -1944,7 +2200,16 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	// actions yet, and nothing edits them after this point.
 	s.setLivePVSurplusSoCCapsLocked(plan.Actions, p)
 	plan.DecisionID = s.nextDecisionIDLocked()
+	// A safety_k of 0 asks for no caution; NaN asks for caution it cannot get.
+	plan.CautionOff = cautionOff && request.safetyK != 0
+	cautionChanged := plan.CautionOff != (s.last != nil && s.last.CautionOff)
 	s.last = &plan
+	if f := s.lastPlanningFailure; f != nil && f.RecoveredDecisionID == "" {
+		recovered := *f
+		recovered.RecoveredDecisionID = plan.DecisionID
+		recovered.RecoveredAtMs = time.Now().UnixMilli()
+		s.lastPlanningFailure = &recovered
+	}
 	s.executionPlan = s.last
 	s.lastSlots = slots
 	s.lastParams = p
@@ -1953,12 +2218,22 @@ func (s *Service) runReplan(request replanRequest) *Plan {
 	s.plannedPredictions = pp
 	s.lastReason = request.reason
 	s.publishedReplanGeneration = request.generation
+	s.lastPlanningError = ""
+	s.planningWarnings = warnings
 	reason := request.reason
 	replanAtMs := s.lastReplanAt.UnixMilli()
 	saveDiag := s.SaveDiag
+	changed := s.planChanged
 	s.mu.Unlock()
+	tell(changed)
+	if cautionChanged && plan.CautionOff {
+		slog.Warn("mpc: forecast caution off; the plan uses the point forecast",
+			"decision_id", plan.DecisionID, "safety_k", request.safetyK, "warnings", warnings)
+	} else if cautionChanged {
+		slog.Info("mpc: forecast caution back on", "decision_id", plan.DecisionID)
+	}
 	if captured.Record != nil {
-		captured.Record(baseForecastSlots, fallbackSlots, plan.DecisionID, replanAtMs)
+		captured.Record(baseForecastSlots, fallbackSlots, recoveredLoads(pointInputs, baseForecastSlots), plan.DecisionID, replanAtMs)
 	}
 	// Horizon statistics — surfaced in logs so operators can
 	// reconstruct "what did the DP know?" without pulling the full
@@ -2433,27 +2708,35 @@ func lookupPVInput(forecasts []state.ForecastPoint, ts int64) (float64, *state.F
 	return 0, nil
 }
 
-// currentSoC averages battery SoC from telemetry (0–1).
-func currentSoC(t *telemetry.Store, fallback float64) float64 {
+// currentSoC averages fresh online battery SoC (0–1). A caller without a
+// telemetry source can plan from its supplied state. A live store must not
+// turn missing measurements into that configured initial state.
+func currentSoC(t *telemetry.Store, fallback float64) (float64, bool) {
 	if t == nil {
-		return fallback
+		return fallback, true
 	}
 	bats := t.ReadingsByType(telemetry.DerBattery)
-	if len(bats) == 0 {
-		return fallback
-	}
 	var sum float64
 	var n int
 	for _, b := range bats {
-		if b.SoC != nil {
+		h := t.DriverHealth(b.Driver)
+		if (h == nil || h.IsOnline()) && freshBatterySoC(b) {
 			sum += *b.SoC
 			n++
 		}
 	}
 	if n == 0 {
-		return fallback
+		return 0, false
 	}
-	return sum / float64(n)
+	return sum / float64(n), true
+}
+
+func freshBatterySoC(r *telemetry.DerReading) bool {
+	if r == nil || r.SoC == nil || !finite(*r.SoC) || *r.SoC < 0 || *r.SoC > 1 || r.SoCUpdatedAt.IsZero() {
+		return false
+	}
+	age := time.Since(r.SoCUpdatedAt)
+	return age >= 0 && age <= telemetry.BatterySoCMaxAge
 }
 
 // onlineFleetParams takes fuseMaxW from the replan's copy, so the battery
@@ -2473,7 +2756,7 @@ func (s *Service) onlineFleetParams(p Params, fleet []BatteryFleetMember, fuseMa
 			continue
 		}
 		r := s.Tele.Get(b.Driver, telemetry.DerBattery)
-		if r == nil || r.SoC == nil {
+		if !freshBatterySoC(r) {
 			continue
 		}
 		totalCap += b.CapacityWh

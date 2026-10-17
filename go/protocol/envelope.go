@@ -36,10 +36,12 @@ const (
 	ProtoFloor = 0
 )
 
-// Lanes. Lane 0 is one fixed bucket at a fixed cadence for the life of a
-// session, because a frame size that varies with what happened in the house
-// leaks the household's load pattern through otherwise perfect encryption.
-// Anything whose size depends on what the box supports goes on lane 1.
+// Lanes. Lane 0 is one fixed bucket for the life of a session, because a
+// frame size that varies with what happened in the house leaks the
+// household's load pattern through otherwise perfect encryption. Over the
+// relay it also goes at a fixed cadence; through FTW Cloud each reading goes
+// as it lands (docs/protocol-cloud.md, "Tunnel"). Anything whose size
+// depends on what the box supports goes on lane 1.
 const (
 	LaneControl uint8 = 0
 	LaneBulk    uint8 = 1
@@ -65,6 +67,10 @@ type Envelope struct {
 	// B is the body, left encoded so the handler can unmarshal it into the
 	// type the message name implies.
 	B cbor.RawMessage `cbor:"b,omitempty"`
+	// By names the person behind a call from a Sourceful support session:
+	// the staff member's id, at most ByMax bytes. FTW Cloud asserts it and
+	// the box writes it to its audit log. Absent on every other session.
+	By string `cbor:"by,omitempty"`
 }
 
 // Frame is one envelope on one lane. Package appwire owns the byte layout, the

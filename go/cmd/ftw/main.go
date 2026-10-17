@@ -40,6 +40,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/appuplink"
 	"github.com/srcfl/ftw/go/internal/arp"
 	"github.com/srcfl/ftw/go/internal/battery"
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/components"
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
@@ -68,6 +69,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/selfupdate"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
+	"github.com/srcfl/ftw/go/protocol/cloudwire"
 )
 
 // Version gets injected at build time via -ldflags. Defaults to "dev" for
@@ -473,6 +475,11 @@ func main() {
 		slog.Error("http listener could not bind", "addr", httpSrv.Addr, "err", explainBindError(httpSrv.Addr, err))
 		os.Exit(1)
 	}
+	// A driver's request from inside the box would reach the API as the box
+	// itself, so drivers may not dial its port.
+	if tcp, ok := listener.Addr().(*net.TCPAddr); ok {
+		drivers.SetSelfAPIPorts(tcp.Port)
+	}
 	go func() {
 		slog.Info("HTTP API listening (boot phase)", "addr", httpSrv.Addr)
 		if err := httpSrv.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -694,7 +701,14 @@ func main() {
 	if cfg.DeviceRepository != nil && cfg.DeviceRepository.Enabled {
 		go driverRepositoryRefreshLoop(ctx, driverRepository, cfg.DeviceRepository.RefreshIntervalH)
 	}
+	// cfgMu guards cfg, which a config apply replaces in place.
+	cfgMu := &sync.RWMutex{}
 	reg := newDriverRegistry(tel, st)
+	reg.SiteLocation = func() (float64, float64, bool) {
+		cfgMu.RLock()
+		defer cfgMu.RUnlock()
+		return siteLocation(cfg)
+	}
 	reg.SetTroubleshootingMode(cfg.Site.TroubleshootingMode)
 	reg.RuntimePolicyResolver = driverRepository.RuntimePolicy
 	reg.MQTTFactory = func(name string, c *config.MQTTConfig) (drivers.MQTTCap, error) {
@@ -788,7 +802,6 @@ func main() {
 	// counter every one of them had to remember would be wrong within a month.
 	controlRev := &control.Revision{}
 	capMu := &sync.RWMutex{}
-	cfgMu := &sync.RWMutex{}
 	modelsMu := &sync.Mutex{}
 
 	// Pre-declare services that the hot-reload Applier needs to touch.
@@ -866,7 +879,18 @@ func main() {
 	// schedule writes the empty JSON ("{}"), which HydrateSchedules
 	// treats as no-config so a future reload doesn't resurrect it.
 	const lpSchedKeyPrefix = "loadpoint_schedule:"
+	// The cars (docs/cars.md). Declared before the savers: a goal or a
+	// surplus choice set on a charger is its car's, and the car keeps it.
+	// Built once the schedules are hydrated, below.
+	var carsRT *cars.Runtime
 	lpMgr.SetScheduleSaver(func(id string, s loadpoint.Schedule) error {
+		if carsRT != nil {
+			row, err := carsRT.GoalSaved(id, s)
+			if err != nil || row == nil {
+				return err
+			}
+			s = *row
+		}
 		key := lpSchedKeyPrefix + id
 		if s.Empty() {
 			return st.SaveConfig(key, "{}")
@@ -899,6 +923,12 @@ func main() {
 	// flag on every restart.
 	const lpSurplusKeyPrefix = "loadpoint_surplus_only:"
 	lpMgr.SetSurplusOnlySaver(func(id string, v bool) error {
+		if carsRT != nil {
+			row, err := carsRT.SurplusSaved(id, v)
+			if err != nil || !row {
+				return err
+			}
+		}
 		key := lpSurplusKeyPrefix + id
 		val := "false"
 		if v {
@@ -926,6 +956,36 @@ func main() {
 	// ~450 after all its dependencies (pvSvc, loadSvc) are
 	// wired up. nil until that point — the reload closure guards.
 	var mpcSvc *mpc.Service
+
+	// The cars start after the schedules and surplus choices are hydrated
+	// and before the first control tick, so a restored session keeps its
+	// car's capacity. On first start they are made from the loadpoints and
+	// the vehicles[] profiles.
+	carsRT = cars.New(cars.Deps{
+		Store:      st,
+		Loadpoints: lpMgr,
+		Vehicles:   func() []telemetry.VehicleObservation { return telemetry.VehicleObservations(tel) },
+		Identity: func(driver string) (string, string) {
+			if env := reg.Env(driver); env != nil {
+				make, sn, _, _ := env.FullIdentity()
+				return make, sn
+			}
+			return "", ""
+		},
+		Bus: bus,
+		Replan: func(reason string) {
+			if mpcSvc != nil {
+				mpcSvc.RequestReplan(reason)
+			}
+		},
+	})
+	carsRT.SetVehicleDrivers(configuredVehicleDrivers(cfg.Drivers))
+	if err := carsRT.Start(carProfiles(cfg.Vehicles)); err != nil {
+		// The runtime stays, empty and passive: each charger keeps its own
+		// settings, as before cars.
+		slog.Error("cars: could not start; chargers keep their own settings", "err", err)
+	}
+	lpMgr.SetLevelObserver(carsRT.LevelSet)
 
 	// Pre-declared for the same reason as mpcSvc — the hot-reload
 	// Applier needs to mutate loadSvc.SiteMeter when the operator
@@ -1180,6 +1240,8 @@ func main() {
 		// anchor, current SoC estimate) — see loadpoint.Manager.Load.
 		lpMgr.Load(buildLoadpointConfigs(newCfg.Loadpoints))
 		hydrateLoadpointSurplusOnly()
+		carsRT.SetVehicleDrivers(configuredVehicleDrivers(newCfg.Drivers))
+		carsRT.Reload(carProfiles(newCfg.Vehicles), loadpointSettingsChanges(oldCfg, newCfg)...)
 
 		// The OCPP quarantine follows the loadpoints just reloaded:
 		// a pending charger a new entry names is adopted on this save,
@@ -1391,36 +1453,16 @@ func main() {
 						break
 					}
 				}
-				var vehicle *config.Vehicle
-				if lpID != "" {
-					if v := cfg.VehicleByIdentifier(vehicleID); v != nil {
-						vc := *v
-						vehicle = &vc
-					}
-				}
 				cfgMu.RUnlock()
 				if lpID == "" {
 					return
 				}
-				if vehicle == nil {
-					slog.Info("ocpp: session identity matches no vehicle profile — loadpoint keeps its own settings",
-						"charger", chargerID, "identity", vehicleID, "source", source)
-					return
-				}
-				name := vehicle.Name
-				if name == "" {
-					name = vehicle.ID
-				}
-				lpMgr.ApplyVehicleProfile(lpID, name, vehicle.CapacityWh)
-				lpMgr.SetSurplusOnly(lpID, vehicle.SurplusOnly)
-				if vehicle.TargetSoC > 0 {
-					lpMgr.SetTarget(lpID, vehicle.TargetSoC, time.Time{})
-				}
-				slog.Info("ocpp: vehicle profile applied",
-					"charger", chargerID, "lp", lpID, "vehicle", vehicle.ID,
-					"source", source, "capacity_wh", vehicle.CapacityWh,
-					"surplus_only", vehicle.SurplusOnly,
-					"target_soc", vehicle.TargetSoC)
+				// The charger's word is the first rule of the
+				// identification order (docs/cars.md). An identity no car
+				// lists makes the session a visitor's once some car lists
+				// identifiers; while none does, it names nobody.
+				slog.Info("ocpp: the charger named the car", "charger", chargerID, "lp", lpID, "source", source)
+				carsRT.ChargerIdentified(lpID, vehicleID)
 			})
 			// Charging needs: on an ISO 15118 session the car states what
 			// it wants — energy, departure, and on DC its own capacity and
@@ -1448,6 +1490,7 @@ func main() {
 				}
 				if needs.PresentSoC != nil {
 					lpMgr.AnchorVehicleSoC(lpID, *needs.PresentSoC)
+					carsRT.ChargerReportedLevel(lpID, *needs.PresentSoC)
 				}
 				target, haveTarget := needs.TargetSoC()
 				switch {
@@ -1603,12 +1646,20 @@ func main() {
 		mpcSvc.SiteMeter = cfg.SiteMeterDriver()
 		// The mathematical planner co-optimizes every scheduled loadpoint.
 		// The service retains the first entry for its Go-DP emergency fallback.
+		mpcSvc.LoadpointStates = func() []loadpoint.State {
+			states := lpMgr.States()
+			if lpController != nil {
+				for i := range states {
+					if hold, ok := lpController.GetManualHold(states[i].ID, time.Now()); ok {
+						states[i].ManualActive, states[i].ManualChargeW = true, hold.PowerW
+					}
+				}
+			}
+			return states
+		}
 		mpcSvc.Loadpoints = func(slotLenMin int) []*mpc.LoadpointSpec {
 			specs := make([]*mpc.LoadpointSpec, 0)
 			for _, st := range lpMgr.States() {
-				if lpController != nil {
-					lpController.SetGridDeferred(st.ID, false)
-				}
 				if !st.PluggedIn || st.ChargingDeclined {
 					continue
 				}
@@ -1642,37 +1693,16 @@ func main() {
 					(!effectiveTargetTime.After(time.Now()) && !st.FinishAtVehicleLimit) {
 					continue
 				}
-				// Pull capacity off the configured loadpoint.
-				var capWh float64 = 60000 // 60 kWh fallback
-				for _, c := range cfg.Loadpoints {
-					if c.ID == st.ID && c.VehicleCapacityWh > 0 {
-						capWh = c.VehicleCapacityWh
-						break
-					}
-				}
-				// Prefer a car SoC over the session estimate. A live reading
-				// (five minutes, not driver-stale) is ground truth and may
-				// also supply the charge limit. A cached or driver-stale
-				// reading inside the one-hour anchor window still starts
-				// the plan when it is newer than the manual confirmation,
-				// or when the level was never confirmed. Energy delivered
-				// since that measurement is included. An older manual
-				// correction stays. A stale charge limit does not cap the
-				// plan. The same choice is exposed as planning_soc.
-				initSoC := st.CurrentSoC
-				socSource := "session"
-				var vehicleChargeLimit float64 // 0 = unknown
-				delivering := st.CurrentPowerW > loadpoint.DeliveringW
-				if pick := telemetry.PlanningVehiclePick(tel, delivering, time.Now()); pick.Driver != "" {
-					var fromVehicle bool
-					initSoC, fromVehicle = lpMgr.PlanningStartSoC(st.ID, pick.SoC, pick.UpdatedAt, true)
-					if fromVehicle {
-						socSource = "vehicle:" + pick.Driver
-					}
-					if !pick.Stale {
-						vehicleChargeLimit = pick.ChargeLimit
-					}
-				}
+				// Capacity, level and limits come from the session's car
+				// (docs/cars.md). The loadpoint's state carries the car's
+				// capacity, 60 kWh when nobody knows it, and its level: the
+				// car's last reading plus the energy delivered to it since,
+				// which the cars runtime anchors each tick. That is the
+				// level the app shows. The car's charge limit caps the plan
+				// only while its level is the car's own and still exact.
+				car := evPlanCar(st, carsRT)
+				capWh, initSoC, socSource := car.CapacityWh, car.InitialSoC, car.Source
+				vehicleChargeLimit := car.ChargeLimit // 0 = unknown
 				// Map target time → slot index using the DP's
 				// actual slot length (hour-of-prices vs. 15-min
 				// quarters vary by market). Both planners clamp a
@@ -1705,64 +1735,16 @@ func main() {
 				if initSoC > maxSoC {
 					maxSoC = initSoC
 				}
-				// Defer grid-funded EV planning when the deadline lies
-				// past the last published price slot AND is more than ~3 h
-				// out. Without this, MPC commits today's afternoon grid
-				// (today's prices are confirmed) instead of waiting for
-				// tomorrow's pre-dawn slots (typically published ~13:00 UTC
-				// for next-day Nordpool). The user-facing intent is "burn
-				// surplus PV during day, only plan grid at night when the
-				// real cheap window is known". Setting LoadpointSpec.SurplusOnly
-				// makes MPC's DP refuse grid-import EV actions; the runtime
-				// loadpoint controller still grabs PV via the bat-SoC unlock
-				// path. Once tomorrow's prices land, MPC's next replan
-				// rebuilds the spec without this guard and proper grid
-				// planning kicks in.
-				deferGridPlan := false
-				if priceSvc != nil {
-					end := time.Now().Add(72 * time.Hour)
-					pts, _ := priceSvc.Load(time.Now().UnixMilli(), end.UnixMilli())
-					var latestEnd time.Time
-					for _, p := range pts {
-						slotEnd := time.UnixMilli(p.SlotTsMs).Add(time.Duration(p.SlotLenMin) * time.Minute)
-						if slotEnd.After(latestEnd) {
-							latestEnd = slotEnd
-						}
-					}
-					if !latestEnd.IsZero() &&
-						effectiveTargetTime.After(latestEnd) &&
-						time.Until(effectiveTargetTime) > 3*time.Hour {
-						deferGridPlan = true
-					}
-				}
-				slog.Debug("mpc: loadpoint spec",
-					"id", st.ID, "soc", initSoC, "soc_source", socSource,
-					"target", effectiveTarget, "target_slot", targetSlot,
-					"max_soc", maxSoC, "vehicle_limit", vehicleChargeLimit,
-					"defer_grid_plan", deferGridPlan)
-				if deferGridPlan {
-					slog.Info("mpc: LP grid-funded planning deferred — target past published prices",
-						"lp", st.ID, "target", effectiveTargetTime, "hours_to_target", time.Until(effectiveTargetTime).Hours())
-				}
-				// Mirror the deferral into the runtime controller so live
-				// dispatch enforces "no grid import" too. Without this,
-				// MPC's plan would still record a small EV budget per slot
-				// (snapped to forecast surplus); when forecast PV
-				// undershoots reality, the runtime controller would
-				// happily import grid to fulfil the cached plan budget.
-				if lpController != nil {
-					lpController.SetGridDeferred(st.ID, deferGridPlan)
-				}
-				// Surplus-only on the 48 h spec is the operator flag or
-				// the "deadline is past published prices" deferral.
-				// The bat-SoC unlock is a this-tick opportunistic clamp
-				// and must not poison night-time grid EV in a plan
-				// computed while the sun is still up. Battery→EV is
-				// already blocked by NoBatteryToEV below.
+				// Published prices choose among feasible times. Missing later
+				// prices never turn a saved deadline into a surplus-only goal.
+				slog.Debug("mpc: loadpoint spec", "id", st.ID, "soc", initSoC,
+					"soc_source", socSource, "target", effectiveTarget, "target_slot", targetSlot,
+					"max_soc", maxSoC, "vehicle_limit", vehicleChargeLimit)
 				ctrlMu.Lock()
 				noBatteryToEV := !(ctrl.BatteryCoversEV || boostActive)
 				ctrlMu.Unlock()
 				charging, chargeDuration := lpMgr.ChargingPeriod(st.ID)
+				minW, maxW, steps := loadpoint.LimitPower(st, planningStepsForLoadpoint(st, cfg))
 				specs = append(specs, &mpc.LoadpointSpec{
 					ID:               st.ID,
 					CapacityWh:       capWh,
@@ -1773,11 +1755,11 @@ func main() {
 					PluggedIn:        true,
 					TargetSoC:        targetSoC,
 					TargetSlotIdx:    targetSlot,
-					MinChargeW:       st.MinChargeW,
-					MaxChargeW:       st.MaxChargeW,
-					AllowedStepsW:    planningStepsForLoadpoint(st, cfg),
+					MinChargeW:       minW,
+					MaxChargeW:       maxW,
+					AllowedStepsW:    steps,
 					ChargeEfficiency: loadpoint.DefaultChargeEfficiency,
-					SurplusOnly:      loadpoint.PlannerTreatsLoadpointAsSurplusOnly(st.SurplusOnly, deferGridPlan),
+					SurplusOnly:      st.SurplusOnly,
 					NoBatteryToEV:    noBatteryToEV,
 					Charging:         mpc.DefaultChargingPeriods(charging, chargeDuration.Seconds()),
 				})
@@ -1959,10 +1941,7 @@ func main() {
 		lpController.SetFuseEVMax(func() (float64, bool) {
 			ctrlMu.Lock()
 			defer ctrlMu.Unlock()
-			if !ctrl.FuseSaturated {
-				return 0, false
-			}
-			return ctrl.FuseEVMaxW, true
+			return control.EVFuseBudget(tel, ctrl, lpMgr.States(), lpMgr.Configs(), ctrl.SiteFuseAmps*ctrl.SiteFuseVoltage*float64(ctrl.SiteFusePhases))
 		})
 		// Every lease is preflighted and re-evaluated on each loadpoint tick.
 		// This closure owns site/battery health because those concepts belong
@@ -2127,16 +2106,13 @@ func main() {
 		// clamp (or arbitrage-mode planning) detaches Tesla and
 		// nothing software-side can wake it.
 		lpController.SetVehicleStatus(func(lpID string) (string, string, bool) {
-			st, ok := lpMgr.State(lpID)
-			if !ok || !st.PluggedIn {
+			// The session's car's own source, live. A car is woken only
+			// when the box knows it is the one on this charger.
+			report, ok := carsRT.LiveReport(lpID)
+			if !ok {
 				return "", "", false
 			}
-			delivering := st.CurrentPowerW > loadpoint.DeliveringW
-			pick := telemetry.PickBestVehicleForLoadpoint(tel, delivering, time.Now())
-			if pick.Driver == "" {
-				return "", "", false
-			}
-			return pick.Driver, pick.ChargingState, true
+			return report.Driver, report.ChargingState, true
 		})
 
 		lpController.SetVehicleRefreshTarget(func(lpID string) (string, error) {
@@ -2144,23 +2120,19 @@ func main() {
 			if !ok || !lp.PluggedIn {
 				return "", nil
 			}
-			connected := 0
-			for _, other := range lpMgr.States() {
-				if other.PluggedIn {
-					connected++
-				}
-			}
 			cfgMu.RLock()
 			defer cfgMu.RUnlock()
-			return configuredVehicleRefreshDriver(cfg.Drivers, connected)
+			return configuredVehicleRefreshDriver(cfg.Drivers, carsRT.Sources(lpID))
 		})
 
 		lpController.SetVehicleChargeState(func(lpID string) (loadpoint.VehicleChargeState, bool) {
-			pick := telemetry.PickVehicleForCompletion(tel, time.Now())
-			if pick.Driver == "" || pick.Stale || !lpMgr.VehicleObservationApplies(lpID, pick.UpdatedAt) {
+			// Only the session's car can say its goal is done, from a live
+			// report made during this connection.
+			report, ok := carsRT.LiveReport(lpID)
+			if !ok || !lpMgr.VehicleObservationApplies(lpID, report.At) {
 				return loadpoint.VehicleChargeState{}, false
 			}
-			return loadpoint.VehicleChargeState{SoC: pick.SoC, Limit: pick.ChargeLimit, State: pick.ChargingState}, true
+			return loadpoint.VehicleChargeState{SoC: report.SoC, Limit: report.ChargeLimit, State: report.ChargingState}, true
 		})
 
 		// Wire the EV-available surplus computation for the
@@ -2423,10 +2395,16 @@ func main() {
 	// The app's window onto this box's own HTTP API. Handed to the uplink
 	// now and filled in below, once the API server exists.
 	appAPI := &lateAPI{}
+	// FTW Cloud as app sessions see it, bound below once the link exists.
+	appCloud := &cloudSession{}
+	// Owners hear about agents through the notification service, bound
+	// below once it exists, as FTW Cloud's grant notices are.
+	cloudNotify := &cloudNotices{}
+	agents := &agentPorts{logs: logRing, cfg: cfg, cfgMu: cfgMu, st: st, notices: cloudNotify, cars: carsRT}
 	appEnroll, appUplink, appLinkEnabled, appLinkErr := startAppLink(
 		ctx, cfg, identityKeyPath, boxID, Version,
-		st, tel, mpcSvc, lpMgr, lpController, priceSvc, ctrl, ctrlMu, plannerPrefs,
-		controlRev, appLinkWatchdog, appAPI, webPush,
+		st, tel, mpcSvc, lpMgr, lpController, carsRT, priceSvc, ctrl, ctrlMu, plannerPrefs,
+		controlRev, appLinkWatchdog, appAPI, appCloud, agents,
 	)
 	switch {
 	case appLinkErr != nil:
@@ -2438,8 +2416,24 @@ func main() {
 		slog.Info("app link disabled — set app_link.enabled to turn it on")
 	}
 
+	// FTW Cloud: the phones' own sessions with the box, carried as
+	// ciphertext the service cannot read, from the first pairing on; and a
+	// signed, readable copy of the house, off until an owner turns it on.
+	// Both use the one FTW Cloud connection.
+	var appTunnel *appuplink.Tunnel
+	if appUplink != nil {
+		appTunnel = appUplink.Tunnel()
+	}
+	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, priceSvc, appAPI, cloudNotify, appTunnel, carsRT, webPush)
+	appCloud.bind(cloudLink)
+	if cloudLink != nil {
+		agents.home = cloudLink.Home
+		agents.notice = cloudLink.Notice
+	}
+
 	// The anonymous fleet ping: how many boxes, which versions, which drivers.
-	// Its separate relay HTTP door keeps daily totals; the encrypted app path
+	// Its separate Cloud HTTP route keeps daily totals; the encrypted app path
 	// stays opaque and stores no routed traffic.
 	// The bundled drivers dir is deliberately not passed: which drivers this
 	// build ships with is compiled in, not discovered on disk. See
@@ -2469,8 +2463,10 @@ func main() {
 		State: st,
 		CapMu: capMu, Capacities: capacities, TelemetryCapacities: telemetryCapacities,
 		BatteryIdentity: batteryIdentity,
-		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled),
+		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled, agents),
+		Agents:          agentsForAPI(agents),
 		FleetPing:       fleetPinger,
+		Cloud:           cloudForAPI(cloudLink),
 		CfgMu:           cfgMu, Cfg: cfg, ConfigPath: *configPath,
 		ConfigApplier:       applyConfigChange,
 		DriverDir:           resolveDriverDir(),
@@ -2499,6 +2495,7 @@ func main() {
 		LoadModel:        loadSvc,
 		ForecastLearning: forecastTrackerSvc,
 		Loadpoints:       lpMgr,
+		Cars:             carsRT,
 		LoadpointCtrl:    lpController,
 		OCPPChargers:     ocppChargersFn,
 		EVSend:           evSend,
@@ -2621,6 +2618,7 @@ func main() {
 		return amps, limitA, true
 	})
 	notifSvc.Subscribe(bus)
+	cloudNotify.svc.Store(notifSvc)
 	// Persist every dispatch to state.notification_log via a bus
 	// subscriber so the notifications package stays free of storage
 	// logic. The UI reads this table through /api/notifications/history.
@@ -2649,14 +2647,29 @@ func main() {
 		notifSvc.AddPublisher(webPush)
 		deps.WebPush = webPush
 	}
-	if appUplink != nil {
-		deps.PushResync = appUplink.ResyncDeadman
+	// FTW Cloud carries the catalogue's events to the owners' phones,
+	// signed, when the grant includes them. The publisher only queues.
+	if cloudLink != nil {
+		notifSvc.AddPublisher(notifications.CloudPublisher{Queue: cloudEventQueue(cloudLink)})
+	}
+	notifSvc.SetChargingFacts(func(id string) (notifications.ChargingFacts, bool) {
+		lp, ok := lpMgr.State(id)
+		if !ok {
+			return notifications.ChargingFacts{}, false
+		}
+		return notifications.ChargingFacts{
+			Plugged: lp.PluggedIn, LevelKnown: lp.PluggedIn && lp.SoCSource != "assumed", HasGoal: lp.TargetSoC > 0,
+		}, true
+	})
+	if cloudLink != nil {
+		deps.PushResync = cloudLink.RosterChanged
 	}
 	// The loadpoint manager publishes its session latches (completion,
 	// interruption) on the same bus the engine listens to.
 	if lpMgr != nil {
 		lpMgr.SetBus(bus)
 	}
+	replanOnPlugIn(bus, mpcSvc)
 	// Late-bind onto the Deps literal that was built earlier with a nil
 	// notifSvc (the deps struct is assembled before this block runs).
 	deps.Notifications = notifSvc
@@ -2748,7 +2761,6 @@ func main() {
 	// startup replan ran with whatever fallback SoC was available; once
 	// the Tesla / vehicle driver gets ground truth from the car, the
 	// plan should incorporate it (especially for EV target deadlines).
-	var vehicleReplanFired bool
 	// Per-loadpoint last observed draw for the EV-stop edge replan.
 	// A falling edge (was >100 W, now <50 W while still plugged in)
 	// signals the EV finished or paused itself — the slot's plan no
@@ -2765,6 +2777,7 @@ func main() {
 		select {
 		case <-sigc:
 			slog.Info("shutting down")
+			cloudLink.Bye(cloudwire.ByeShutdown, cloudByeWait)
 			markNativeCleanExit(nativeRoot)
 			flushHistoryOnStop(st)
 			if err := st.RecordEvent("shutdown"); err != nil {
@@ -2777,6 +2790,9 @@ func main() {
 			} else {
 				slog.Info("restart requested via API — exiting cleanly so the supervisor brings us back")
 			}
+			// A restart the box chose, an update among them: FTW Cloud holds
+			// back "box out of reach" until the box is back.
+			cloudLink.Bye(cloudwire.ByeUpdate, cloudByeWait)
 			markNativeCleanExit(nativeRoot)
 			flushHistoryOnStop(st)
 			if err := st.RecordEvent("restart"); err != nil {
@@ -2928,29 +2944,12 @@ func main() {
 				lpController.TickWithDispatch(ctx, tickNow, freshness.Allowed())
 			}
 
-			// Anchor each plugged-in loadpoint to the car reading the plan
-			// would start from. Runs after Tick's Observe so the anchor
-			// wins over that tick's inference. The reading is applied at
-			// the time the car measured it, and energy delivered since
-			// then moves the estimate. A measurement newer than the
-			// manual confirmation replaces it, including a cached or
-			// driver-stale cloud report inside VehicleAnchorMaxAge. A
-			// newer manual confirmation is left alone. When the session
-			// cannot place the measurement in its energy history, the
-			// reading still replaces the older level as the current SoC.
-			for _, st := range lpMgr.States() {
-				if !st.PluggedIn {
-					continue
-				}
-				delivering := st.CurrentPowerW > loadpoint.DeliveringW
-				pick := telemetry.PickVehicleForAnchor(tel, delivering, time.Now())
-				if pick.Driver == "" || !lpMgr.VehicleSoCSupersedes(st.ID, pick.UpdatedAt) {
-					continue
-				}
-				if !lpMgr.AnchorVehicleSoCAt(st.ID, pick.SoC, pick.UpdatedAt) {
-					lpMgr.AnchorVehicleSoC(st.ID, pick.SoC)
-				}
-			}
+			// The cars follow the chargers just observed: plug-ins and
+			// unplugs, which car each session is, and each car's own
+			// readings, which anchor the session it is on (docs/cars.md).
+			// Runs after Tick's Observe so a reading wins over that tick's
+			// inference.
+			carsRT.Tick()
 
 			if !freshness.Allowed() {
 				// Clear before persisting: persistTelemetryTick snapshots
@@ -3028,6 +3027,10 @@ func main() {
 			// resume charging.
 			evCurtailHeadroomW := loadpoint.SurplusPotentialW(lpStatesSnapshot)
 			boostEVW, boostReserveSoC := activeBatteryBoostTotals(lpController, lpStatesSnapshot, tickNow)
+			var evFuseDemands []loadpoint.FuseDemand
+			if lpController != nil {
+				evFuseDemands = lpController.FuseDemands()
+			}
 
 			ctrlMu.Lock()
 			ctrl.EVSurplusOnlyReserveW = evReserveW
@@ -3035,6 +3038,8 @@ func main() {
 			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
 			ctrl.BatteryBoostEVChargingW = boostEVW
 			ctrl.BatteryBoostReserveSoC = boostReserveSoC
+			ctrl.EVCommandedW = loadpoint.CommandedEVPowerW(lpStatesSnapshot)
+			ctrl.SetEVFuseDemands(evFuseDemands)
 			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
 			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
 			planMissingNow := ctrl.Mode.IsPlannerMode() && ctrl.PlanStale
@@ -3187,15 +3192,12 @@ func main() {
 				}
 			}
 
-			// First-vehicle-SoC replan trigger: as soon as any
-			// DerVehicle driver is online and reporting SoC, redo the
-			// plan once with measured-truth instead of the pluginSoC
-			// estimate the startup replan used.
-			if mpcSvc != nil && !vehicleReplanFired {
-				if pick := telemetry.PickBestVehicle(tel, time.Now()); pick.Driver != "" {
-					vehicleReplanFired = true
-					go mpcSvc.Replan(ctx)
-					slog.Info("fresh vehicle SoC received; MPC replan requested", "driver", pick.Driver, "soc", pick.SoC)
+			// A car whose plan cannot make its goal: the loadpoint manager
+			// tells the household once per plug-in, from a plan that is
+			// neither being remade nor out of date.
+			if mpcSvc != nil {
+				if snap := mpcSvc.PlanSnapshot(); snap.Plan != nil && !snap.Pending && !snap.Outdated {
+					lpMgr.ObservePlanShortfall(snap.Plan.LoadpointShortfallWh, tickNow)
 				}
 			}
 

@@ -25,6 +25,9 @@ const (
 	MsgAPIHead          = "api.head"
 	MsgAPIChunk         = "api.chunk"
 	MsgAPIEnd           = "api.end"
+	// MsgNow is a watch's read of the home over the exchange, and the box's
+	// answer to it (ADR 0009). The same type both ways, as tick is.
+	MsgNow = "now"
 )
 
 // Operations a client may ask for, from contract/registry.yaml `ops` — the
@@ -86,6 +89,10 @@ type Hello struct {
 	// ignore this additive field; subscribed in hello_ok tells a newer app whether
 	// it still needs to send the ordinary sub message.
 	Sub *Sub `cbor:"sub,omitempty"`
+	// Code is a watch's pairing code, sent once, in the hello that rides in
+	// the exchange's handshake message 1. A phone's code travels as the
+	// whole of its message 1 payload instead, and a paired watch sends none.
+	Code []byte `cbor:"code,omitempty"`
 }
 
 type ProtoRange struct {
@@ -136,6 +143,54 @@ type HelloOK struct {
 	// Subscribed says the optional subscription carried by Hello was accepted.
 	// False also covers an older box, where this additive field is absent.
 	Subscribed bool `cbor:"subscribed,omitempty"`
+	// Cloud is what the phone needs to read this home from FTW Cloud. Every
+	// role gets it, and only while an owner has FTW Cloud on. Absent means
+	// off, or an older box.
+	Cloud *CloudSession `cbor:"cloud,omitempty"`
+}
+
+// ExchangeHelloOK answers a watch's hello on the exchange, in handshake
+// message 2 (ADR 0009, decision 2).
+//
+// It carries what a watch needs and nothing more. The capability list and the
+// mode catalogue stay on the stream: a watch sends cmd and now, and nothing it
+// shows needs them. The smallest bulk bucket it fits, normally 1 KiB; its size
+// follows the house's equipment, never what happens in the house.
+type ExchangeHelloOK struct {
+	Proto  int      `cbor:"proto"`
+	Mode   BoxMode  `cbor:"mode"`
+	Clock  Clock    `cbor:"clock"`
+	Role   string   `cbor:"role"`
+	Scopes []string `cbor:"scopes"`
+	// Rev is the site's controlRev. A command carries the rev it expects, and
+	// the exchange has no snapshot to learn it from.
+	Rev uint64 `cbor:"rev"`
+	// Cloud is what the watch needs to read FTW Cloud on its own, while an
+	// owner has FTW Cloud on. Absent means off.
+	Cloud *CloudSession `cbor:"cloud,omitempty"`
+}
+
+// CloudSession lets a phone check and read what FTW Cloud serves it. It comes
+// from the box over Noise and never from the service, so the service cannot
+// sign for the box, swap its key or rename a source.
+type CloudSession struct {
+	// PK is the box's FTW Cloud public key, the 65-byte uncompressed P-256
+	// point. Every box envelope from the service verifies with it.
+	PK []byte `cbor:"pk"`
+	// Home is the home id at the service, cut from PK.
+	Home string `cbor:"home"`
+	// Boot is the uplink's current 16-byte boot id. With hello_ok's
+	// clock.uptimeMs it anchors the times in box envelopes: both count from
+	// the same process start.
+	Boot []byte `cbor:"boot"`
+	// Sources maps each opaque source id to its source id in this protocol,
+	// the driver name.
+	Sources map[string]string `cbor:"sources"`
+	// Loadpoints maps each opaque loadpoint id to the loadpoint id.
+	Loadpoints map[string]string `cbor:"loadpoints"`
+	// Cars maps each opaque car id to the car's id. Absent from a box
+	// without cars.
+	Cars map[string]string `cbor:"cars,omitempty"`
 }
 
 // HintAppUpdate tells the app it is behind. It is a hint, not an error: the
@@ -258,12 +313,67 @@ type Delta struct {
 
 // Tick says nothing changed.
 //
-// Sent anyway, on the same cadence and in the same bucket. Silence would
-// itself be information: it would tell the relay operator that nothing
-// happened in the house that second.
+// Sent anyway, in the same bucket. Over the relay it goes on every pulse:
+// silence would tell the relay operator that nothing happened in the house
+// that second. Through FTW Cloud it is the beat that goes when nothing has
+// moved for the subscribed period, so the phone can tell a quiet house from
+// a lost session.
 type Tick struct {
 	Seq      uint64 `cbor:"seq"`
 	UptimeMs int64  `cbor:"uptimeMs"`
+}
+
+// Now is the home as the Now screen shows it, answered on the exchange in one
+// lane 0 frame (ADR 0009, decision 2). A watch reads it when FTW Cloud is off.
+//
+// The request is a now with an empty body. What does not fit the frame is
+// left out and the frame flagged TRUNC, as a delta is.
+type Now struct {
+	UptimeMs int64 `cbor:"uptimeMs"`
+	// ControlRev is the site's controlRev, which a command expects.
+	ControlRev uint64 `cbor:"controlRev"`
+	// Fields are the frozen fields, as a snapshot carries them.
+	Fields map[string]int64 `cbor:"fields"`
+	// Sources are keyed by the frozen source fields, 7 for the grid, 8 for
+	// PV and 9 for the battery, so a watch with no field dictionary can still
+	// age each reading.
+	Sources map[string]NowSource `cbor:"sources"`
+	// DispatchBlockedBy names the sources stopping dispatch, as a snapshot
+	// does. A watch that sees it knows a charge will be refused.
+	DispatchBlockedBy []string `cbor:"dispatchBlockedBy"`
+	// Loadpoints are the box's chargers, in its configured order.
+	Loadpoints []NowLoadpoint `cbor:"loadpoints"`
+}
+
+// NowSource is one source's freshness, without its name.
+type NowSource struct {
+	State SourceState `cbor:"state"`
+	// AgeMs is box uptime since the last good reading, or -1 for none.
+	AgeMs int64 `cbor:"ageMs"`
+}
+
+// NowLoadpoint is one charger as a watch draws it.
+type NowLoadpoint struct {
+	ID      string `cbor:"id"`
+	Plugged bool   `cbor:"plugged"`
+	// SocPermille is the car's level, absent when the box does not know it.
+	SocPermille *int64 `cbor:"socPermille,omitempty"`
+	// PowerW is the charger's draw, positive while charging.
+	PowerW int64 `cbor:"powerW"`
+	// The car on the charger (docs/cars.md): SocPermille is its level, and
+	// these say where the level came from and how the box knows the car.
+	// While the box asks, Session names the plug-in a tap answers and Choose
+	// lists the cars a tap may pick. To fit lane 0, car ids travel here as
+	// their 16 bytes, the 32 hex digits decoded: an asking charger with four
+	// cars takes about 180 B of the 512 B frame.
+	SocSource       string   `cbor:"socSource,omitempty"`
+	SocAgeS         *int64   `cbor:"socAgeS,omitempty"`
+	SocEstimate     bool     `cbor:"socEstimate,omitempty"`
+	Session         string   `cbor:"session,omitempty"`
+	CarID           []byte   `cbor:"carId,omitempty"`
+	CarIdentifiedBy string   `cbor:"carIdentifiedBy,omitempty"`
+	CarCorrected    bool     `cbor:"carCorrected,omitempty"`
+	Choose          [][]byte `cbor:"choose,omitempty"`
 }
 
 // --------------------------------------------------------------------------
@@ -333,6 +443,11 @@ type CmdResult struct {
 	State    string     `cbor:"state"`
 	Observed *Observed  `cbor:"observed,omitempty"`
 	Error    *ErrorBody `cbor:"error,omitempty"`
+	// Car is the car as the box holds it after a car op, and Charger the
+	// charger's car after session.car.set (docs/cars.md): read back, never
+	// the request's echo.
+	Car     *Car        `cbor:"car,omitempty"`
+	Charger *ChargerCar `cbor:"charger,omitempty"`
 }
 
 type Observed struct {
@@ -380,6 +495,10 @@ type PlanSlot struct {
 	// slot's price is not known.
 	PriceMinor *int64     `cbor:"priceMinor"`
 	Reason     PlanReason `cbor:"reason"`
+	// SocPermille is the battery's planned level at the end of the slot, in
+	// thousandths, absent when the planner gave none. The same name and unit
+	// as the FTW Cloud plan class. An older app ignores it.
+	SocPermille *int64 `cbor:"socPermille,omitempty"`
 }
 
 // Plan is what the box intends to do.
@@ -397,6 +516,57 @@ type Plan struct {
 	Stale bool `cbor:"stale"`
 	// CeilingW is the import ceiling being defended, nil when there is none.
 	CeilingW *int64 `cbor:"ceilingW"`
+	// Chargers is each charger's share of this plan, as GET /api/loadpoints
+	// reports it, so a plan the box pushes redraws the charger without a
+	// read. Absent on a box with no chargers or no planner. An older app
+	// ignores it.
+	Chargers []PlanCharger `cbor:"chargers,omitempty"`
+	// CautionOff is set when the household's planning style asks for
+	// forecast caution and this plan uses the point forecast instead,
+	// because the caution inputs were invalid or a cautious plan could not
+	// keep the plan's limits and departure goals. The box sets it again on
+	// every replan and clears it once caution works. An older app ignores it.
+	CautionOff bool `cbor:"cautionOff,omitempty"`
+}
+
+// PlanCharger is one charger's share of the plan. Keyed by the charger,
+// never by a car: a car visits chargers (docs/cars.md, srcfl/ftw#1647).
+type PlanCharger struct {
+	// ID is the charger's loadpoint id.
+	ID string `cbor:"id"`
+	// CarID is the session's car, empty while the box does not know which
+	// one is plugged in. Always empty until Core keeps cars. A change of
+	// it is a plan input: whatever applies session.car.set requests a
+	// replan, and the plan reaches the phone as every replan does.
+	CarID     string `cbor:"carId,omitempty"`
+	PluggedIn bool   `cbor:"pluggedIn"`
+	// Pending is set while a newer plan is being made; the windows are then
+	// the plan the box goes on acting on until the new one lands. Outdated
+	// is set with it, and alone when the plan is not one the box acts on;
+	// without Pending the windows are then empty.
+	Pending  bool `cbor:"pending"`
+	Outdated bool `cbor:"outdated"`
+	// GridDeferred says grid-funded charging waits for prices that reach
+	// the deadline, as grid_deferred on the HTTP route.
+	GridDeferred bool `cbor:"gridDeferred"`
+	// GoalRev changes when the charger's goal, ready time, schedule or
+	// solar-only choice changes, wherever that was done.
+	GoalRev uint32 `cbor:"goalRev"`
+	// Windows are the charging windows still ahead, the next one first.
+	Windows []PlanChargerWindow `cbor:"windows"`
+	// TotalWh is what the plan still means to deliver across its horizon.
+	TotalWh int64 `cbor:"totalWh"`
+	// ShortfallWh is how far short of the goal the plan leaves the car, in
+	// battery watt-hours. Absent when the plan has no goal for it.
+	ShortfallWh *int64 `cbor:"shortfallWh,omitempty"`
+}
+
+// PlanChargerWindow is one stretch the plan charges on a charger. Wall
+// clock.
+type PlanChargerWindow struct {
+	StartMs int64 `cbor:"startMs"`
+	EndMs   int64 `cbor:"endMs"`
+	Wh      int64 `cbor:"wh"`
 }
 
 // --------------------------------------------------------------------------

@@ -49,7 +49,8 @@ type Config struct {
 	// still boot, or the operator loses the UI they would fix it with. The
 	// write path (Settings save, bootstrap) never populates this — it calls
 	// Validate directly and stays strict. Never serialized.
-	LoadWarnings []string `yaml:"-" json:"-"`
+	LoadWarnings      []string `yaml:"-" json:"-"`
+	LoadpointWarnings []string `yaml:"-" json:"-"`
 	// Retired names settings of removed features that loading dropped so
 	// they cannot steer the site. Startup warns once for each;
 	// DropRetiredSettings deletes them from stored settings.
@@ -246,10 +247,10 @@ type FleetPing struct {
 	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
 }
 
-// DefaultFleetPingEndpoint is the fleet-report door on FTW's relay. The relay
+// DefaultFleetPingEndpoint is the anonymous fleet-report route on FTW Cloud. It
 // adds the report to daily totals and discards the request; a failed ping is
 // forgotten, never retried.
-const DefaultFleetPingEndpoint = "https://relay.ftw.energy/fleet"
+const DefaultFleetPingEndpoint = "https://cloud.ftw.energy/v1/fleet"
 
 // On reports whether the ping is switched on, and is the only place that
 // answers it.
@@ -273,7 +274,7 @@ func (f *FleetPing) On() bool {
 // this address after FTW moved the collector, and the aggregate would
 // quietly lose every box that had ever saved its settings.
 func (f *FleetPing) Resolved() string {
-	if f == nil || f.Endpoint == "" {
+	if f == nil || f.Endpoint == "" || strings.TrimSpace(f.Endpoint) == "https://relay.ftw.energy/fleet" {
 		return DefaultFleetPingEndpoint
 	}
 	return f.Endpoint
@@ -1915,6 +1916,9 @@ func isLegacyDefaultDriverRepository(repo DriverRepositorySource) bool {
 // Validate ensures the config is internally consistent and safe to run with.
 func (c *Config) Validate() error {
 	c.NormalizeUnits()
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	if c.State != nil && c.State.ColdRetentionDays < 0 {
 		return fmt.Errorf("state.cold_retention_days must be >= 0, got %d", c.State.ColdRetentionDays)
 	}
@@ -2306,6 +2310,9 @@ func SaveAtomic(path string, c *Config) error {
 }
 
 func saveAtomic(w durableWriter, path string, c *Config) error {
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	// Driver paths are resolved to absolute-ish paths at Load() time.
 	// Convert them back to config-relative before writing so that
 	// repeated save cycles don't accumulate extra "../" prefixes.

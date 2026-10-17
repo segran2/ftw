@@ -236,6 +236,18 @@ function preparingBrief(status, hasBattery) {
   };
 }
 
+function failedBrief(status, hasBattery, error) {
+  return {
+    state: { key: 'blocked', label: 'Cannot plan', tone: 'warn' },
+    next: { action: 'Planning could not finish', time: 'Fix the cause below, then try Replan' },
+    reason: error,
+    constraint: 'No new schedule is being dispatched; FTW safety limits still apply',
+    forecast: { label: 'No accepted plan', detail: 'Planning stopped before a usable schedule was produced' },
+    soc: batterySocNow(status, hasBattery, 'No planned charge path yet'),
+    planner: { label: 'Cannot plan', detail: error },
+  };
+}
+
 export function derivePlanBrief({
   enabled = false,
   unavailableReason = "",
@@ -243,6 +255,7 @@ export function derivePlanBrief({
   status = {},
   now = Date.now(),
   socOpts = {},
+  planning = {},
 } = {}) {
   fillPlanSoC(plan, socOpts);
   const actions = plan && Array.isArray(plan.actions) ? plan.actions : [];
@@ -253,18 +266,29 @@ export function derivePlanBrief({
     if (plannerMode) return blockedBrief(status, hasBattery, unavailableReason);
     return manualBrief(status, hasBattery);
   }
-  if (!actions.length) return preparingBrief(status, hasBattery);
+  if (planning.error && !planning.replanning) return failedBrief(status, hasBattery, planning.error);
+  const warnings = Array.isArray(planning.warnings) ? planning.warnings.join(' ') : '';
+  if (!actions.length) {
+    const brief = preparingBrief(status, hasBattery);
+    if (warnings) brief.constraint = warnings;
+    return brief;
+  }
 
   const solver = plan.solver || {};
   const stale = Boolean(status.plan_stale);
+  // The household asked for forecast caution and this plan uses the point
+  // forecast instead. The planning warnings say why.
+  const cautionOff = Boolean(plan.caution_off);
   const plannerActive = String(status.mode || "").startsWith("planner_");
   const state = stale
     ? { key: "stale", label: "Fallback active", tone: "warn" }
     : solver.fallback
       ? { key: "fallback", label: "Built-in plan active", tone: "warn" }
-      : plannerActive
-        ? { key: "active", label: "Plan active", tone: "active" }
-        : { key: "ready", label: "Plan ready", tone: "idle" };
+      : cautionOff
+        ? { key: "caution_off", label: "Caution off", tone: "warn" }
+        : plannerActive
+          ? { key: "active", label: "Plan active", tone: "active" }
+          : { key: "ready", label: "Plan ready", tone: "idle" };
 
   const live = actions.find((action) => (
     now >= action.slot_start_ms &&
@@ -297,15 +321,19 @@ export function derivePlanBrief({
   } else if (stale) {
     constraint = "The schedule is old, so FTW is using safe live balancing";
   }
+  if (warnings) constraint = warnings + ' ' + constraint;
 
   const finalAction = actions[actions.length - 1];
   // The plan reaches as far as the published prices, and says how far.
   const forecast = {
-    label: "Published prices",
+    label: cautionOff ? "Point forecast" : "Published prices",
     detail: finalAction
       ? `Plan until ${formatPlanEnd(finalAction.slot_start_ms + (finalAction.slot_len_min || 15) * 60_000)}`
       : "The plan reaches as far as the published prices",
   };
+  if (cautionOff) {
+    forecast.detail = `No margin for forecast error in this plan. ${forecast.detail}`;
+  }
   // Expected charge follows the next step. Charging the car reports that
   // car's planned SoC. The home battery on the same slot (start SoC in
   // the header) is a different number — a car at 76% must not read as

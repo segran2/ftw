@@ -53,6 +53,17 @@ type Controller struct {
 	// fusePhaseCapA holds the per-loadpoint per-phase EV current cap carried
 	// between ticks by the reactive per-phase fuse clamp (tickOne goroutine).
 	fusePhaseCapA map[string]float64
+	// tickFuseCaps belongs to the serial tick, after one shared budget read.
+	tickFuseCaps        map[string]float64
+	tickFusePhases      int
+	tickDirectiveActive bool
+	tickDirectiveOK     bool
+	tickDirective       Directive
+	// fuseResumeTicks is owned by the serial tick. A paused charger needs
+	// two consecutive dispatch ticks with room for a legal step.
+	fuseResumeTicks map[string]int
+	fuseDemandMu    sync.RWMutex
+	fuseDemands     []FuseDemand
 
 	// siteSurplusForEVW is live PV left after house load and battery soak.
 	// A false reading pauses surplus_only rather than guessing an import.
@@ -124,11 +135,6 @@ type Controller struct {
 	nearTermLogMu   sync.Mutex
 	nearTermLogLast map[string]time.Time
 
-	// fusePauseUntil keeps a loadpoint at 0 W for fusePauseCooldown after
-	// the fuse cap falls below its minimum step.
-	fusePauseMu    sync.Mutex
-	fusePauseUntil map[string]time.Time
-
 	// phaseLockMu guards the day-long 1Φ lock and the 30 min phase dwell.
 	// Without the dwell, a forecast near 4140 W flips the Easee contactor
 	// every tick and winds up the battery PI.
@@ -149,12 +155,6 @@ type Controller struct {
 	// fraction) for the bat-SoC surplus-unlock feature. nil disables
 	// the feature entirely — the LP behaves exactly as today.
 	batSoC func() (float64, bool)
-
-	// gridDeferredMu guards loadpoints whose deadline sits past published
-	// prices. Those ticks follow surplus, so a sunny plan cannot import
-	// after the forecast misses.
-	gridDeferredMu sync.Mutex
-	gridDeferred   map[string]bool
 
 	// batSoCArmed is the surplus-unlock hysteresis. batSoCNoPV counts
 	// ticks with no live PV so a full battery does not kick the EV
@@ -205,14 +205,7 @@ const nearTermLogCooldown = 10 * time.Minute
 // Easee contactor and winds up the battery PI.
 const phaseSwitchMinHold = 30 * time.Minute
 
-// fusePauseCooldown is how long an LP stays at 0 W after a fuse-over-
-// limit force-pause. Long enough that whatever house load caused the
-// overload (oven, EV from another LP, sauna…) has time to clear or for
-// the operator to notice; short enough that a transient inrush doesn't
-// stop charging for the rest of the day. 5 min is the operator-stated
-// preference; chosen vs. e.g. 1 min because the typical "did the oven
-// kick on?" disturbance lasts longer than a minute.
-const fusePauseCooldown = 5 * time.Minute
+const fuseResumeSafeTicks = 2
 
 // defaultPhaseSplitW mirrors loadpoint.Config.PhaseSplitW's default —
 // 3680 W is a 16 A 1Φ ceiling at 230 V. Kept in sync with the comment
@@ -288,6 +281,10 @@ type ManualHold struct {
 	StartedAt time.Time
 	// UpdatedAt identifies the latest choice, including a current change.
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	// SetBy is who set the hold: an agent's subject, agent:<id>, for an
+	// agent's hold (docs/agents.md, Holds); a phone's or empty for an
+	// owner's. An agent may touch only a hold with its own subject.
+	SetBy string `json:"set_by,omitempty"`
 }
 
 // Directive is the loadpoint-relevant slice of mpc.SlotDirective.
@@ -299,6 +296,7 @@ type Directive struct {
 	SlotEnd            time.Time
 	LoadpointEnergyWh  map[string]float64
 	LoadpointMaxPowerW map[string]float64
+	LoadpointFallback  map[string]bool
 }
 
 // EVSample is the loadpoint-relevant slice of telemetry.DerReading
@@ -578,10 +576,6 @@ func (c *Controller) SetPeakRemainingSurplusW(f func() (float64, bool)) {
 	c.peakRemainingSurplusW = f
 }
 
-// applyFuseClampAndCooldown caps wantW at the joint fuse share.
-// Below the minimum step it pauses for fusePauseCooldown, so a
-// transient does not flap. A hold cannot override it.
-
 // fusePhaseMarginA is the per-phase amp headroom held below the breaker.
 const fusePhaseMarginA = 1.0
 
@@ -624,6 +618,12 @@ func (c *Controller) applyPerPhaseFuseClamp(lpCfg Config, cmd map[string]any) {
 	if c == nil || c.perPhaseMeterAmps == nil {
 		return
 	}
+	if c.tickFuseCaps != nil {
+		// The shared budget already accounts for the worst measured phase.
+		// Re-integrating its overage here would trim the same reading again
+		// on each tick, eventually turning a safe positive offer into 0 W.
+		return
+	}
 	fuseA := c.siteFuse().MaxAmps
 	if fuseA <= 0 {
 		return
@@ -648,29 +648,25 @@ func (c *Controller) applyPerPhaseFuseClamp(lpCfg Config, cmd map[string]any) {
 	}
 }
 
-// The reason is "", "fuse_limit", or "fuse_cooldown".
+// applyFuseClampAndCooldown applies the frozen hard cap. A short recovery
+// wait is part of that cap; an unknown startup budget never starts a timer.
 func (c *Controller) applyFuseClampAndCooldown(now time.Time, lpCfg Config, wantW float64) (float64, string) {
 	if c == nil {
 		return wantW, ""
 	}
-	c.fusePauseMu.Lock()
-	until, has := c.fusePauseUntil[lpCfg.ID]
-	if has && !now.Before(until) {
-		// Cooldown elapsed; release lazily so subsequent ticks see no
-		// hold and can re-attempt charging.
-		delete(c.fusePauseUntil, lpCfg.ID)
-		has = false
-	}
-	c.fusePauseMu.Unlock()
-	if has {
-		return 0, "fuse_cooldown"
-	}
+	lpCfg = c.fuseConfig(now, lpCfg)
 	if c.fuseEVMax == nil {
 		return wantW, ""
 	}
-	cap, ok := c.fuseEVMax()
+	cap, ok := c.fuseCapFor(lpCfg.ID)
 	if !ok || cap < 0 {
 		return wantW, ""
+	}
+	if !finite(cap) {
+		cap = 0
+	}
+	if c.fuseResumeTicks[lpCfg.ID] > 0 {
+		return 0, "fuse_cooldown"
 	}
 	if wantW <= cap {
 		return wantW, ""
@@ -682,18 +678,10 @@ func (c *Controller) applyFuseClampAndCooldown(now time.Time, lpCfg Config, want
 			"lp", lpCfg.ID, "want_w", wantW, "fuse_cap_w", cap, "snapped_w", snapped)
 		return snapped, "fuse_limit"
 	}
-	// Cap is below the LP's min step → pause + arm cooldown.
-	c.fusePauseMu.Lock()
-	if c.fusePauseUntil == nil {
-		c.fusePauseUntil = map[string]time.Time{}
-	}
-	c.fusePauseUntil[lpCfg.ID] = now.Add(fusePauseCooldown)
-	c.fusePauseMu.Unlock()
-	slog.Warn("loadpoint fuse-clamp: paused for cooldown",
+	slog.Info("loadpoint fuse-clamp: below minimum step",
 		"lp", lpCfg.ID, "want_w", wantW, "fuse_cap_w", cap,
-		"min_step_w", lpCfg.MinChargeW,
-		"cooldown_s", int(fusePauseCooldown.Seconds()))
-	return 0, "fuse_cooldown"
+		"min_step_w", lpCfg.MinChargeW)
+	return 0, "fuse_limit"
 }
 
 // SetNearTermPeakSurplusW wires the short-horizon "peak surplus over
@@ -778,50 +766,12 @@ func (c *Controller) evalBatSoCArm(lpID string, threshold float64) bool {
 	return armed
 }
 
-// SetGridDeferred records that MPC has suppressed grid-funded EV
-// planning for this LP (because the deadline lies past published
-// prices). Surplus dispatch semantics apply at runtime too: the EV's
-// commanded W is snapped to live surplus only, with no grid import,
-// regardless of what the cached MPC plan budget says. Cleared when
-// MPC's next replan finds prices for the deadline window. Safe to
-// call concurrently with the dispatch tick.
-func (c *Controller) SetGridDeferred(lpID string, deferred bool) {
-	if c == nil {
-		return
-	}
-	c.gridDeferredMu.Lock()
-	defer c.gridDeferredMu.Unlock()
-	if c.gridDeferred == nil {
-		c.gridDeferred = map[string]bool{}
-	}
-	if deferred {
-		c.gridDeferred[lpID] = true
-	} else {
-		delete(c.gridDeferred, lpID)
-	}
-}
-
-// GridDeferred reports whether MPC has deferred grid-funded planning
-// for this loadpoint (target deadline past the published price
-// horizon). Read by the API layer so the deferral is visible to the
-// operator instead of looking like a PV-only mode nobody chose.
-func (c *Controller) GridDeferred(lpID string) bool {
-	return c.gridDeferredFor(lpID)
-}
-
-// gridDeferredFor reads the per-LP deferral flag set by main.go's MPC
-// spec builder. Read-only accessor used inside surplusActive.
-func (c *Controller) gridDeferredFor(lpID string) bool {
-	if c == nil {
-		return false
-	}
-	c.gridDeferredMu.Lock()
-	defer c.gridDeferredMu.Unlock()
-	return c.gridDeferred[lpID]
-}
+// GridDeferred remains for clients that read the existing field. Saved
+// deadlines no longer defer grid charging solely for unpublished prices.
+func (c *Controller) GridDeferred(string) bool { return false }
 
 // surplusActive is true when live surplus replaces the plan: SurplusOnly,
-// a grid-deferred loadpoint, or an armed bat-SoC unlock. A schedule
+// or an armed bat-SoC unlock. A schedule
 // target is a floor instead. See surplusAddsToPlan.
 func (c *Controller) surplusActive(lpCfg Config, sched Schedule) bool {
 	if lpCfg.SurplusOnly {
@@ -831,8 +781,8 @@ func (c *Controller) surplusActive(lpCfg Config, sched Schedule) bool {
 	if sched.HasTarget() {
 		return false
 	}
-	if c.gridDeferredFor(lpCfg.ID) {
-		return true
+	if c.tickDirectiveActive && c.tickDirectiveOK && c.tickDirective.LoadpointFallback[lpCfg.ID] {
+		return false // A one-off saved deadline has the same grid floor.
 	}
 	return c.evalBatSoCArm(lpCfg.ID, sched.SurplusUnlockBatSoC)
 }
@@ -857,7 +807,7 @@ func (c *Controller) surplusAddsToPlan(lpCfg Config, sched Schedule) bool {
 
 // AnyLoadpointSurplusActive reports whether any configured loadpoint
 // is currently treating PV surplus as priority — via the configured
-// SurplusOnly flag, the MPC grid-deferral flag, or a runtime-armed
+// SurplusOnly flag or a runtime-armed
 // bat-SoC unlock. main.go's siteSurplusForEVW reader uses this to
 // zero out the home-battery's PV-charge contribution from the EV's
 // apparent surplus, which prevents the EV from stealing PV that the
@@ -870,9 +820,6 @@ func (c *Controller) AnyLoadpointSurplusActive() bool {
 	}
 	for _, cfg := range c.manager.Configs() {
 		if cfg.SurplusOnly {
-			return true
-		}
-		if c.gridDeferredFor(cfg.ID) {
 			return true
 		}
 		sched, _ := c.manager.GetSchedule(cfg.ID)
@@ -1079,6 +1026,43 @@ func (c *Controller) SetManualHold(id string, h ManualHold) {
 	}
 	c.manualPersistMu.Lock()
 	defer c.manualPersistMu.Unlock()
+	c.setManualHoldLocked(id, h)
+}
+
+// SetManualHoldIfOwn sets h only while no live hold of someone other than
+// h.SetBy is in place, checked and written under one lock, so an owner's
+// hold that lands between an agent's check and its write still wins. It
+// reports whether it set h.
+func (c *Controller) SetManualHoldIfOwn(id string, h ManualHold, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	c.manualPersistMu.Lock()
+	defer c.manualPersistMu.Unlock()
+	if cur, held := c.GetManualHold(id, now); held && cur.SetBy != h.SetBy {
+		return false
+	}
+	c.setManualHoldLocked(id, h)
+	return true
+}
+
+// ClearManualHoldIfOwn clears the hold only while the live one is setBy's.
+// It reports whether it cleared one.
+func (c *Controller) ClearManualHoldIfOwn(id, setBy string, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	c.manualPersistMu.Lock()
+	defer c.manualPersistMu.Unlock()
+	if cur, held := c.GetManualHold(id, now); !held || cur.SetBy != setBy {
+		return false
+	}
+	c.clearManualHoldLocked(id)
+	return true
+}
+
+// setManualHoldLocked requires manualPersistMu.
+func (c *Controller) setManualHoldLocked(id string, h ManualHold) {
 	c.markManualExplicit(id)
 	if h.PowerW > 0 && c.manager != nil {
 		c.manager.RetryCharging(id)
@@ -1236,20 +1220,30 @@ func (c *Controller) TickWithDispatch(ctx context.Context, now time.Time, dispat
 	if c == nil || c.manager == nil || c.tel == nil {
 		return
 	}
+	c.clearFuseDemands()
+	if !dispatchAllowed {
+		for id := range c.fuseResumeTicks {
+			c.fuseResumeTicks[id] = 0
+		}
+	}
 	// Stop every affected charger before observing any session. Observation
 	// may restore or sync state.db; a stalled disk must not delay standdown,
 	// including the chargers after the one whose checkpoint is blocked.
 	type observation struct {
-		config Config
-		sample EVSample
+		config        Config
+		sample        EVSample
+		wasPlugged    bool
+		wasDelivering bool
 	}
 	var observations []observation
+	samples := map[string]EVSample{}
 	for _, cfg := range c.manager.Configs() {
 		sample, observed := c.tel(cfg.DriverName)
 		if !observed {
 			continue
 		}
-		observations = append(observations, observation{cfg, sample})
+		observations = append(observations, observation{config: cfg, sample: sample})
+		samples[cfg.DriverName] = sample
 		// Only a stale site meter stands chargers down. An old charger power
 		// reading from a live driver is not a hardware risk: the fuse clamps
 		// work from the site meter, and energy accounting already treats the
@@ -1263,9 +1257,83 @@ func (c *Controller) TickWithDispatch(ctx context.Context, now time.Time, dispat
 	if c.plan == nil && dispatchAllowed {
 		return
 	}
-	for _, observed := range observations {
-		c.tickOne(ctx, now, observed.config, observed.sample, dispatchAllowed)
+	for i := range observations {
+		observed := &observations[i]
+		previous, _ := c.manager.State(observed.config.ID)
+		observed.wasPlugged = previous.PluggedIn
+		observed.wasDelivering = previous.CurrentPowerW >= DeliveringW
+		c.observeTick(now, observed.config, observed.sample, dispatchAllowed)
+		if dispatchAllowed && observed.sample.Connected && !observed.sample.ConnectionUnknown && c.driverCanDispatch(observed.config.DriverName) {
+			c.releaseCompletedManualHold(now, observed.config, observed.sample)
+		}
 	}
+	if dispatchAllowed {
+		c.tickDirective, c.tickDirectiveOK = c.currentDirective(now)
+		c.tickDirectiveActive = true
+		c.freezeFuseBudget(now, samples)
+		defer func() { c.tickFuseCaps = nil; c.tickFusePhases = 0; c.tickDirectiveActive = false }()
+	}
+	for _, observed := range observations {
+		c.tickOne(ctx, now, observed.config, observed.sample, dispatchAllowed, observed.wasPlugged, observed.wasDelivering)
+	}
+}
+
+func (c *Controller) observeTick(now time.Time, cfg Config, sample EVSample, dispatchAllowed bool) {
+	c.observeEnergy(cfg, sample, now)
+	c.manager.observeConnectionProof(cfg.ID, sample.ConnectionGeneration, sample.ConnectionUnknown)
+	if sample.ConnectionUnknown {
+		c.restoreManualHoldForSession(cfg.ID)
+		return
+	}
+	sched, _ := c.manager.GetSchedule(cfg.ID)
+	enteringSurplusPaused, _ := c.getSurplusPause(cfg.ID)
+	// Observe the prior pause without advancing the battery-SoC hysteresis;
+	// tickOne evaluates the new surplus decision once, after the plan freezes.
+	c.batSoCArmedMu.Lock()
+	armed := c.batSoCArmed[cfg.ID]
+	c.batSoCArmedMu.Unlock()
+	wasSurplus := cfg.SurplusOnly || (!sched.HasTarget() && armed)
+	c.manager.SetSurplusWithheld(cfg.ID, wasSurplus && enteringSurplusPaused)
+	c.manager.ObserveSample(cfg.ID, sample)
+	c.restoreManualHoldForSession(cfg.ID)
+	c.evaluateBatteryBoost(cfg.ID, now, sample.Connected, dispatchAllowed && !sample.PowerUnavailable)
+}
+
+// Release before freezing the shared budget so its phase matches the order.
+func (c *Controller) releaseCompletedManualHold(now time.Time, lpCfg Config, sample EVSample) {
+	// Auto-release an operator manual hold once the vehicle has stopped
+	// requesting current (it hit its own charge limit / is full). Without
+	// this a "Start" hold pins the wallbox at a fixed amperage and the
+	// loadpoint shows "charging" at 0 W until the operator presses Stop.
+	// Debounced by SessionCompletionTimeout so a brief ramp/handshake dip
+	// — or a car that hasn't woken yet — doesn't drop the hold early. Only
+	// trips for drivers that distinguish "explicitly not requesting" from
+	// "throttled to 0" (RequestActive); others leave it true and never
+	// auto-release. Done before the dispatch branch below so the freed
+	// tick falls straight through to automatic (surplus/plan) dispatch.
+	if hold, held := c.GetManualHold(lpCfg.ID, now); held && hold.PowerW > 0 {
+		if !sample.RequestActive {
+			if c.manualHoldIdleFor(lpCfg.ID, now) >= SessionCompletionTimeout && c.releaseManualHoldIfCurrent(lpCfg.ID, hold) {
+				slog.Info("loadpoint manual hold auto-released — vehicle stopped requesting current (full/declined)",
+					"lp", lpCfg.ID, "idle", SessionCompletionTimeout)
+			}
+		} else {
+			c.resetManualIdle(lpCfg.ID)
+		}
+	}
+
+	// Release a "charge now" hold at its target SoC. The operator asked
+	// for immediate charge up to a level, not a pin-forever: clearing
+	// here lets this same tick fall straight through to automatic
+	// surplus/plan dispatch instead of holding the wallbox at a fixed
+	// amperage the rest of the session.
+	if hold, held := c.GetManualHold(lpCfg.ID, now); held && hold.ReleaseAtSoC > 0 {
+		if st, ok := c.manager.State(lpCfg.ID); ok && st.CurrentSoC >= hold.ReleaseAtSoC && c.releaseManualHoldIfCurrent(lpCfg.ID, hold) {
+			slog.Info("loadpoint manual hold released — charge-now target reached",
+				"lp", lpCfg.ID, "soc", st.CurrentSoC, "release_at_soc", hold.ReleaseAtSoC)
+		}
+	}
+
 }
 
 func (c *Controller) standDownBeforeStorage(ctx context.Context, now time.Time, cfg Config, sample EVSample) {
@@ -1286,12 +1354,9 @@ func (c *Controller) standDownBeforeStorage(ctx context.Context, now time.Time, 
 	}
 }
 
-func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, sample EVSample, dispatchAllowed bool) {
-	c.observeEnergy(lpCfg, sample, now)
-	c.manager.observeConnectionProof(lpCfg.ID, sample.ConnectionGeneration, sample.ConnectionUnknown)
+func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, sample EVSample, dispatchAllowed, wasPlugged, wasDelivering bool) {
 	if sample.ConnectionUnknown {
 		delete(c.resumeOffers, lpCfg.ID)
-		c.restoreManualHoldForSession(lpCfg.ID)
 		return
 	}
 	// Resolve the schedule once per tick — used for the bat-SoC unlock
@@ -1307,6 +1372,8 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	// both true.
 	surplusOn := c.surplusActive(lpCfg, sched)
 	surplusAdds := c.surplusAddsToPlan(lpCfg, sched)
+	enteringSurplusPaused, _ := c.getSurplusPause(lpCfg.ID)
+	selfWithheld := surplusOn && enteringSurplusPaused
 	// Detect the disconnected→connected edge (state.PluggedIn flips
 	// from false to true) so we can reset session-scoped state
 	// before the new session's first dispatch tick. Without this
@@ -1319,24 +1386,6 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	// (or the proxy's cache to refresh on its own) to learn the
 	// car's current charge_limit_pct + SoC, which costs accuracy
 	// on the first ~15 min of a new charging session.
-	wasPlugged := false
-	wasDelivering := false
-	if st, ok := c.manager.State(lpCfg.ID); ok {
-		wasPlugged = st.PluggedIn
-		wasDelivering = st.CurrentPowerW >= DeliveringW
-	}
-	// As of last tick, were we pausing this surplus loadpoint below its
-	// floor? (computeSurplusCmd for THIS tick runs later.) A charger that
-	// reports "not requesting current" while we're withholding power is
-	// responding to our own pause, not declining — so it must not count
-	// toward session completion, and the same signal drives the resume
-	// wallbox-cycle in maybeWakeVehicle below.
-	enteringSurplusPaused, _ := c.getSurplusPause(lpCfg.ID)
-	selfWithheld := surplusOn && enteringSurplusPaused
-	c.manager.SetSurplusWithheld(lpCfg.ID, selfWithheld)
-	c.manager.ObserveSample(lpCfg.ID, sample)
-	c.restoreManualHoldForSession(lpCfg.ID)
-	c.evaluateBatteryBoost(lpCfg.ID, now, sample.Connected, dispatchAllowed && !sample.PowerUnavailable)
 	if !sample.Connected {
 		delete(c.resumeOffers, lpCfg.ID)
 		c.resetSurplusSession(lpCfg.ID)
@@ -1373,39 +1422,6 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		go c.wakeVehicleAuto(context.Background(), lpCfg.ID, "delivering_edge")
 	}
 
-	// Auto-release an operator manual hold once the vehicle has stopped
-	// requesting current (it hit its own charge limit / is full). Without
-	// this a "Start" hold pins the wallbox at a fixed amperage and the
-	// loadpoint shows "charging" at 0 W until the operator presses Stop.
-	// Debounced by SessionCompletionTimeout so a brief ramp/handshake dip
-	// — or a car that hasn't woken yet — doesn't drop the hold early. Only
-	// trips for drivers that distinguish "explicitly not requesting" from
-	// "throttled to 0" (RequestActive); others leave it true and never
-	// auto-release. Done before the dispatch branch below so the freed
-	// tick falls straight through to automatic (surplus/plan) dispatch.
-	if hold, held := c.GetManualHold(lpCfg.ID, now); held && hold.PowerW > 0 {
-		if !sample.RequestActive {
-			if c.manualHoldIdleFor(lpCfg.ID, now) >= SessionCompletionTimeout && c.releaseManualHoldIfCurrent(lpCfg.ID, hold) {
-				slog.Info("loadpoint manual hold auto-released — vehicle stopped requesting current (full/declined)",
-					"lp", lpCfg.ID, "idle", SessionCompletionTimeout)
-			}
-		} else {
-			c.resetManualIdle(lpCfg.ID)
-		}
-	}
-
-	// Release a "charge now" hold at its target SoC. The operator asked
-	// for immediate charge up to a level, not a pin-forever: clearing
-	// here lets this same tick fall straight through to automatic
-	// surplus/plan dispatch instead of holding the wallbox at a fixed
-	// amperage the rest of the session.
-	if hold, held := c.GetManualHold(lpCfg.ID, now); held && hold.ReleaseAtSoC > 0 {
-		if st, ok := c.manager.State(lpCfg.ID); ok && st.CurrentSoC >= hold.ReleaseAtSoC && c.releaseManualHoldIfCurrent(lpCfg.ID, hold) {
-			slog.Info("loadpoint manual hold released — charge-now target reached",
-				"lp", lpCfg.ID, "soc", st.CurrentSoC, "release_at_soc", hold.ReleaseAtSoC)
-		}
-	}
-
 	cmd := map[string]any{"action": "ev_set_current"}
 	// cmdReason names the branch that decides this tick's power_w; every
 	// clamp that overrides the value overrides the reason with it. Fed
@@ -1432,16 +1448,6 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		// into PV-surplus-only charging. The fuse clamp below is the one
 		// guard a manual hold can never override. (surplusOn still drives
 		// the phase-mode fallback further down.)
-		// Fuse protection: even an operator-pinned hold must not bust
-		// the fuse. Apply the joint allocator's FuseEVMax cap and the
-		// pause-cooldown guard before sending. A sticky 11 kW Start
-		// hold + house drawing 7 A on one phase = fuse trip without
-		// this clamp.
-		var fuseReason string
-		holdW, fuseReason = c.applyFuseClampAndCooldown(now, lpCfg, holdW)
-		if fuseReason != "" {
-			cmdReason = fuseReason
-		}
 		cmd["power_w"] = holdW
 		// Phase mode: explicit hold > explicit LP config > surplus
 		// default ("auto") > driver default. Same surplus-active fallback
@@ -1488,10 +1494,15 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 			cmd["site_phases"] = site.Phases()
 		}
 	} else {
-		cmdW, planReady, fuseCapped := c.computeCommand(now, lpCfg, sample.PowerW)
+		cmdW, planReady, _ := c.computeCommandForBudget(now, lpCfg, sample.PowerW, false)
 		cmdReason = "plan"
-		if fuseCapped {
-			cmdReason = "fuse_limit"
+		if c.plan != nil {
+			if d, ok := c.currentDirective(now); ok && d.LoadpointFallback[lpCfg.ID] {
+				cmdReason = "EV deadline reserve"
+				if sample.PowerUnavailable {
+					cmdW = 0
+				}
+			}
 		}
 		if !planReady {
 			// No plan budget for this loadpoint right now — explicit
@@ -1543,16 +1554,8 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 				cmdReason = "vehicle_complete"
 			}
 		}
-		// Fuse protection: applied LAST (after MPC budget, surplus
-		// clamp, wake-kick) so all upstream sources see their nominal
-		// wantW; only the actual ceiling we send to the wallbox is
-		// reduced when the fuse demands it. Partial ramp-downs are
-		// immediate; only "cap below min step → must pause" arms the
-		// 5-min cooldown.
-		var fuseReason string
-		cmdW, fuseReason = c.applyFuseClampAndCooldown(now, lpCfg, cmdW)
-		if fuseReason != "" {
-			cmdReason = fuseReason
+		if d, ok := c.currentDirective(now); ok && d.LoadpointFallback[lpCfg.ID] && sample.PowerUnavailable {
+			cmdW = 0
 		}
 		cmd["power_w"] = cmdW
 		// Easee treats an unset phase_mode as 3p and then ignores a 1Φ step.
@@ -1591,6 +1594,32 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	// A manual diagnostic may lower a site limit, but never replace the
 	// installation's voltage, phase count or fuse with a larger offer.
 	c.applyInstallationLimits(cmd)
+	if applyCurrentCeiling(cmd) {
+		cmdReason = "charger_limit"
+	}
+	if wantW, ok := cmd["power_w"].(float64); ok {
+		phaseMode, _ := cmd["phase_mode"].(string)
+		c.recordFuseDemand(lpCfg.DriverName, wantW, phaseMode)
+		// The reserve directive requires a known physical ceiling. Capture
+		// its intent above, but never turn an unknown cap into permission.
+		if d, ready := c.currentDirective(now); ready && d.LoadpointFallback[lpCfg.ID] {
+			if cap, known := c.fuseCapFor(lpCfg.ID); !known || !finite(cap) || cap < 0 {
+				wantW, cmdReason = 0, "fuse_limit"
+			}
+		}
+		limitedW, reason := c.applyFuseClampAndCooldown(now, lpCfg, wantW)
+		cmd["power_w"] = limitedW
+		if reason != "" {
+			cmdReason = reason
+		}
+	}
+	// A new API choice can change phase after the shared budget was frozen.
+	// Do not spend a 3p share on one phase; the next tick uses the new choice.
+	if w, ok := cmd["power_w"].(float64); ok && w > 0 && c.tickFusePhases > 1 {
+		if mode, _ := cmd["phase_mode"].(string); mode != "" && mode != "3p" {
+			cmd["power_w"], cmdReason = float64(0), "fuse_limit"
+		}
+	}
 	c.applyPerPhaseFuseClamp(lpCfg, cmd)
 	if applyCurrentCeiling(cmd) {
 		cmdReason = "fuse_limit"
@@ -2389,10 +2418,14 @@ func (c *Controller) setSurplusStepW(id string, w float64) {
 // commanded reason so a fuse-starved 0 W never reads as "the plan
 // chose 0" (#1009).
 func (c *Controller) computeCommand(now time.Time, lpCfg Config, currentPowerW float64) (float64, bool, bool) {
+	return c.computeCommandForBudget(now, lpCfg, currentPowerW, true)
+}
+
+func (c *Controller) computeCommandForBudget(now time.Time, lpCfg Config, currentPowerW float64, clampFuse bool) (float64, bool, bool) {
 	if c.plan == nil {
 		return 0, false, false
 	}
-	d, ok := c.plan(now)
+	d, ok := c.currentDirective(now)
 	if !ok {
 		return 0, false, false
 	}
@@ -2400,8 +2433,25 @@ func (c *Controller) computeCommand(now time.Time, lpCfg Config, currentPowerW f
 	if !hasBudget {
 		return 0, false, false
 	}
+	if d.LoadpointFallback[lpCfg.ID] && c.fuseEVMax == nil {
+		return 0, true, false
+	}
+	if d.LoadpointFallback[lpCfg.ID] && clampFuse {
+		if cap, known := c.fuseCapFor(lpCfg.ID); !known || !finite(cap) || cap < 0 {
+			return 0, true, false
+		}
+	}
+	if d.LoadpointFallback[lpCfg.ID] {
+		st, known := c.manager.State(lpCfg.ID)
+		if _, _, needed := DeadlineNeed(st); !known || !needed {
+			return 0, true, false
+		}
+	}
 	remainingS := d.SlotEnd.Sub(now).Seconds()
 	alreadyWh, unmeasuredS := c.energySince(lpCfg.ID, d.SlotStart, now)
+	if d.LoadpointFallback[lpCfg.ID] {
+		alreadyWh, unmeasuredS = 0, 0 // Fresh goal energy already includes delivery.
+	}
 	if durationS := d.SlotEnd.Sub(d.SlotStart).Seconds(); durationS > 0 {
 		alreadyWh += budgetWh * unmeasuredS / durationS
 	}
@@ -2420,8 +2470,8 @@ func (c *Controller) computeCommand(now time.Time, lpCfg Config, currentPowerW f
 	// would together bust the fuse. Honour it before snapping to the
 	// charger's discrete steps so the snap chooses a level under the cap.
 	fuseCapped := false
-	if c.fuseEVMax != nil {
-		if cap, ok := c.fuseEVMax(); ok && cap >= 0 && wantW > cap {
+	if clampFuse && c.fuseEVMax != nil {
+		if cap, ok := c.fuseCapFor(lpCfg.ID); ok && cap >= 0 && wantW > cap {
 			wantW = cap
 			fuseCapped = true
 		}

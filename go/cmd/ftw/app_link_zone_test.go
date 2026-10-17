@@ -66,7 +66,8 @@ func helloBoxZone(t *testing.T, info appBoxInfo) string {
 			Role:   apiauth.RoleOwner,
 			Scopes: appproto.ScopesForRole(apiauth.RoleOwner),
 		},
-		Grants: ownerGrant{},
+		Grants:   ownerGrant{},
+		Commands: appproto.NewCmdLog(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -127,4 +128,6 @@ func (s *sentFrames) all() [][]byte {
 
 type ownerGrant struct{}
 
-func (ownerGrant) Grant() (string, uint64, bool) { return apiauth.RoleOwner, 1, true }
+func (ownerGrant) Grant() (appproto.Enrolment, bool) {
+	return appproto.Enrolment{Role: apiauth.RoleOwner, Epoch: 1}, true
+}

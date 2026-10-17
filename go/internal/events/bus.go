@@ -71,6 +71,9 @@ const (
 	KindChargingConnected       = "charging.connected"
 	KindChargingSessionComplete = "charging.session_complete"
 	KindChargingInterrupted     = "charging.interrupted"
+	KindChargingGoalAtRisk      = "charging.goal_at_risk"
+	// KindCarWhich asks which car is on a charger (docs/cars.md).
+	KindCarWhich = "car.which"
 )
 
 // HealthTick is fired every control-loop tick with the current telemetry
@@ -156,9 +159,11 @@ type UpdateInstalled struct {
 
 func (UpdateInstalled) Kind() string { return KindUpdateInstalled }
 
-// ChargingSessionComplete is emitted once per session when a fresh,
-// matched vehicle BMS reading confirms that the active target was reached.
-// A charger refusing current does not establish battery state.
+// ChargingSessionComplete is emitted once per session when the active target
+// was reached: by a fresh, matched vehicle BMS reading, or, for a car that
+// reports nothing itself, by the box's estimate from a level someone set.
+// The estimate is energy the box measured, so subscribers say it in kWh. A
+// charger refusing current does not establish battery state.
 type ChargingSessionComplete struct {
 	LoadpointID string
 	KWh         float64 // what the session meter delivered
@@ -185,3 +190,31 @@ type ChargingConnected struct {
 }
 
 func (ChargingConnected) Kind() string { return KindChargingConnected }
+
+// ChargingGoalAtRisk is emitted once per plug-in when the plan cannot bring
+// the car to its target by the ready time, and the box knows the car's
+// level rather than assuming it.
+type ChargingGoalAtRisk struct {
+	LoadpointID string
+	TargetSoC   float64 // fraction
+	By          time.Time
+	// ByClock is By as a household reads it, "07:00" in the box's zone.
+	ByClock     string
+	ShortfallWh float64
+	At          time.Time
+}
+
+func (ChargingGoalAtRisk) Kind() string { return KindChargingGoalAtRisk }
+
+// CarWhich is emitted once per plug-in when the box cannot tell which of its
+// cars is on a charger. Session names the plug-in a tap answers, and CarIDs
+// are the cars a tap may pick, in the box's order: at most four, empty when
+// there are more.
+type CarWhich struct {
+	LoadpointID string
+	Session     string
+	CarIDs      []string
+	At          time.Time
+}
+
+func (CarWhich) Kind() string { return KindCarWhich }

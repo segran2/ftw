@@ -1,5 +1,163 @@
 # Changelog
 
+## 0.147.1
+
+### Patch Changes
+
+- 8a7bd9c: An owner can let an assistant in for up to a year, up from 30 days. The box tells the app how long it lets each kind of access last, so a newer app offers an older box no more than 30 days.
+
+## 0.147.0
+
+### Minor Changes
+
+- cbdd8a5: Use FTW Cloud for remote app sessions, anonymous daily totals and encrypted browser offline notices. The box no longer connects to the Frankfurt relay. Older web and phone pairings may need a new QR code.
+
+## 0.146.0
+
+### Minor Changes
+
+- e3c0bac: Settings has an Access tab, where an owner with no phone app lets an AI assistant such as Claude or ChatGPT into the home. The owner types the code from FTW Cloud's page, sees what the box read in the signed offer, and grants it or less, never more. Reads are the default; control is something the owner turns on, with caps no higher than the assistant asked for. Granting, renewing, narrowing and approving a request need the house password, and the page says so before it asks for a code. The tab lists who has access, with expiry and last use, and lets the owner renew, narrow or remove each one and answer waiting requests.
+  
+  The box now says why it will not take an offer: unsigned, expired, for another home, unreadable, or a build that pins no offer key. A box with only an assistant, and no phone, now links to FTW Cloud, which learns of the assistant from the box's roster.
+- f17cb05: Include the Cloud home id in a linked box's pairing QR so the web app can pair through FTW Cloud.
+
+### Patch Changes
+
+- 7ffdab7: The box pins FTW Cloud's offer key, so an owner can approve an assistant on the box page with the code from the consent page.
+
+## 0.145.2
+
+### Patch Changes
+
+- fac5bd1: Let home battery charging yield to the car and resume EV charging once measured fuse headroom is stable, without a fixed five-minute pause. Avoid repeated cuts from the same phase reading and reserve room for commands that have not yet appeared in meter data.
+
+## 0.145.1
+
+### Patch Changes
+
+- d0e0144: FTW Cloud's copy carries each car's level and goal as the `car` class, by an opaque id and with no name, VIN or identifier, when it changes and in full every 15 minutes. A charger's level and goal fields in the copy now read from its session's car, so phones that know cars and phones that know only chargers see the same numbers.
+- 7fb84d6: FTW Cloud tells every owner's phone when someone gains access to the box, asks for a change, is about to lose access, can now approve access, or pairs as an owner, with the readable copy on or off. The box's `notice` names the client on `agent.added` only while the copy is on and carries events, and these kinds no longer also go to FTW Cloud as events, so an owner gets one alert and a viewer none. The `agent.added` push now says access was given, not who gave it.
+
+## 0.145.0
+
+### Minor Changes
+
+- f206613: Bundle the vehicle drivers that say where a car is plugged in: `home_assistant_vehicle` (new: a car's level, cable and place from a Home Assistant automation over MQTT), `tesla_cloud`, `teslamate_vehicle` and `vag_vehicle`, and the updated `tesla_vehicle`. They report the charge cable, and where they can, whether the car is at this site, so the box can name the plugged-in car by its own word. A car at 1 % no longer reads as full. They do nothing until configured, and none wakes a car.
+- 4675e4d: A car can say it was plugged in here. Vehicle drivers may report when their source read the car's cable go in (`plugged_since_ms`) and how far the car is from the site (`site_distance_m`; up to 300 m is here, over 5 km is elsewhere). `host.site_location()` gives the site's position to a signed vehicle driver, so the car's coordinates stay in the driver; Home Assistant's `vehicle_json` leaves out where the car is. The box names a car by its own word even when the report arrives late, but not when two chargers saw a plug-in in the same minute, and never a car that was read elsewhere after the plug-in. A reading from before the plug-in no longer makes the only car a visitor, and a tap over the box's visitor verdict stays. The driver card shows a car's level in percent when the driver sends a fraction.
+- b568635: The box keeps cars apart from its chargers. A car's level is its own: a reading from the car stays exact until 1 kWh has reached it, however old the reading, so a nine-minute-old 14 % with nothing delivered since shows as "from the car". The box knows which car is on a charger from the charger's identifier, the car's own report, the only car, or one tap after it asks (`car.which`), and the plan takes that car's capacity, goal, surplus choice and power limit. On first start the box makes Car 1 from each charger's settings and a car from each vehicle profile, and binds each vehicle driver by VIN or to the only car. The charger routes and ops act on the session's car for this release, so apps already installed keep working.
+- 4a1d81d: A phone whose session runs through FTW Cloud now gets a frame as each driver poll lands, instead of on the box's next one-second pulse, with a beat each second when no poll comes. A frame goes on every poll whether or not a value changed, so its timing shows the poll rhythm and never which reading moved. While a phone watches, the readable copy's `live` also goes when a reading lands, still at most once a second. Sessions over the relay keep their fixed cadence. Lane 0's invariant changes from "fixed length and cadence" to "fixed length; fixed cadence over the relay".
+
+### Patch Changes
+
+- d232ddb: The contract names cars apart from chargers: the car's fields, where its level comes from, how the box knows which car is on a charger, the car ops, the `car.which` push and FTW Cloud's `car` class with an opaque car id. docs/cars.md describes them. The box does not keep cars yet.
+- d9d7b0a: When the planning style asks for forecast caution and the plan has to use the point forecast instead, the plan now says so: the box page shows "Caution off" and the app's plan message carries `cautionOff`. It clears once caution works again. A cautious plan is no longer refused just because the car charges while the battery discharges: dispatch already keeps the battery off a protected car. With a car plugged in, an accepted cautious plan now takes one Energyplan solve instead of two; a refused one still takes two. The forecast archive no longer credits the live meter's current load to Core's recovery, and a lasting caution fault no longer rewrites its failure record on every replan.
+- 8fdc990: The FTW Cloud uplink tries QUIC on UDP 443 first and falls back to the WebSocket when UDP does not get through within 250 ms, remembering per network which one opened. A QUIC session that ends before `hello_ok`, or that the path drops within a minute of it, puts the WebSocket first on that network for a day. Over QUIC, `hb` and a `live` without its source table go as datagrams, and the tunnel's bulk on a stream of its own, so history never holds up a command. Noise sessions accept frames up to 1024 out of order, since bulk can overtake lane 0. `GET /api/cloud` says which transport carries the link. The registry names them in `cloud_transports`.
+
+## 0.144.1
+
+### Patch Changes
+
+- 4bd7bd4: Recover saved household load learning when the raw interval archive proves the old clock-jump collection bug. Keep solar learning, charging goals and the raw record. A permanently rejected archived observation no longer blocks later valid training; disk, worker and model failures still retry.
+- 51f0e35: Keep saved EV charging goals active when plans or prices are unavailable. Share one live fuse budget across chargers, keep legal charging steps, and reserve final charger offers before optional battery charging.
+
+## 0.144.0
+
+### Minor Changes
+
+- f024251: The box enforces agent access (`docs/agents.md`): an owner can let an assistant, Sourceful support for one ticket or the release check reach the box through FTW Cloud's tunnel, never the relay. Each grant has scopes, an op allowlist, caps on hold length, power and rate, and a wall-clock expiry that fails closed without NTP; revoke and expiry bite at the next call. Holds end by themselves; durable changes wait as requests until an owner confirms them with a phone's approval key or on the box page with the house password. The box keeps an audit log of who did what, serves log excerpts and configuration redacted on the box, and pushes `agent.added` and `agent.request` to owners.
+- f5cdb92: A phone can reach its box through FTW Cloud, with the relay unreachable. The box links to `cloud.ftw.energy` when it first shows a QR pairing code or has a paired phone, and carries each phone's own Noise session (`ftw.session.v1`) as `tun {dev, sid, d}` on that link. FTW Cloud cannot read or forge `d`; the box admits a session by the key its handshake proves, exactly as over the relay, and drops one the service put under another device. A new phone can pair through FTW Cloud: while a QR code is shown, the roster lists the code's hash, never the code. The readable copy stays a separate grant: with it off the box sends only its roster and the tunnel, and turning it off now deletes the copy at the service while the link and the home id stay. The link ends, and `cloud.key` with it, when no phone may use it and no code is shown. The tunnel has its own queues and a 250 MB a day budget apart from the readable copy's 20 MB: a command and its answer go first, and bulk is paced under FTW Cloud's limits. Each device now holds one session across the relay and FTW Cloud, in place of four places shared by all, and may open at most 12 through FTW Cloud a minute. `GET /api/cloud` shows `link`, `tunBytesLast24h`, `tunBudgetBytes` and `tunDropped`. For every linked home, FTW Cloud sees a stable home id, the box's address and when traffic goes. The relay keeps working as before.
+
+### Patch Changes
+
+- bf5bf50: The registry names agents: an assistant, Sourceful support for one ticket and the release check, with their roles, scopes, the scope that opens each command to an agent, their refusals and two push kinds. `docs/agents.md` specifies how the box will enforce them; this release only names them, and no pairing code or role change can hand an agent's role to a phone.
+- 11a7021: The box follows FTW Cloud to the instance that holds its home. When the service closes the uplink with 4421, the box dials the host named in the close reason once, only if it is `cloud.ftw.energy` or one label under it, and keeps that host with its link so a restart goes there first. It goes back to `cloud.ftw.energy` after a second redirect in a row, or after three failed dials over at least 30 s, so a shard's restart does not send it away. When the service closes with 4503 before a deploy, the box redials at a random moment within the spread the service names, at least 1 s, instead of all boxes coming back within half a second; a 4503 before `hello_ok` counts as a failure and grows the backoff. The box lists `shard` in `hello.caps`. The service still proves itself with the TLS certificate and the service key the box was built with, so a redirect grants nothing.
+- f5cdb92: A box whose FTW Cloud link carries the phones' sessions says so in `hello_ok.caps` as `cloud.tun`, a new registry capability, so a phone uses that path only when the box takes it. The registry also names the carrier state `tunnel` for a session that FTW Cloud carries.
+- c3a4c0a: Update the compiled energy planner so a legal future charging step remains available when choosing cheaper hours. Keep physical power limits, charger pulses and departure goals.
+- 69c4f31: Keep price planning when a load forecast cannot fit the site. Retry with the point forecast and then the configured load prior, keeping hardware limits, current measurements and departure goals. Retain the rejected inputs for support and report when the plan uses a simpler forecast.
+- 69c4f31: Keep a validated point plan when optional forecast caution fails, shortens the plan or worsens a car's departure goal. Try the point forecast before a load prior in Core fallback, and keep raw rejected risk inputs for support.
+- 6b7c245: Update the bundled Pixii drivers. Fresh negative PV totals now report zero
+  generation instead of leaving solar stale or missing after sunset. The battery
+  driver also recovers when Pixii starts after FTW or returns after an outage.
+- 6a40212: Push the plan to every streaming phone the moment the box replans, with each charger's windows, plug state and shortfall on it. A car plugged in now shows its new plan in the app without the app asking again. Viewers, which may not read the plan, get nothing.
+- 69c4f31: Use available prices in reserve charging plans. Move EV charging to cheaper legal slots while retaining the same energy, departure time, battery trajectory and site limits.
+- 9c8436b: Compare delayed car charge readings by measurement time. A newer car reading can now replace an older one even when both arrive late. Keep newer manual corrections and count energy delivered since the measurement once. Keep the measurement time when restart or trimmed history requires using the raw reading.
+
+## 0.143.1
+
+### Patch Changes
+
+- fd7aea2: Update the bundled Energyplan planner to 0.5.2. Within the box's time budget, the plan for a long sunny horizon no longer empties the battery and sells the solar. On a sunny two-day home case at about a Raspberry Pi 4's 1.5 s budget the plan now costs 77 kr instead of 100 kr; the best plan costs 77 kr. Core still validates every plan.
+- da2aa98: Discard missing forecast measurement intervals when the system clock changes after startup. Use wall time consistently so a clock correction cannot create false high household-load observations.
+- 2b0cf6f: Accept idle solver rounding within 0.00001 W when checking EV charging during battery export. Keep rejecting real discharge and include exact powers in rejection diagnostics.
+- 022eb41: Keep a safe plan when a later forecast cannot meet the site limits. The reserve planner prepares the battery for future peaks and reports why it shortened a plan, while Core still checks every planned action.
+  
+  Retain valid intervals before corrupt future forecast values, use the reserve when the DP grid exceeds its memory budget, and require fresh battery charge readings before planning from live telemetry.
+- d7cb09d: Keep complete planner worker replies readable when the worker exits before Core reads them. Retain bounded cancellation and worker restart behavior.
+- 5636993: Include the latest failed planner inputs, worker request and response, and current charging state in support packages. Retain the latest failure across restarts with a durable SQLite commit and report storage errors. Keep failure evidence distinct from accepted plans and redact credentials before export.
+
+## 0.143.0
+
+### Minor Changes
+
+- 6e05ac5: The plan an app reads (`plan.get` and the plan pushed after a command) now carries the battery's planned level at the end of each slot, `socPermille`, in thousandths: the same name and unit as the FTW Cloud plan class. A phone can then say where the battery ends up, not only what it does. A level the planner did not give as a number is left out. Older apps ignore the field.
+- 7c72a5b: An Apple Watch can charge the car and read the house without its phone (ADR 0009). The box keeps a second relay socket, `/r/<epoch>/<handle>/exchange`, beside its uplink, and answers a watch's one-shot HTTPS requests on it: a Noise IK handshake with prologue `ftw.exchange.v1:` that carries the watch's hello and the box's `hello_ok`, then `cmd` and `now`. Watch sessions live in a table of eight apart from the phones' four, so a watch never pushes a phone out, and each ends after four exchanges, a minute idle or three minutes. Every answer is two lane 0 frames, so a read, a command and a refusal have one length; a command's result that has not settled in 3 s leaves a tick in its place, and asking again with the same `cmdId` returns it. The box answers a command no sooner than 400 ms after it arrived, applied or refused, so the time to answer does not tell the relay which; a command that takes longer answers when it is done. The box takes at most 60 handshakes a minute and answers a stranger or a removed watch with silence. It now says `cmd.exchange`, so a phone can offer "Add watch". Losing the exchange socket changes nothing for the uplink or local control.
+
+### Patch Changes
+
+- 9fa327f: An app command retried in a new session no longer acts twice. Each app session kept its own list of command ids, so when a phone lost its connection mid-command and sent the command again, the box acted again. The box now keeps one list for all sessions, keyed by the device and its command id, and holds each id for 24 hours of uptime, as the protocol says. Another device's command with the same id still counts as new.
+- 5c1feae: The box streams the grid's three phase currents to the app and to FTW Cloud, so the phone can show each phase against the main fuse. They go as extra fields 11–13 in tenths of an ampere, signed by the site convention, with the main fuse as field 14. A meter that gives only the size of each current, such as Sungrow, gets its sign from the power on the same phase. The box sends only the phases the site has, and only while the site meter is online. When a field stops coming, the box resends the whole snapshot once, so a phone never keeps a phase at its last value. Lane 0 keeps its 512-byte frame, and these fields are the first to give way when a delta does not fit.
+- 5d2e7fe: Specify how an Apple Watch reads its home from FTW Cloud in one HTTPS request (ADR 0009). `go/protocol/cloudwire` gains the one-shot read: `POST /v1/app/once`, a Noise IK handshake with prologue `ftw.cloud.once.v1:`, `read {have, hz}` and `token.get` in message 1, and an answer of length-prefixed messages. `push.register` gains `app`, `iphone` or `watch`, so the service picks the APNs topic, and the roster may carry a device with role `watch`. Golden vectors for one read are in `cloudwire/testdata/cloud-once-vectors.json`. Nothing on the box changes; FTW Cloud serves the route in a later step.
+- 00d791c: Know the shared registry's new names for an Apple Watch: role `watch` and capability `cmd.exchange` (ADR 0009). The box claims neither yet. Its page and the app refuse a watch code, and refuse to change a phone into a watch, until a phone can add one.
+- a6ddfea: An owner's phone can add an Apple Watch as a device of its own (ADR 0009). The phone asks for a watch code over its session, with a passkey step-up on that request; the code binds to the phone and leaves a pending phone code alone. The box stores the watch with role `watch` and the phone as its parent. A watch holds the watch role's scopes that its phone holds at that moment, so demoting the phone narrows the watch at once. Removing a phone removes its watches; removing a watch touches nothing else. A watch never gets a stream session. The box's page and `GET /api/app-link/devices` list each watch under its phone, and FTW Cloud's roster carries it with the scopes the box derives. The box does not offer the watch path yet: `cmd.exchange` stays unsaid until the exchange socket lands.
+
+## 0.142.2
+
+### Patch Changes
+
+- 4d9018a: Bundle sungrow 1.6.0, which reads grid, PV and battery power, SoC and per-phase values once a second, so live figures on the phone move every second instead of every five. Counters, temperature, frequency and fault bits keep the five-second rate.
+- 5bc76c9: Honour the interval a driver returns from `driver_poll`, as the driver contract says. Core ignored it before and polled every five seconds. The returned wait now sets the next poll, between one second and thirty seconds. A driver that calls `host.set_poll_interval` keeps that interval, as before, whatever it returns.
+  
+  Bundled drivers that return one second now read once a second: ambibox_v2x, ferroamp, ferroamp_dc2_v2x, pixii_pv, sdm630, sonnen and zap. myuplink reads every thirty seconds instead of every five. easee_cloud, tesla_wall_connector and zaptec_cloud wait ten seconds after a failed read, and solaredge_legacy thirty seconds after a failed SunSpec probe.
+
+## 0.142.1
+
+### Patch Changes
+
+- 49439b2: Show recorded energy after gaps in today's solar or consumption readings, with a clear mark for partial totals. Keep missing totals unknown in the flow view instead of showing zero.
+
+## 0.142.0
+
+### Minor Changes
+
+- 3c60ca7: Add the owner-controlled FTW Cloud capability, with cloud uplink, phone sessions, signed notifications and owner-facing Cloud APIs. Local operation remains the default; Cloud requires the owner's consent.
+
+## 0.141.7
+
+### Patch Changes
+
+- b1b3469: Let phones read their home from FTW Cloud. While FTW Cloud is on, the box tells every paired phone, over its own encrypted session, the key it signs with and the names behind its anonymous ids, so a phone can check what the service forwards. Boxes that can run the uplink say so to the app. `POST` and `DELETE /api/cloud/stats` record and withdraw an owner's consent to statistics; nothing is sent for it yet.
+- b1b3469: With FTW Cloud on and events in the grant, the box sends its notifications as signed events for the owners' phones; names never leave the house. A restart the box chooses, an update among them, tells FTW Cloud so it holds back "box out of reach". A new notification, "The car may not be ready", tells once per plug-in when the box knows the car's level and the plan cannot reach the goal by the ready time. A car that reports nothing itself gets "Car charged" in kWh once the box's estimate from a level someone set reaches the target. "Car plugged in" now waits 90 seconds and is sent only when the box needs the level or a goal. Each notification transport now has its own 10-second limit, so one that hangs no longer delays the others.
+- c6ab8ee: Release builds know FTW Cloud at `wss://cloud.ftw.energy` by the service's public key, so an owner can turn FTW Cloud on. Nothing changes until they do. The box checks every message from the service against that key and refuses a service that signs with any other.
+- b1b3469: Add the FTW Cloud uplink, off unless an owner turns it on. `GET /api/cloud` shows the grant and the bytes sent in the last 24 hours, `GET /api/cloud/preview` shows the exact bytes that leave the house, and `POST` and `DELETE /api/cloud/grant` turn it on and off. Backups no longer include `cloud.key`.
+
+## 0.141.6
+
+### Patch Changes
+
+- 22a8f32: A phone that opens the app just after the hour finds the box at once over the relay. The relay turns its rendezvous handles on the hour but closes each box's old room on its own turn in a five-minute spread, so a phone could wait up to five minutes in an empty room. The box now joins the new hour's handle when the hour turns and keeps the old one until the relay closes it.
+
+## 0.141.5
+
+### Patch Changes
+
+- 85e1b7a: Limit charging steps to the charger's max power when loading, saving and planning, and show a warning. Show the latest planning failure in Plan instead of leaving it on Preparing.
+
+## 0.141.4
+
+### Patch Changes
+
+- 18945ce: Report connection wait, SQL query, scan and decode times when a forecast read fails, without recording measurement values or extending its deadline.
+
 ## 0.141.3
 
 ### Patch Changes

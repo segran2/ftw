@@ -57,7 +57,7 @@ func TestNativeEnergyplanEVRecoveryFallbackFaults(t *testing.T) {
 				t.Cleanup(func() { _ = external.Close() })
 				wrapper := &EnergyplanOptimizer{ExternalOptimizer: external}
 				health, err := wrapper.Health(context.Background())
-				if err != nil || health.Version != "0.5.1" {
+				if err != nil || health.Version != "0.5.2" {
 					t.Fatalf("bundle health=%+v err=%v", health, err)
 				}
 				svc := shadowTestService(t)
@@ -77,10 +77,10 @@ func TestNativeEnergyplanEVRecoveryFallbackFaults(t *testing.T) {
 					if previous == nil || previous.Solver == nil || previous.Solver.Fallback || previous.InitialSoC != measuredSoC {
 						t.Fatalf("native baseline did not publish from measured low SoC: %+v", previous)
 					}
+					svc.shadowWG.Wait()
 					if err := ValidatePlan(svc.lastSlots, svc.lastParams, previous); err != nil {
 						t.Fatal(err)
 					}
-					svc.shadowWG.Wait()
 					previous = svc.Latest()
 					previousBytes, _ = json.Marshal(previous)
 				}

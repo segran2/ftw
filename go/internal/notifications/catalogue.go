@@ -14,10 +14,19 @@ const (
 	PushChargingConnected       = protocol.PushChargingConnected
 	PushChargingSessionComplete = protocol.PushChargingSessionComplete
 	PushChargingInterrupted     = protocol.PushChargingInterrupted
+	PushChargingGoalAtRisk      = protocol.PushChargingGoalAtRisk
 	PushUpdateInstalled         = protocol.PushUpdateInstalled
 	PushDriverOffline           = protocol.PushDriverOffline
 	PushFuseOverLimit           = protocol.PushFuseOverLimit
 	PushBoxUnreachable          = protocol.PushBoxUnreachable
+	PushCloudGranted            = protocol.PushCloudGranted
+	PushAgentAdded              = protocol.PushAgentAdded
+	PushAgentRequest            = protocol.PushAgentRequest
+	PushAgentExpiring           = protocol.PushAgentExpiring
+	PushApprovalKeySet          = protocol.PushApprovalKeySet
+	PushOwnerAdded              = protocol.PushOwnerAdded
+	PushCloudRevoked            = protocol.PushCloudRevoked
+	PushCarWhich                = protocol.PushCarWhich
 )
 
 // PushSentence is one lock-screen sentence, exactly as the app wrote it.

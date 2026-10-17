@@ -89,16 +89,19 @@ type forecastTracker struct {
 	observationLoadValid bool
 	issueArchiveError    bool
 	sourceChoice         forecastSourceChoice // guarded by mu
+
+	learningRecoveryChecked string // guarded by learningMu; physical learning identity
+	learningRecoveryAfterMS int64  // a pre-sync clock retries when archived evidence becomes available
 }
 
 func (f *forecastTracker) Start(ctx context.Context) error {
-	if err := f.restoreLearning(ctx); err != nil {
-		return err
-	}
 	initCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	err := f.store.InitForecastArchive(initCtx)
 	cancel()
 	if err != nil {
+		return err
+	}
+	if err := f.restoreLearning(ctx); err != nil {
 		return err
 	}
 	f.queue = make(chan forecastJob, 8)
@@ -672,7 +675,7 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 			}
 		}
 	}
-	in.Record = func(base, planning []mpc.Slot, decisionID string, issued int64) {
+	in.Record = func(base, planning []mpc.Slot, recoveredLoad []bool, decisionID string, issued int64) {
 		issue := makeIssue(base, issued)
 		issue.DecisionID = decisionID
 		if prediction != nil {
@@ -681,6 +684,9 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 		}
 		version := forecastModelRevision(issue.Models)
 		issue.Series[0].ModelVersion = version
+		// Core may recover with a prior after the selected model fails. Keep
+		// its accepted inputs separate from the raw worker and legacy series.
+		selected = recoveredForecastSources(selected, recoveredLoad)
 		issue.Series[0].Points = primaryForecastPoints(base, issue.Series[0].Points, selected)
 		issue.Series = append(issue.Series, forecasting.Series{Name: "planning", ModelVersion: version,
 			Points: primaryForecastPoints(planning, forecastPoints(planning, frozen, site, origin, load), selected)})
@@ -716,6 +722,19 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 
 func usablePrimaryForecast(known bool, quality string, watts float64) bool {
 	return known && (quality == "cold_start" || quality == "learning" || quality == "ready") && watts >= 0 && !math.IsNaN(watts) && !math.IsInf(watts, 0)
+}
+
+// A load Core recovered belongs to that recovery, not the model whose raw
+// prediction was rejected. Risk adjustments keep the recovered source.
+func recoveredForecastSources(selected []forecasting.Point, recoveredLoad []bool) []forecasting.Point {
+	out := append([]forecasting.Point(nil), selected...)
+	for i, recovered := range recoveredLoad {
+		if recovered && i < len(out) {
+			out[i].LoadSource, out[i].LoadQuality = "core_recovery", "fallback"
+			out[i].ModelLoad = nil
+		}
+	}
+	return out
 }
 
 // Preserve the source and quality used for each signal, while recording the
