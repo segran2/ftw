@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.149.0
+
+### Minor Changes
+
+- 2b1cc25: Include project statistics in the updated FTW Cloud terms. Local-only users
+  get a separate question with Yes suggested; nothing starts before an answer.
+  Statistics-only sharing grants no app or assistant remote access. Turning
+  Cloud off ends remote access and remembers that choice across restarts.
+  Hourly collection still waits for the signed C8 review and service approval.
+
+## 0.148.0
+
+### Minor Changes
+
+- 6335dbc: Add a separate, versioned Cloud statistics path for reporting installations,
+  configured capacity and recorded hourly energy. Older consents stay inactive
+  for these fields; the owner must accept the new policy.
+
+## 0.147.2
+
+### Patch Changes
+
+- 47799bd: The EV's hard limit now reads only the site meter and FTW's own commands, never the charger's power readings. A charge is cut by the overage the meter measures on the worst phase or in total import, holds while the site is inside its limits, and rises one step at a time once the meter shows the last one. After a stop it restarts only when the meter has shown room for 35 seconds, and a Core restart keeps FTW's last offer while the same charging session is still plugged in. A late, missing or lone 0 W reading from the charger can no longer stop a charge, and an import ceiling no longer makes the charger start and stop every half minute.
+
 ## 0.147.1
 
 ### Patch Changes
