@@ -2621,6 +2621,15 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 		if de.Missing&state.EstimatedLoad != 0 {
 			dayEnergy["load_quality"] = "estimated"
 		}
+		if de.Missing&state.EndpointEstimatedPV != 0 {
+			dayEnergy["pv_quality"] = "estimated"
+			if dayEnergy["history_quality"] == "complete" {
+				dayEnergy["history_quality"] = "estimated"
+			}
+		}
+		if de.PVUntilMS > 0 {
+			dayEnergy["pv_until_ms"] = de.PVUntilMS
+		}
 		if de.LoadUntilMS > 0 {
 			dayEnergy["load_until_ms"] = de.LoadUntilMS
 		}

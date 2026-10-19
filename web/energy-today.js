@@ -16,7 +16,7 @@ function knownWh(value) {
 
 export function energyTodayReading(today, key) {
   const total = today?.[key];
-  if (knownWh(total)) return key === "load_wh" && (today?.history_quality === "estimated" || today?.load_quality === "estimated")
+  if (knownWh(total)) return ((key === "load_wh" && (today?.history_quality === "estimated" || today?.load_quality === "estimated")) || (key === "pv_wh" && today?.pv_quality === "estimated"))
     ? {wh: total, partial: false, estimated: true} : {wh: total, partial: false};
   const measured = today?.measured?.[key];
   if (knownWh(measured)) return {wh: measured, partial: true};
@@ -66,6 +66,7 @@ export function updateEnergyToday(today, root = document) {
     ? "Gaps in today's readings. ≥ shows recorded energy only."
     : "Today's energy is not available yet.";
   if (estimated) note.textContent = (incomplete ? note.textContent + " " : "") + "Home use includes estimates from source energy.";
+  if (today?.pv_quality === "estimated") {note.hidden = false; note.textContent += " Solar includes estimated energy across historical gaps.";}
   const home = energyTodayReading(today, "load_wh");
   if (home.estimated && home.partial) {
     note.hidden = false;

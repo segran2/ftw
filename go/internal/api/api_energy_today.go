@@ -13,6 +13,15 @@ func energyTodayFields(d state.DayEnergy) map[string]any {
 	if d.LoadUntilMS > 0 {
 		out["load_until_ms"] = d.LoadUntilMS
 	}
+	if d.Missing&state.EndpointEstimatedPV != 0 {
+		out["pv_quality"] = "estimated"
+		if out["history_quality"] == "complete" {
+			out["history_quality"] = "estimated"
+		}
+	}
+	if d.PVUntilMS > 0 {
+		out["pv_until_ms"] = d.PVUntilMS
+	}
 	measured := make(map[string]any)
 	for key, field := range map[string]struct {
 		flag state.HistoryMissing
@@ -33,6 +42,9 @@ func energyTodayFields(d state.DayEnergy) map[string]any {
 		// The load total includes inferred intervals. It cannot also appear
 		// in the measured-only fallback used by clients after a data gap.
 		measured["load_wh"] = nil
+	}
+	if d.Missing&state.EndpointEstimatedPV != 0 {
+		measured["pv_wh"] = nil
 	}
 	out["measured"] = measured
 	return out

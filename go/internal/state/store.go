@@ -1645,6 +1645,7 @@ type DayEnergy struct {
 	// Historical repairs use completed minute evidence, not an extrapolated
 	// current tail. Status exposes this bound independently of live power.
 	LoadUntilMS int64
+	PVUntilMS   int64
 	// Intervals is the number of integration intervals that contributed to
 	// the totals — i.e. the count of rows that had a predecessor (prev_ts IS
 	// NOT NULL). Zero means there was at most one history row in the range, so
@@ -1693,6 +1694,9 @@ func (s *Store) DailyEnergy(sinceMs, untilMs int64) (DayEnergy, error) {
 		d, err := s.legacyDailyEnergy(sinceMs, untilMs)
 		if err == nil {
 			err = s.applyHistoricalDailyLoad(ctx, sinceMs, untilMs, &d)
+			if err == nil {
+				err = s.applyEndpointDailyPV(ctx, sinceMs, untilMs, &d)
+			}
 		}
 		return d, err
 	}
@@ -1706,6 +1710,9 @@ func (s *Store) DailyEnergy(sinceMs, untilMs int64) (DayEnergy, error) {
 			return out, err
 		}
 		out = addDayEnergy(old, out)
+	}
+	if err := s.applyEndpointDailyPV(ctx, sinceMs, untilMs, &out); err != nil {
+		return out, err
 	}
 	if err := s.applyHistoricalDailyLoad(ctx, sinceMs, untilMs, &out); err != nil {
 		return out, err

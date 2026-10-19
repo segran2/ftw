@@ -41,7 +41,18 @@ func (s *Store) historicalLoadRepairs(ctx context.Context, from, to int64) (map[
 		}
 		out[p.StartMS] = p
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	endpoints, err := s.endpointRepairs(ctx, from, to)
+	if err != nil {
+		return nil, err
+	}
+	for at, m := range endpoints["load"] {
+		out[at] = repairMinute{StartMS: at, Wh: m.Wh, InterpolatedMS: m.AfterMS - m.BeforeMS}
+	}
+	return out, nil
 }
 
 // walkHouseholdLoad replaces only derived household energy in the read view.
@@ -119,7 +130,10 @@ func (s *Store) repairedLoadBuckets(ctx context.Context, from, to, width int64) 
 
 func (s *Store) applyHistoricalDailyLoad(ctx context.Context, from, to int64, d *DayEnergy) error {
 	// A historical correction cannot invent the currently unfinished minute.
-	end := bucketStart(to, ArchiveResolutionMS)
+	end, err := s.endpointReadUntil(ctx, from, to)
+	if err != nil {
+		return err
+	}
 	if end <= from {
 		return nil
 	}
@@ -136,7 +150,7 @@ func (s *Store) applyHistoricalDailyLoad(ctx context.Context, from, to int64, d 
 	return nil
 }
 
-func (s *Store) applyHistoricalLoadChart(ctx context.Context, points []HistoryPoint, from, to, width int64) ([]HistoryPoint, error) {
+func (s *Store) applyHistoricalLoadChartOnly(ctx context.Context, points []HistoryPoint, from, to, width int64) ([]HistoryPoint, error) {
 	if width < ArchiveResolutionMS {
 		return points, nil
 	} // Do not invent raw poll values.
@@ -192,7 +206,7 @@ func (s *Store) applyHistoricalLoadChart(ctx context.Context, points []HistoryPo
 	return points, nil
 }
 
-func (s *Store) applyHistoricalLoadLedger(ctx context.Context, q EnergyHistoryQuery, points []EnergyLedgerPoint) ([]EnergyLedgerPoint, error) {
+func (s *Store) applyHistoricalLoadLedgerOnly(ctx context.Context, q EnergyHistoryQuery, points []EnergyLedgerPoint) ([]EnergyLedgerPoint, error) {
 	if q.AssetID != "" && q.AssetID != ObservedConsumerAssetID {
 		return points, nil
 	}

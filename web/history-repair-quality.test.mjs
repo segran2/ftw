@@ -10,3 +10,9 @@ test("corrected household energy stays estimated even when another original flow
   assert.equal(flowReadingsFromStatus({load_w:1200,energy:{today}}).selfPoweredPctToday,null);
   assert.equal(today.measured.load_wh,null);
 });
+
+test("endpoint solar and home totals both show estimate markers",()=>{
+  const today={load_wh:41000,load_quality:"estimated",pv_wh:37000,pv_quality:"estimated",history_quality:"incomplete",measured:{load_wh:null,pv_wh:null}};
+  assert.equal(formatEnergyToday(today,"load_wh"),"≈ 41.0 kWh");
+  assert.equal(formatEnergyToday(today,"pv_wh"),"≈ 37.0 kWh");
+});
