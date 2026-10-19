@@ -9,10 +9,13 @@ import (
 	"time"
 )
 
-func endpointFixture(t *testing.T, night bool) (*Store, EndpointRepairRequest, string) {
+func endpointFixture(t *testing.T, night bool, at ...int64) (*Store, EndpointRepairRequest, string) {
 	t.Helper()
 	s := sourceStore(t)
 	base := time.Now().UTC().Truncate(24 * time.Hour).Add(-24 * time.Hour).UnixMilli()
+	if len(at) > 0 {
+		base = at[0]
+	}
 	for at := base - 60000; at <= base+31*60000; at += 5000 {
 		if at >= base+10*60000 && at < base+22*60000 {
 			continue
@@ -259,5 +262,25 @@ func TestEndpointRepairRollsBackWhenCacheInvalidationFails(t *testing.T) {
 	}
 	if _, hit, err := s.LoadDailyEnergy("guard"); err != nil || !hit {
 		t.Fatal("cache partially deleted", hit, err)
+	}
+}
+
+func TestEndpointRepairLiveTotalsStopAtCommittedMinute(t *testing.T) {
+	base := time.Now().Truncate(time.Minute).Add(-40 * time.Minute).UnixMilli()
+	s, r, backup := endpointFixture(t, false, base)
+	ctx := context.Background()
+	p, err := PrepareEndpointRepair(ctx, s.mainDBPath, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyEndpointRepair(ctx, s.mainDBPath, backup, p, p.SHA256); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.DailyEnergy(base, time.Now().UnixMilli())
+	if err != nil || d.Missing&(MissingLoad|MissingPV) != 0 {
+		t.Fatal("writer tail voided repaired totals", d, err)
+	}
+	if d.LoadUntilMS != base+31*60000 || d.PVUntilMS != d.LoadUntilMS {
+		t.Fatal("extrapolated unfinished tail", d)
 	}
 }

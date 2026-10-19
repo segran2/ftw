@@ -12,7 +12,7 @@ const EndpointEstimatedPV HistoryMissing = 1 << 9
 
 func (s *Store) endpointReadUntil(ctx context.Context, from, to int64) (int64, error) {
 	end := bucketStart(to, 60000)
-	if to < time.Now().Add(-2*time.Minute).UnixMilli() {
+	if s.history == nil || to < time.Now().Add(-2*time.Minute).UnixMilli() {
 		return end, nil
 	}
 	var last int64
