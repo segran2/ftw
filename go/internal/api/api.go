@@ -1205,6 +1205,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			// instead of "no data yet". Mirror the old `len(pts) > 1` guard.
 			if d.Intervals > 0 {
 				energyToday = energyTodayFields(d)
+				if err := s.addHouseholdSubtotal(r.Context(), midnight.UnixMilli(), now.UnixMilli(), energyToday); err != nil {
+					slog.Warn("household energy subtotal unavailable", "err", err)
+				}
 			}
 		} else {
 			slog.Warn("failed to integrate today's energy", "err", err)
@@ -2603,7 +2606,7 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "history coverage unavailable", http.StatusInternalServerError)
 			return
 		}
-		out = append(out, map[string]any{
+		dayEnergy := map[string]any{
 			"coverage_ms":       coverage,
 			"period_ms":         periodEnd - dayStart.UnixMilli(),
 			"history_quality":   de.Missing.Quality(),
@@ -2614,7 +2617,12 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			"bat_charged_wh":    de.Missing.Value(state.MissingBattery, de.BatChargedWh),
 			"bat_discharged_wh": de.Missing.Value(state.MissingBattery, de.BatDischargedWh),
 			"load_wh":           de.Missing.Value(state.MissingLoad, de.LoadWh),
-		})
+		}
+		if err := s.addHouseholdSubtotal(r.Context(), dayStart.UnixMilli(), periodEnd, dayEnergy); err != nil {
+			http.Error(w, "household energy subtotal unavailable", http.StatusInternalServerError)
+			return
+		}
+		out = append(out, dayEnergy)
 	}
 	writeJSON(w, 200, map[string]any{"days": out, "tz": localzone.Name()})
 }
