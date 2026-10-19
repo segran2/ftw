@@ -2618,6 +2618,12 @@ func (s *Server) handleEnergyDaily(w http.ResponseWriter, r *http.Request) {
 			"bat_discharged_wh": de.Missing.Value(state.MissingBattery, de.BatDischargedWh),
 			"load_wh":           de.Missing.Value(state.MissingLoad, de.LoadWh),
 		}
+		if de.Missing&state.EstimatedLoad != 0 {
+			dayEnergy["load_quality"] = "estimated"
+		}
+		if de.LoadUntilMS > 0 {
+			dayEnergy["load_until_ms"] = de.LoadUntilMS
+		}
 		if err := s.addHouseholdSubtotal(r.Context(), dayStart.UnixMilli(), periodEnd, dayEnergy); err != nil {
 			http.Error(w, "household energy subtotal unavailable", http.StatusInternalServerError)
 			return

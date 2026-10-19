@@ -7,6 +7,12 @@ func energyTodayFields(d state.DayEnergy) map[string]any {
 		return nil
 	}
 	out := map[string]any{"history_quality": d.Missing.Quality()}
+	if d.Missing&state.EstimatedLoad != 0 {
+		out["load_quality"] = "estimated"
+	}
+	if d.LoadUntilMS > 0 {
+		out["load_until_ms"] = d.LoadUntilMS
+	}
 	measured := make(map[string]any)
 	for key, field := range map[string]struct {
 		flag state.HistoryMissing

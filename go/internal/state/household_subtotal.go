@@ -23,8 +23,12 @@ func (s *Store) HouseholdEnergySubtotal(ctx context.Context, from, to int64) (*H
 		return nil, nil
 	}
 	const width int64 = 5 * 60000
+	repairs, err := s.historicalLoadRepairs(ctx, from, to)
+	if err != nil {
+		return nil, err
+	}
 	buckets := map[int64]*sourceLoadBucket{}
-	err := s.walkSiteEnergy(ctx, from, to, func(r siteEnergyRow) error {
+	err = s.walkHouseholdLoad(ctx, from, to, repairs, func(r siteEnergyRow) error {
 		// Retained coarse intervals remain indivisible; never split an older
 		// observed interval into invented five-minute measurements.
 		w := max(width, r.width)

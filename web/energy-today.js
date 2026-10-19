@@ -16,7 +16,7 @@ function knownWh(value) {
 
 export function energyTodayReading(today, key) {
   const total = today?.[key];
-  if (knownWh(total)) return key === "load_wh" && today?.history_quality === "estimated"
+  if (knownWh(total)) return key === "load_wh" && (today?.history_quality === "estimated" || today?.load_quality === "estimated")
     ? {wh: total, partial: false, estimated: true} : {wh: total, partial: false};
   const measured = today?.measured?.[key];
   if (knownWh(measured)) return {wh: measured, partial: true};
@@ -46,7 +46,7 @@ export function updateEnergyToday(today, root = document) {
     const {partial, estimated} = energyTodayReading(today, key);
     el.textContent = formatEnergyToday(today, key);
     el.title = estimated && partial ? "Estimated subtotal from accepted energy intervals only; gaps are excluded."
-      : estimated ? "Estimated from source energy during brief balance failures."
+      : estimated ? "Estimated from source energy; may include audited historical corrections."
       : partial ? "Recorded energy only; missing readings are excluded." : "";
   }
   const group = root.getElementById("e-pv")?.closest(".energy-group");
@@ -60,12 +60,12 @@ export function updateEnergyToday(today, root = document) {
   }
   const keys = new Set(Object.values(ENERGY_FIELDS));
   const incomplete = [...keys].some(key => !knownWh(today?.[key]));
-  const estimated = today?.history_quality === "estimated";
+  const estimated = today?.history_quality === "estimated" || today?.load_quality === "estimated";
   note.hidden = !incomplete && !estimated;
   note.textContent = today
     ? "Gaps in today's readings. ≥ shows recorded energy only."
     : "Today's energy is not available yet.";
-  if (estimated) note.textContent = (incomplete ? note.textContent + " " : "") + "Home use includes estimates for brief balance failures.";
+  if (estimated) note.textContent = (incomplete ? note.textContent + " " : "") + "Home use includes estimates from source energy.";
   const home = energyTodayReading(today, "load_wh");
   if (home.estimated && home.partial) {
     note.hidden = false;
