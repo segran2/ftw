@@ -2,20 +2,22 @@ package control
 
 import (
 	"math"
+	"time"
 
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
 // clampEVBatteryHeadroom keeps optional battery charge out of room an EV
-// still needs. It reads only the site meter and our own commands; no charger
-// or battery reading takes part. The EV still needs its demand less the
-// lowest offer of the last evSettle, which the meter surely shows.
+// still needs. A stable offer is not proof of delivery. Fresh, aligned EV
+// power may reduce the reservation, but never beyond the lowest recent offer.
+// This only caps optional battery charge; it grants no EV rise or restart.
 func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, state *State, fuseMaxW float64) []DispatchTarget {
 	if store == nil || state == nil || len(targets) == 0 || fuseMaxW <= 0 {
 		return targets
 	}
 	now := state.now()
-	// This tick's new offer is not in the meter yet; the lowest logged one is.
+	// A recent offer rise cannot establish load already in the meter. The
+	// lowest logged offer is an upper bound on credited measured EV power.
 	offeredW, _, _, ok := state.evOffers.span(now)
 	if !ok {
 		offeredW = 0
@@ -31,11 +33,12 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 	if len(state.evFuseDemands) == 0 {
 		return targets
 	}
-	needW := math.Max(0, demandW-offeredW)
 	meter := store.Get(state.SiteMeterDriver, telemetry.DerMeter)
 	if meter == nil || !finiteFuseValue(meter.RawW) || !finiteFuseValue(fuseMaxW) {
 		return floorPositiveEVBatteryTargets(targets)
 	}
+	creditedW := realizedEVForBatteryW(store, state, meter, now)
+	needW := math.Max(0, demandW-math.Min(offeredW, creditedW))
 	latest := make(map[string]float64, len(targets))
 	targeted := make(map[string]bool, len(targets))
 	for _, target := range targets {
@@ -141,4 +144,31 @@ func floorPositiveEVBatteryTargets(targets []DispatchTarget) []DispatchTarget {
 		}
 	}
 	return out
+}
+
+// Missing, unhealthy or unaligned EV observations reserve the full demand.
+// The meter-only EV fuse gate still decides every rise/start; battery relief
+// from this clamp cannot fund a rise before it appears in the site meter.
+func realizedEVForBatteryW(store *telemetry.Store, state *State, meter *telemetry.DerReading, now time.Time) float64 {
+	const maxAge = 15 * time.Second
+	const maxSkew = 10 * time.Second
+	if meter == nil || meter.UpdatedAt.After(now) || now.Sub(meter.UpdatedAt) > maxAge {
+		return 0
+	}
+	var total float64
+	for _, demand := range state.evFuseDemands {
+		rd := store.Get(demand.driverName, telemetry.DerEV)
+		health := store.DriverHealth(demand.driverName)
+		if rd == nil || health == nil || !health.TelemetryLive() || health.DeviceFault || rd.UpdatedAt.After(now) || now.Sub(rd.UpdatedAt) > maxAge {
+			continue
+		}
+		observation, known := telemetry.ControlPowerObservation(rd.RawW, rd.Data, rd.UpdatedAt)
+		at := observation.Seen()
+		age, skew := now.Sub(at), meter.UpdatedAt.Sub(at)
+		if !known || age < 0 || age > maxAge || age > telemetry.ControlPowerMaxAge(rd.Data) || skew < -maxSkew || skew > maxSkew || !finiteFuseValue(observation.PowerW) {
+			continue
+		}
+		total += math.Min(demand.powerW, math.Max(0, observation.PowerW))
+	}
+	return total
 }

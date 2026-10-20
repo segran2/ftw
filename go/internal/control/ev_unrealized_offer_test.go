@@ -8,8 +8,8 @@ import (
 )
 
 // A stable current offer is not proof that its power is already inside the
-// site meter. These incident replays specify the missing EV-priority behavior;
-// they intentionally fail until the reservation accounts for unrealized offers.
+// site meter. These incident replays require the battery to leave room for
+// the unrealized part of a stable EV offer.
 // This is a battery-allocation regression, not an Easee hardware simulator.
 func TestEVBatteryReservesUnrealizedStableOffer(t *testing.T) {
 	for _, tc := range []struct {
