@@ -60,7 +60,7 @@ func TestEVSiteHeadroomProjection(t *testing.T) {
 			if tc.modify != nil {
 				tc.modify(&f, &c, &a, &p, &at)
 			}
-			got := projectEVHeadroom(f, p, 230, c, a, at, now)
+			got := projectEVHeadroom(f, p, 230, c, a, []float64{4519.5, 4719.6, 4475.8}, at, now)
 			if (got != nil) != tc.want {
 				t.Fatalf("projection=%+v want present=%v", got, tc.want)
 			}
@@ -73,7 +73,7 @@ func TestEVSiteHeadroomProjection(t *testing.T) {
 
 func TestEVSiteHeadroomServerContext(t *testing.T) {
 	tel := telemetry.NewStore()
-	tel.Update("meter", telemetry.DerMeter, 13843, nil, []byte(`{"l1_a":19.65,"l2_a":20.52,"l3_a":19.46}`))
+	tel.Update("meter", telemetry.DerMeter, 13843, nil, []byte(`{"l1_a":19.65,"l2_a":20.52,"l3_a":19.46,"l1_w":4519.5,"l2_w":4719.6,"l3_w":4475.8}`))
 	tel.Update("battery", telemetry.DerBattery, 9383, nil, nil)
 	tel.DriverHealthMut("meter").RecordSuccess()
 	tel.DriverHealthMut("battery").RecordSuccess()
@@ -99,5 +99,16 @@ func TestEVSiteHeadroomServerContext(t *testing.T) {
 	tel.DriverHealthMut("meter").SetDeviceFault(true, "test")
 	if got = srv.evSiteHeadroom(f, lp, "meter", now); got != nil {
 		t.Fatalf("faulted meter contributed %+v", got)
+	}
+}
+
+func TestEVSiteHeadroomRejectsInvalidPhasePower(t *testing.T) {
+	now := time.Now()
+	f := ControlFeedback{Kind: "ev", Reason: "power_below_target", ReadingsFresh: true, SentW: watts(10350), ActualW: watts(4155), ObservedAtMs: now.UnixMilli()}
+	fuse := config.Fuse{MaxAmps: 25, Phases: 3, Voltage: 230}
+	for _, powers := range [][]float64{nil, {4600, 4600}, {math.NaN(), 4600, 4600}, {4600, math.Inf(1), 4600}, {4600, 4600, math.Inf(-1)}} {
+		if got := projectEVHeadroom(f, 3, 230, fuse, []float64{20, 20, 20}, powers, now, now); got != nil {
+			t.Fatalf("invalid phase power produced explanation: %+v", got)
+		}
 	}
 }
