@@ -419,6 +419,19 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 		set("waiting", "not_connected", "info")
 		return
 	}
+	// A positive clamp explains the lower offer, not prolonged zero delivery.
+	// An explicit load-balancer reason can explain zero delivery. Keep known
+	// safety pauses and unconfirmed/stale commands authoritative.
+	evMismatchObserved := !cmd.PowerMismatchSince.IsZero() && cmd.LastObservation.Sub(cmd.PowerMismatchSince) >= 2*time.Minute
+	noPowerObserved := evMismatchObserved || !cmd.NoPowerSince.IsZero() && cmd.NoPowerAt.Sub(cmd.NoPowerSince) >= 2*time.Minute
+	if f.Kind == "ev" && commanded && cmd.Result == "accepted" &&
+		f.LimitedBy != "load_balancer" &&
+		coreReason != "site_meter_stale" && coreReason != "site_phase_currents_stale" && coreReason != "fuse_cooldown" &&
+		f.SentW != nil && *f.SentW > 100 && f.ActualW != nil && math.Abs(*f.ActualW) < 100 &&
+		f.OfferedA != nil && *f.OfferedA > 0 && noPowerObserved {
+		set("warning", "no_power_response", "warning")
+		return
+	}
 	if f.RequestedA != nil && f.DeviceLimitA != nil && *f.RequestedA > *f.DeviceLimitA+0.5 {
 		set("limited", "device_limit", "warning")
 		return
@@ -471,7 +484,11 @@ func classifyControlFeedback(f *ControlFeedback, cmd telemetry.CommandEvidence, 
 	if cmd.LastGapW != nil {
 		gap = *cmd.LastGapW
 	}
-	if !cmd.PowerMismatchSince.IsZero() && now.Sub(cmd.PowerMismatchSince) >= grace && gap > telemetry.ControlToleranceW(*f.SentW) {
+	mismatchSettled := !cmd.PowerMismatchSince.IsZero() && now.Sub(cmd.PowerMismatchSince) >= grace
+	if f.Kind == "ev" {
+		mismatchSettled = evMismatchObserved
+	}
+	if mismatchSettled && gap > telemetry.ControlToleranceW(*f.SentW) {
 		if reason := batteryChargeLevelLimit(f); reason != "" {
 			set("limited", reason, "info")
 			return
@@ -543,6 +560,9 @@ func batteryChargeLevelLimit(f *ControlFeedback) string {
 // evidence to the existing endpoint without changing stored loadpoint state.
 type loadpointFeedbackView struct {
 	loadpoint.State
+	// Level is current_soc, left out for a visitor's car: nobody knows its
+	// level, and the box does not guess one (docs/cars.md).
+	Level           *float64         `json:"current_soc,omitempty"`
 	ControlFeedback *ControlFeedback `json:"control_feedback,omitempty"`
 }
 
@@ -556,7 +576,12 @@ func (s *Server) loadpointsWithFeedback(states []loadpoint.State) []loadpointFee
 	}
 	out := make([]loadpointFeedbackView, 0, len(states))
 	for _, st := range states {
-		out = append(out, loadpointFeedbackView{st, byDriver[st.DriverName]})
+		view := loadpointFeedbackView{State: st, ControlFeedback: byDriver[st.DriverName]}
+		if !st.SoCUnknown {
+			level := st.CurrentSoC
+			view.Level = &level
+		}
+		out = append(out, view)
 	}
 	return out
 }

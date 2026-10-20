@@ -12,6 +12,7 @@ package loadpoint
 import (
 	"crypto/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,9 +163,46 @@ type State struct {
 	VehicleStale         bool    `json:"vehicle_stale,omitempty"`
 	VehicleSoCAgeS       int64   `json:"vehicle_soc_age_s,omitempty"`
 	SoCSource            string  `json:"soc_source,omitempty"`
+	// PlanningSoC is the state of charge a new plan starts from. The API
+	// sets it from PlanningStartSoC so the charging view matches the planner.
+	// PlanningFromVehicle is true when that value came from a car reading.
+	PlanningSoC         *float64 `json:"planning_soc,omitempty"`
+	PlanningFromVehicle bool     `json:"planning_from_vehicle,omitempty"`
 	// VehicleName is the vehicle profile the session identified (via the
-	// charging transaction's idTag/idToken), empty when none matched.
+	// charging transaction's idTag/idToken), empty when none matched. With
+	// cars it is the session's car's name.
 	VehicleName string `json:"vehicle_name,omitempty"`
+	// The car on the charger and how the box knows it (docs/cars.md). Empty
+	// while nothing is plugged in. The registry names them carId,
+	// carIdentifiedBy and carCorrectedFrom.
+	Session          string   `json:"session,omitempty"`
+	CarID            string   `json:"car_id,omitempty"`
+	CarIdentifiedBy  string   `json:"car_identified_by,omitempty"`
+	CarCorrected     bool     `json:"car_corrected,omitempty"`
+	CarCorrectedFrom string   `json:"car_corrected_from,omitempty"`
+	Choose           []string `json:"choose,omitempty"`
+	// SoCUnknown is a visitor's session: no level, and CurrentSoC counts
+	// only what was delivered. Routes leave the level out.
+	SoCUnknown bool `json:"-"`
+	// Observed is set once the charger has reported since the box started:
+	// before that, PluggedIn says nothing about the cable.
+	Observed bool `json:"-"`
+	// LevelFromCar is set while the session's level is anchored to a
+	// reading the car itself made, and SoCConfirmedAt is when the level was
+	// read or set; zero when it is not confirmed.
+	LevelFromCar   bool      `json:"-"`
+	SoCConfirmedAt time.Time `json:"-"`
+	// PluggedAt is when this connection was first seen, and SessionKey the
+	// charger's own session identity when it has one. Together they tell
+	// one plug-in from the next.
+	PluggedAt  time.Time `json:"-"`
+	SessionKey string    `json:"-"`
+	// CarMaxW is the most the session car's own charger takes, and
+	// CarChargeLimit the car's charge limit while its level is exact; zero
+	// when unknown. The plan and the reserve hold to them (LimitPower,
+	// PlanningTarget).
+	CarMaxW        float64 `json:"-"`
+	CarChargeLimit float64 `json:"-"`
 
 	// MinChargeW / MaxChargeW / AllowedStepsW are repeated here so the
 	// UI has everything for rendering in one fetch.
@@ -279,6 +317,8 @@ type Manager struct {
 
 	// intentMu serializes durable goal and solar edits with config reloads.
 	intentMu sync.Mutex
+	// levelObserver hears a level set by hand (SetLevelObserver).
+	levelObserver func(id string, soc float64, at time.Time)
 	// scheduleSaver, if non-nil, is invoked synchronously whenever a
 	// schedule is set or cleared. Wired by main.go to persist via
 	// state.SaveConfig. Left nil in tests / sites without storage.
@@ -358,6 +398,13 @@ type loadpointRuntime struct {
 	sessionID                string
 	socRetention             string
 	completionNotified       bool
+	// goalRiskNotified latches charging.goal_at_risk once per plug-in.
+	// vehicleAnchored is true once the car itself reported a level this
+	// session; chargedSinceStart once it drew power in this process, so a
+	// restart beside a car that is already done says nothing.
+	goalRiskNotified  bool
+	vehicleAnchored   bool
+	chargedSinceStart bool
 	Config
 
 	pluggedIn            bool
@@ -386,20 +433,25 @@ type loadpointRuntime struct {
 	// every plug-in transition (prev !pluggedIn → now pluggedIn).
 	sessionPluginSoC float64
 
-	// vehicleName is the vehicle profile applied for this session after
-	// the charging transaction identified the car (Manager.
-	// ApplyVehicleProfile); baseCapacityWh remembers the capacity to
-	// restore on plug-out — the profile is session-scoped, the next car
-	// may be a different one.
-	vehicleName    string
+	// baseCapacityWh is the capacity to restore on plug-out after the car
+	// itself reported its own for the session (capacityFromCar): the next
+	// car may be a different one.
 	baseCapacityWh float64
 
+	// car is the session's car (SetCarBinding), and socUnknown is a
+	// visitor's session, whose level nobody knows.
+	car        CarBinding
+	socUnknown bool
+	// configCapacityWh is config.yaml's vehicle_capacity_wh, which a
+	// binding with no capacity of its own falls back to. observed is set
+	// once the charger has reported since the box started.
+	configCapacityWh float64
+	observed         bool
+
 	// capacityFromCar is set when the vehicle itself reported its battery
-	// capacity (OCPP 2.0.1 NotifyEVChargingNeeds), which outranks both the
-	// configured value and a profile's — one is measured, the others are
-	// an operator's estimate of the car that usually parks here. It shares
-	// baseCapacityWh with vehicleName: whichever arrives first snapshots
-	// the configured capacity, and plug-out restores it either way.
+	// capacity (OCPP 2.0.1 NotifyEVChargingNeeds), which outranks the
+	// session car's — one is measured, the other is an owner's estimate.
+	// Plug-out restores baseCapacityWh.
 	capacityFromCar bool
 
 	// schedule carries the operator's persistent intent. Empty when
@@ -428,7 +480,12 @@ type loadpointRuntime struct {
 
 	// socConfirmed is true only after a level from the user or a matched car.
 	// A configured/default plug-in level remains a planning assumption.
-	socConfirmed bool
+	// socConfirmedAt is when the user set it or the car measured it. Zero means the
+	// time was not kept (for example a level restored after restart);
+	// a car reading may then replace it. A newer confirmation wins over
+	// an older car measurement.
+	socConfirmed   bool
+	socConfirmedAt time.Time
 
 	// surplusWithheld is set by the controller each tick: true when WE
 	// are intentionally withholding power from this loadpoint (a
@@ -551,7 +608,7 @@ func (m *Manager) Load(cfgs []Config) {
 		if c.ID == "" {
 			continue
 		}
-		lp := &loadpointRuntime{Config: c}
+		lp := &loadpointRuntime{Config: c, configCapacityWh: c.VehicleCapacityWh}
 		if existing := m.byID[c.ID]; existing != nil && existing.DriverName == c.DriverName {
 			lp.sessionGeneration = existing.sessionGeneration
 			lp.connectionGeneration = existing.connectionGeneration
@@ -597,6 +654,9 @@ func (m *Manager) Load(cfgs []Config) {
 			lp.notRequestingSince = existing.notRequestingSince
 			lp.chargingDeclined = existing.chargingDeclined
 			lp.socConfirmed = existing.socConfirmed && existing.DriverName == c.DriverName
+			if lp.socConfirmed {
+				lp.socConfirmedAt = existing.socConfirmedAt
+			}
 			if existing.DriverName == c.DriverName {
 				lp.sessionDeviceID = existing.sessionDeviceID
 				lp.sessionID = existing.sessionID
@@ -618,13 +678,22 @@ func (m *Manager) Load(cfgs []Config) {
 			lp.chargingSteadySince = existing.chargingSteadySince
 			lp.stoppedSince = existing.stoppedSince
 			lp.steadyRunArmed = existing.steadyRunArmed
-			lp.vehicleName = existing.vehicleName
 			lp.capacityFromCar = existing.capacityFromCar
-			if existing.vehicleName != "" || existing.capacityFromCar {
+			lp.car = existing.car
+			lp.observed = existing.observed
+			if existing.DriverName == c.DriverName {
+				lp.socUnknown = existing.socUnknown
+			}
+			if existing.car.CapacityWh > 0 {
+				// The car's capacity outlives a config reload, as the car
+				// does. A visitor's is the charger's, from the new config.
+				lp.Config.VehicleCapacityWh = existing.car.CapacityWh
+			}
+			if existing.capacityFromCar {
 				// An identified car survives config hot-reload: keep the
 				// session's applied capacity, but re-base the plug-out
-				// restore on the NEW config's value.
-				lp.baseCapacityWh = c.VehicleCapacityWh
+				// restore on the NEW config's value, or the car's.
+				lp.baseCapacityWh = lp.Config.VehicleCapacityWh
 				if existing.VehicleCapacityWh > 0 {
 					lp.Config.VehicleCapacityWh = existing.VehicleCapacityWh
 				}
@@ -757,7 +826,11 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 		}
 		lp.sessionPluginSoC = anchor
 		lp.socConfirmed = false
+		lp.socUnknown = false
 		lp.completionNotified = false
+		lp.goalRiskNotified = false
+		lp.vehicleAnchored = false
+		lp.chargedSinceStart = false
 		lp.deliveredHistory = nil
 		lp.notRequestingSince = time.Time{}
 		lp.chargingDeclined = false
@@ -766,11 +839,10 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 		// Plug-out: drop any pending completion timer / latch.
 		lp.notRequestingSince = time.Time{}
 		lp.chargingDeclined = false
-		if lp.vehicleName != "" || lp.capacityFromCar {
-			// The identified car left with its session — the next one may
-			// be different, so restore the loadpoint's own capacity.
+		if lp.capacityFromCar {
+			// The car that measured its own capacity left with its
+			// session — the next one may be different.
 			lp.VehicleCapacityWh = lp.baseCapacityWh
-			lp.vehicleName = ""
 			lp.capacityFromCar = false
 			lp.baseCapacityWh = 0
 		}
@@ -865,10 +937,22 @@ func (m *Manager) observe(id string, pluggedIn bool, powerW, deliveredWh float64
 	if pluggedIn {
 		lp.currentSoC = estimateSoC(lp.sessionPluginSoC,
 			deliveredWh, lp.VehicleCapacityWh)
+		if powerW >= DeliveringW {
+			lp.chargedSinceStart = true
+		}
+		// A car that reports nothing itself is done when the box's own
+		// estimate, from a level someone set, reaches the target. Said in
+		// kWh, which the box measured; the level is an estimate.
+		if !lp.completionNotified && !lp.vehicleAnchored && lp.socConfirmed && lp.chargedSinceStart &&
+			lp.targetSoC > 0 && lp.currentSoC >= lp.targetSoC && deliveredWh >= minCompletionWh {
+			lp.completionNotified = true
+			fired = append(fired, events.ChargingSessionComplete{LoadpointID: id, KWh: deliveredWh / 1000, At: now})
+		}
 	} else {
 		lp.currentSoC = 0
 	}
 	lp.updatedAtMs = now.UnixMilli()
+	lp.observed = true
 	m.mu.Unlock()
 
 	return fired, bus
@@ -998,33 +1082,6 @@ func (m *Manager) HydrateSurplusOnly(load func(id string) (bool, bool)) {
 	}
 }
 
-// ApplyVehicleProfile switches the loadpoint to an identified car for the
-// rest of the session: capacityWh (when > 0) replaces the configured
-// vehicle capacity so SoC inference and planner energy sizing follow the
-// car actually plugged in. Reverted on plug-out; survives config
-// hot-reloads (Load carries it across). The caller applies the profile's
-// policy fields (surplus_only, target) through the ordinary setters.
-// Returns false for an unknown loadpoint id.
-func (m *Manager) ApplyVehicleProfile(id, vehicleName string, capacityWh float64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	lp, ok := m.byID[id]
-	if !ok {
-		return false
-	}
-	if lp.vehicleName == "" && !lp.capacityFromCar {
-		lp.baseCapacityWh = lp.VehicleCapacityWh
-	}
-	lp.vehicleName = vehicleName
-	// A capacity the car measured for this session outranks the profile's
-	// configured guess, whichever arrived first.
-	if capacityWh > 0 && !lp.capacityFromCar {
-		lp.VehicleCapacityWh = capacityWh
-	}
-	lp.updatedAtMs = m.now().UnixMilli()
-	return true
-}
-
 // SetSessionCapacityWh overrides the vehicle capacity for the rest of the
 // session with a figure the car itself reported — OCPP 2.0.1
 // NotifyEVChargingNeeds carries the EV's own battery capacity.
@@ -1045,7 +1102,7 @@ func (m *Manager) SetSessionCapacityWh(id string, capacityWh float64) bool {
 	if !ok {
 		return false
 	}
-	if lp.vehicleName == "" && !lp.capacityFromCar {
+	if !lp.capacityFromCar {
 		lp.baseCapacityWh = lp.VehicleCapacityWh
 	}
 	lp.capacityFromCar = true
@@ -1065,21 +1122,27 @@ func (m *Manager) SetSessionCapacityWh(id string, capacityWh float64) bool {
 // Returns false for unknown IDs or when the loadpoint is unplugged.
 func (m *Manager) SetCurrentSoC(id string, socPct float64) bool {
 	m.sessionMu.Lock()
-	defer m.sessionMu.Unlock()
 	m.mu.Lock()
-	defer func() { m.mu.Unlock(); m.persistSession(id) }()
 	lp, ok := m.byID[id]
-	if !ok {
-		return false
-	}
-	if !lp.pluggedIn || !finite(socPct) {
+	if !ok || !lp.pluggedIn || !finite(socPct) {
+		m.mu.Unlock()
+		m.persistSession(id)
+		m.sessionMu.Unlock()
 		return false
 	}
 	// A correction gives the planner another chance to offer energy.
 	// Sustained refusal can re-arm after SessionCompletionTimeout.
 	lp.chargingDeclined = false
 	lp.notRequestingSince = time.Time{}
-	reanchorSoCLocked(lp, socPct)
+	at := m.now()
+	reanchorSoCLocked(lp, socPct, at)
+	soc, observer := lp.currentSoC, m.levelObserver
+	m.mu.Unlock()
+	m.persistSession(id)
+	m.sessionMu.Unlock()
+	if observer != nil {
+		observer(id, soc, at)
+	}
 	return true
 }
 
@@ -1091,10 +1154,10 @@ func (m *Manager) AnchorVehicleSoC(id string, socPct float64) bool {
 	return m.AnchorVehicleSoCAt(id, socPct, time.Time{})
 }
 
-// AnchorVehicleSoCAt anchors a car reading at the time the car measured
-// it. Energy delivered since then moves the estimate past the reading, so
-// a cloud SoC that is half an hour old stays useful. A zero observedAt
-// means now. False when the session's energy at observedAt is unknown.
+// AnchorVehicleSoCAt anchors a qualified car reading at its measurement
+// time. Known energy delivered since then moves the estimate forward. When
+// history does not cover that time, adopt the reading without adding unknown
+// energy. A zero observedAt means now.
 func (m *Manager) AnchorVehicleSoCAt(id string, socPct float64, observedAt time.Time) bool {
 	m.sessionMu.Lock()
 	m.mu.Lock()
@@ -1116,17 +1179,20 @@ func (m *Manager) AnchorVehicleSoCAt(id string, socPct float64, observedAt time.
 		return false
 	}
 	deliveredAt := lp.deliveredWhSession
-	if !observedAt.IsZero() {
-		// A reading from before plug-in may predate a drive home.
-		if observedAt.Before(lp.connectionObservedAt.Add(-anchorBeforePlugSlack)) {
-			return false
-		}
-		var ok bool
-		if deliveredAt, ok = lp.deliveredAt(observedAt); !ok {
-			return false
+	if !observedAt.IsZero() && !observedAt.Before(lp.connectionObservedAt.Add(-anchorBeforePlugSlack)) {
+		if known, ok := lp.deliveredAt(observedAt); ok {
+			deliveredAt = known
 		}
 	}
-	reanchorSoCAtLocked(lp, socPct, deliveredAt)
+	// A reading before this connection or outside retained history carries
+	// no known energy delta. Keep its source time even in that raw fallback;
+	// returning false made the caller re-anchor it as a reading taken now.
+	reanchorSoCAtLocked(lp, socPct, deliveredAt, m.now())
+	if !observedAt.IsZero() {
+		// Compare car measurements by source time, not cloud delivery time.
+		lp.socConfirmedAt = observedAt
+	}
+	lp.vehicleAnchored = true
 	if lp.targetSoC > 0 && lp.currentSoC >= lp.targetSoC && !lp.completionNotified {
 		lp.completionNotified = true
 		completion = &events.ChargingSessionComplete{LoadpointID: id, KWh: lp.deliveredWhSession / 1000, At: m.now()}
@@ -1204,15 +1270,20 @@ func (lp *loadpointRuntime) deliveredAt(t time.Time) (float64, bool) {
 // m.mu and have verified the loadpoint is plugged in. Shared by the
 // manual (SetCurrentSoC) and automatic (AnchorVehicleSoC) correction
 // paths so they stay arithmetically identical.
-func reanchorSoCLocked(lp *loadpointRuntime, soc float64) {
-	reanchorSoCAtLocked(lp, soc, lp.deliveredWhSession)
+func reanchorSoCLocked(lp *loadpointRuntime, soc float64, at time.Time) {
+	reanchorSoCAtLocked(lp, soc, lp.deliveredWhSession, at)
 }
 
 // reanchorSoCAtLocked sets the anchor so the estimate equals soc when the
-// session had delivered deliveredWh.
-func reanchorSoCAtLocked(lp *loadpointRuntime, soc, deliveredWh float64) {
+// session had delivered deliveredWh. at is when this confirmation happened.
+func reanchorSoCAtLocked(lp *loadpointRuntime, soc, deliveredWh float64, at time.Time) {
 	soc = units.ClampFraction(soc)
 	lp.socConfirmed = true
+	lp.socUnknown = false
+	if at.IsZero() {
+		at = time.Now()
+	}
+	lp.socConfirmedAt = at
 	// Re-anchor: new_anchor + delivered/capacity == soc.
 	delivered := 0.0
 	if lp.VehicleCapacityWh > 0 {
@@ -1222,7 +1293,31 @@ func reanchorSoCAtLocked(lp *loadpointRuntime, soc, deliveredWh float64) {
 	// energy already delivered. Clamp the resulting level, not the offset.
 	lp.sessionPluginSoC = soc - delivered
 	lp.currentSoC = estimateSoC(lp.sessionPluginSoC, lp.deliveredWhSession, lp.VehicleCapacityWh)
-	lp.updatedAtMs = time.Now().UnixMilli()
+	lp.updatedAtMs = at.UnixMilli()
+}
+
+// VehicleSoCSupersedes reports whether a car measurement should replace the
+// level the plan is using. An unconfirmed plug-in assumption always loses
+// to a usable car reading. A confirmed level loses only when the measurement
+// is newer than that confirmation.
+func (m *Manager) VehicleSoCSupersedes(id string, observedAt time.Time) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	lp := m.byID[id]
+	if lp == nil || !lp.pluggedIn {
+		return false
+	}
+	return vehicleSupersedesLocked(lp, observedAt)
+}
+
+func vehicleSupersedesLocked(lp *loadpointRuntime, observedAt time.Time) bool {
+	if observedAt.IsZero() {
+		return false
+	}
+	if !lp.socConfirmed || lp.socConfirmedAt.IsZero() {
+		return true
+	}
+	return observedAt.After(lp.socConfirmedAt)
 }
 
 func (lp *loadpointRuntime) snapshot() State {
@@ -1254,7 +1349,8 @@ func (lp *loadpointRuntime) snapshot() State {
 		Schedule:                 lp.schedule,
 		ChargingDeclined:         lp.chargingDeclined,
 		SoCRetention:             lp.socRetention,
-		VehicleName:              lp.vehicleName,
+		CarMaxW:                  lp.car.MaxW,
+		CarChargeLimit:           lp.car.ChargeLimit,
 		CommandedW:               lp.commandedW,
 		CommandedReason:          lp.commandedReason,
 		CommandedKnown:           lp.commandedKnown,
@@ -1273,7 +1369,31 @@ func (lp *loadpointRuntime) snapshot() State {
 	if !lp.powerAt.IsZero() {
 		st.PowerUpdatedAtMs = lp.powerAt.UnixMilli()
 	}
-	if st.PluggedIn && st.SoCSource == "" && !lp.socConfirmed {
+	if st.PluggedIn {
+		st.VehicleName = lp.car.Name
+		st.Session = lp.car.Session
+		st.CarID = lp.car.ID
+		st.CarIdentifiedBy = lp.car.IdentifiedBy
+		st.CarCorrected = lp.car.Corrected
+		st.CarCorrectedFrom = lp.car.CorrectedFrom
+		if lp.car.Choose != "" {
+			st.Choose = strings.Split(lp.car.Choose, ",")
+		}
+		st.PluggedAt = lp.connectionObservedAt
+		if lp.sessionDeviceID != "" && lp.sessionID != "" {
+			st.SessionKey = lp.sessionDeviceID + "|" + lp.sessionID
+		}
+	}
+	st.Observed = lp.observed
+	st.LevelFromCar = lp.vehicleAnchored
+	if lp.socConfirmed {
+		st.SoCConfirmedAt = lp.socConfirmedAt
+	}
+	switch {
+	case st.PluggedIn && lp.socUnknown:
+		st.SoCUnknown = true
+		st.SoCSource = "unknown"
+	case st.PluggedIn && st.SoCSource == "" && !lp.socConfirmed:
 		st.SoCSource = "assumed"
 	}
 	st.ManualCommandUpdatedAt = lp.manualCommandUpdatedAt
@@ -1304,20 +1424,54 @@ func (m *Manager) SetSchedule(id string, s Schedule) bool {
 // failure the previous schedule and derived target remain in effect.
 // The callback runs without m.mu so readers can keep seeing the current goal.
 func (m *Manager) SetScheduleChecked(id string, s Schedule) (bool, error) {
+	return m.setSchedule(id, s, true)
+}
+
+// setSchedule stores a goal; save runs the schedule saver first.
+func (m *Manager) setSchedule(id string, s Schedule, save bool) (bool, error) {
+	return m.setScheduleAs(id, func(Schedule) (Schedule, bool) { return s, true }, save)
+}
+
+// setScheduleWith stores the goal next returns from the loadpoint's current
+// schedule, read under intentMu, without the saver. next reports false to
+// leave the schedule alone.
+func (m *Manager) setScheduleWith(id string, next func(cur Schedule) (Schedule, bool)) (bool, error) {
+	return m.setScheduleAs(id, next, false)
+}
+
+func (m *Manager) setScheduleAs(id string, next func(cur Schedule) (Schedule, bool), save bool) (bool, error) {
 	m.intentMu.Lock()
 	defer m.intentMu.Unlock()
 	m.mu.RLock()
 	lp, ok := m.byID[id]
 	saver := m.scheduleSaver
+	now, loc := m.now(), m.loc
+	var cur Schedule
+	if ok {
+		cur = lp.schedule
+	}
 	m.mu.RUnlock()
 	if !ok {
 		return false, nil
 	}
+	s, change := next(cur)
+	if !change {
+		return true, nil
+	}
 	s.Normalize()
+	// Keep the household clock the owner picked: time_of_day_min when the
+	// request has it, else the UTC minute read on today's date. Clients
+	// still read its UTC minute today. A cleared goal has no ready time.
+	if s.Empty() {
+		s = s.withoutClock()
+	} else {
+		s.readClock(now, loc)
+		s.TimeOfDayMinUTC = utcMinuteToday(now, s.clock, loc)
+	}
 	if s.FinishAtVehicleLimit {
 		s.IntentID = rand.Text()
 		if !s.Recurring {
-			s.FirstDeadlineMS = s.NextDeadlineUTC(m.now(), m.loc).UnixMilli()
+			s.FirstDeadlineMS = s.NextDeadlineUTC(now, loc).UnixMilli()
 		} else {
 			s.FirstDeadlineMS = 0
 		}
@@ -1328,7 +1482,7 @@ func (m *Manager) SetScheduleChecked(id string, s Schedule) (bool, error) {
 	// The weekday mask is 7 bits; a stray high bit from a future
 	// client is dropped rather than left to confuse the roll.
 	s.Days &= 0x7F
-	if saver != nil {
+	if saver != nil && save {
 		if err := saver(id, s); err != nil {
 			return true, err
 		}
@@ -1402,11 +1556,21 @@ func (m *Manager) ClearScheduleChecked(id string) (bool, error) {
 // silently ignored — the operator may have renamed a loadpoint, and
 // resurrecting a schedule under the new ID would be surprising.
 //
-// Does NOT invoke the saver — this is a load path. Does NOT call
-// RollSchedules either; the controller's first tick will handle that.
-func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) {
+// A row saved before Core kept the household clock holds only a UTC
+// minute, which does not say what offset it was saved with. It is read
+// on today's date — the time the owner sees now — and saved back once so
+// the next DST change cannot move it. A clock out of range is read the
+// same way. The first failed save is returned; the goal is used either
+// way and read again at the next boot. Does NOT call RollSchedules; the
+// controller's first tick will handle that.
+func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) error {
 	m.intentMu.Lock()
 	defer m.intentMu.Unlock()
+	var failed error
+	m.mu.RLock()
+	saver := m.scheduleSaver
+	now, loc := m.now(), m.loc
+	m.mu.RUnlock()
 	for _, state := range m.States() {
 		id := state.ID
 		s, found := loader(id)
@@ -1414,10 +1578,16 @@ func (m *Manager) HydrateSchedules(loader func(id string) (Schedule, bool)) {
 			continue
 		}
 		s.Normalize()
+		if s.readClock(now, loc) && saver != nil {
+			if err := saver(id, s); err != nil && failed == nil {
+				failed = err
+			}
+		}
 		m.mu.Lock()
 		m.byID[id].schedule = s
 		m.mu.Unlock()
 	}
+	return failed
 }
 
 // RollSchedules brings each loadpoint's one-shot target_soc / target_time

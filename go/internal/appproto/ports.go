@@ -2,11 +2,14 @@ package appproto
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/mpc"
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 // UptimeClock is the only clock this protocol trusts for ages.
@@ -80,6 +83,9 @@ type Snapshot struct {
 	PVW      float64
 	BatteryW float64
 	LoadW    float64
+	// LoadWKnown says Core has a valid live load estimate. Unknown load is
+	// omitted from field 6; a known zero remains a real reading.
+	LoadWKnown bool
 	// BatterySoC is a fraction in [0,1], per the SI rule. The wire carries
 	// permille, converted at the edge of this package.
 	BatterySoC float64
@@ -92,6 +98,16 @@ type Snapshot struct {
 	// node rather than a dead one showing an invented zero.
 	EVW      float64
 	EVWKnown bool
+
+	// GridPhaseA is the site meter's current on L1, L2 and L3 in amps, signed
+	// by the site convention: positive while the phase draws from the grid.
+	// Nil for a phase the site does not have or the meter does not report,
+	// and all nil while the meter is offline. The wire carries tenths of an
+	// ampere, converted at the edge of this package.
+	GridPhaseA [3]*float64
+	// FuseA is the main fuse per phase, the scale the phases are read
+	// against. Sent only with at least one phase.
+	FuseA float64
 
 	Sources []Source
 
@@ -153,6 +169,12 @@ type Loadpoints interface {
 	ClearHold(id string)
 	// ObservedHold is the hold as the box holds it right now.
 	ObservedHold(id string, now time.Time) (loadpoint.ManualHold, bool)
+	// HoldIfOwn sets h only while no live hold of someone other than
+	// h.SetBy is in place, checked and written as one step. It reports
+	// whether it set h.
+	HoldIfOwn(id string, h loadpoint.ManualHold, now time.Time) bool
+	// ClearHoldIfOwn clears the hold only while the live one is setBy's.
+	ClearHoldIfOwn(id, setBy string, now time.Time) bool
 	// Boost installs a battery-boost lease, refusing when live state cannot
 	// safely honour it. The implementation carries whatever replan
 	// bookkeeping the HTTP enable route does.
@@ -179,6 +201,44 @@ type Loadpoints interface {
 	SetSurplusOnly(id string, v bool) (prev bool, ok bool)
 	// ObservedSurplusOnly is the flag as the box holds it now.
 	ObservedSurplusOnly(id string) (v bool, ok bool)
+	// Readings is every charger as the box holds it now, in its configured
+	// order: what a watch's now draws.
+	Readings() []LoadpointReading
+}
+
+// Cars is the box's cars (docs/cars.md): the car ops, behind the same calls
+// GET /api/cars reads.
+type Cars interface {
+	// Cars is every car, as GET /api/cars carries it.
+	Cars() []protocol.Car
+	Add(c protocol.Car) (protocol.Car, error)
+	UpdateCar(id string, u cars.Update) (protocol.Car, error)
+	Remove(id string) error
+	SetGoal(id string, goal *protocol.CarGoal, clear bool, surplusOnly *bool) (protocol.Car, error)
+	SetLevel(id string, soc float64) (protocol.Car, error)
+	// SetSessionGoal and SetSessionLevel act on a charger's session: its
+	// car, or the session itself while its car is unknown.
+	SetSessionGoal(chargerID string, goal *protocol.CarGoal, clear bool, surplusOnly *bool) (protocol.ChargerCar, error)
+	SetSessionLevel(chargerID string, soc float64) (protocol.ChargerCar, error)
+	SetSessionCar(chargerID, session, carID string) (protocol.ChargerCar, error)
+}
+
+// LoadpointReading is one charger as the box holds it now.
+type LoadpointReading struct {
+	ID      string
+	Plugged bool
+	// Car names the car on the charger, and SoCSource, SoCAgeS and
+	// SoCEstimate say where its level came from (docs/cars.md).
+	Car         protocol.ChargerCar
+	SoCSource   string
+	SoCAgeS     *int64
+	SoCEstimate bool
+	// SoC is the car's level as a fraction in [0,1], meaningful only while
+	// SoCKnown.
+	SoC      float64
+	SoCKnown bool
+	// PowerW is the charger's draw, positive while charging.
+	PowerW float64
 }
 
 // PlannerPrefsSnapshot is the household planner preference as the box holds
@@ -208,6 +268,12 @@ type PlanReader interface {
 	Rev() uint64
 	// CeilingW is the import ceiling being defended, nil when there is none.
 	CeilingW() *int64
+}
+
+// PlanChargers is each charger's share of the plan as the box holds it now, read
+// the way GET /api/loadpoints reads it, so a pushed plan and a read agree.
+type PlanChargers interface {
+	PlanChargers(now time.Time) []PlanCharger
 }
 
 // PricePoint is one stored price slot as the box holds it.
@@ -247,6 +313,21 @@ type PriceReader interface {
 }
 
 // Sender delivers an encoded frame to the carrier.
+//
+// Send returns ErrDropped, or an error wrapping it, when the carrier lost
+// that one frame and counted it. The session goes on: what the frame carried
+// is not recorded as sent, so the next frame carries it again.
 type Sender interface {
 	Send(frame []byte) error
+}
+
+// ErrDropped is one frame the carrier lost and counted. See Sender.
+var ErrDropped = errors.New("appproto: the carrier dropped a frame")
+
+// InLineSender is a Sender whose carrier sends bulk after lane 0. SendInLine
+// keeps one bulk frame in line with lane 0 instead, so a reading sent after
+// it never reaches the phone first. The snapshot goes this way: a delta that
+// overtook it would be applied and then overwritten with older values.
+type InLineSender interface {
+	SendInLine(frame []byte) error
 }

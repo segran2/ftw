@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// EnergyplanOptimizer runs the compiled worker on Core's downside forecast.
+// EnergyplanOptimizer runs the compiled worker on the forecast Core selects.
 // Source and builds belong to the private Energyplan repository.
 type EnergyplanOptimizer struct {
 	*ExternalOptimizer
@@ -43,8 +43,8 @@ func energyplanTimeBudget(slots []Slot, p Params) time.Duration {
 		batteries = 1
 	}
 	assets := 3*batteries + 2*len(p.activeLoadpoints())
-	// Core already adjusts PV to one downside horizon. That margin does not
-	// add worker scenarios or change this model's size.
+	// Core sends the point forecast and its caution forecast as separate
+	// requests of this size. Caution adds no worker scenarios.
 	budget := energyplanSmallBudget
 	if len(p.activeLoadpoints()) > 0 {
 		budget = energyplanEVBudget
@@ -65,8 +65,8 @@ func energyplanTimeBudget(slots []Slot, p Params) time.Duration {
 	return budget
 }
 
-// Optimize solves the slots Service has already moved to the PV downside, so
-// the worker never adds a second risk margin.
+// Optimize solves the slots Service selects, including point and caution
+// attempts. The worker never adds a second risk margin.
 func (o *EnergyplanOptimizer) Optimize(ctx context.Context, slots []Slot, p Params) (Plan, error) {
 	budget := energyplanTimeBudget(slots, p)
 	if budget <= 0 {

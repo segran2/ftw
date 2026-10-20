@@ -4,8 +4,8 @@
 // The relay is the only remote path between a box and a phone, and it cannot
 // read a watt: it joins one box uplink to a handful of browser streams under a
 // rendezvous handle and moves opaque bytes between them. Everything that makes
-// those bytes meaningful is in go/internal/appwire (the Noise session) and
-// go/internal/appproto (the messages). See srcfl/ftw-webapp relay/README.md
+// those bytes meaningful is in go/protocol/appwire (the Noise session) and
+// go/protocol (the messages). See srcfl/ftw-webapp relay/README.md
 // for the server's half.
 //
 // One rule shapes the whole file: a dropped connection is this package's
@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,15 +72,28 @@ const (
 	// backoffCap keeps a box off a struggling relay without letting it sulk.
 	backoffCap = 60 * time.Second
 
-	// rotateJitter is how long a box waits before rejoining after an epoch
-	// turned over.
+	// rotateJitter is the longest a box waits before it joins a new epoch's
+	// handle: after its clock turns the hour, or after the relay closed the
+	// old handle.
 	//
-	// Not zero. The relay closes the old handle and the new one appears when
-	// the peer comes back; returning instantly gives it a stronger timing link
-	// between the two protocol handles. The relay already spreads the closes
-	// across five minutes, so a few seconds here weakens that signal without
-	// making the phone wait. It cannot hide IP or connection continuity.
+	// Not zero. Every box turns at the same hour, so this spreads their
+	// joins, and coming back the instant the relay closes the old handle
+	// gives it a stronger timing link between the two protocol handles. It
+	// cannot hide IP or connection continuity.
 	rotateJitter = 5 * time.Second
+
+	// turnRetry is how long a box waits to try the new hour's handle again
+	// when the relay refused it with the old epoch. The relay reads its
+	// clock on its fifteen-second heartbeat, so it can still be on the old
+	// hour that long after ours turned; turnTries tries cover that. After
+	// them the box waits for the relay to close the old room, as it always
+	// has.
+	turnRetry = 5 * time.Second
+	turnTries = 4
+
+	// turnCheck is how often a connected box looks at its clock for a new
+	// hour.
+	turnCheck = time.Second
 
 	// correctionLimit is how many epoch corrections we take at full speed
 	// before backing off. More than a couple means something is wrong rather
@@ -96,7 +110,8 @@ const (
 	// refused there anyway; refusing it here keeps the memory bound local.
 	maxFrameBytes = 65536
 
-	// tickInterval is lane 0's cadence, fixed for the life of a session.
+	// tickInterval is lane 0's cadence over the relay, fixed for the life
+	// of a session.
 	tickInterval = time.Second
 )
 
@@ -114,7 +129,17 @@ type Options struct {
 	// control or the planner.
 	Handler HandlerBuilder
 
+	// ExchangeHandler builds one handler per watch session, with
+	// appproto.Config.Exchange set (ADR 0009). Nil leaves the exchange
+	// socket closed: the box takes no watch, and nothing else changes.
+	ExchangeHandler HandlerBuilder
+
 	Logger *slog.Logger
+
+	// Arrivals hears each finished driver poll (telemetry.Store.Arrivals).
+	// Sessions through FTW Cloud send on it; nil leaves them on the beat
+	// alone, one frame per subscribed period. Relay sessions never use it.
+	Arrivals <-chan struct{}
 
 	// Deadman, when set, arms the dead man's switch: rows posted to the
 	// relay's HTTPS side, claims spoken on every connection. Nil leaves
@@ -157,14 +182,25 @@ type Uplink struct {
 	attempt     int
 	corrections int
 
-	// liveMu guards live, the sessions of the current relay connection,
-	// and liveText, the same connection's text-frame writer (the deadman
-	// claims ride on it). Kept on the uplink so a revoke can reach into
-	// whatever connection is up right now; nil between connections, when
-	// there is nothing to drop and nothing to say.
-	liveMu   sync.Mutex
-	live     *sessions
-	liveText func(string) error
+	// liveMu guards live, the relay connections up right now, oldest first.
+	// Usually one; two for the few minutes after the hour while the box
+	// holds the old handle and the new. Kept on the uplink so a revoke can
+	// reach whatever is up right now; empty between connections, when there
+	// is nothing to drop and nothing to say.
+	liveMu sync.Mutex
+	live   []*liveLink
+
+	// exchanges is the box's table of watch sessions, nil without an
+	// ExchangeHandler. One for the box rather than one per connection, so a
+	// watch's session survives the hour turning under it.
+	exchanges *exchanges
+
+	// slots holds each device's one session, across the relay's
+	// connections and the tunnel through FTW Cloud.
+	slots *slots
+	// tunnel is the table of sessions FTW Cloud carries. It runs whether or
+	// not the relay can be reached.
+	tunnel *Tunnel
 
 	// The dead man's switch bookkeeping: which row ids the relay holds,
 	// so a removed subscription's row is deleted rather than left armed.
@@ -174,18 +210,32 @@ type Uplink struct {
 	deadmanHTTP    *http.Client
 	deadmanRefresh time.Duration
 	readTimeout    time.Duration
+	turnCheck      time.Duration
+	turnRetry      time.Duration
+}
+
+// liveLink is one relay connection's sessions and its text-frame writer,
+// which the deadman claims ride on.
+type liveLink struct {
+	sessions *sessions
+	text     func(string) error
 }
 
 // DropSessionsByAppKey tears down every live session a revoked key holds.
 // Returns how many went; zero is normal when the phone is not connected.
 func (u *Uplink) DropSessionsByAppKey(pub []byte) int {
 	u.liveMu.Lock()
-	live := u.live
+	live := slices.Clone(u.live)
 	u.liveMu.Unlock()
-	if live == nil {
-		return 0
+	dropped := 0
+	for _, l := range live {
+		dropped += l.sessions.dropByAppKey(pub)
 	}
-	return live.dropByAppKey(pub)
+	if u.exchanges != nil {
+		dropped += u.exchanges.dropByAppKey(pub)
+	}
+	dropped += u.tunnel.dropByAppKey(pub)
+	return dropped
 }
 
 // New builds an uplink.
@@ -225,6 +275,8 @@ func New(opts Options) (*Uplink, error) {
 		deadmanPosted:  map[string]bool{},
 		deadmanRefresh: opts.DeadmanRefresh,
 		readTimeout:    defaultReadTimeout,
+		turnCheck:      turnCheck,
+		turnRetry:      turnRetry,
 	}
 	if u.dialer == nil {
 		u.dialer = productionDialer()
@@ -240,6 +292,18 @@ func New(opts Options) (*Uplink, error) {
 	}
 	if u.deadmanRefresh <= 0 {
 		u.deadmanRefresh = deadmanRefreshInterval
+	}
+	u.slots = &slots{}
+	u.tunnel = newTunnel(opts.Handler, opts.Enroll, u.slots, opts.Arrivals, u.log)
+	if opts.ExchangeHandler != nil {
+		u.exchanges = &exchanges{
+			build:    opts.ExchangeHandler,
+			enroll:   opts.Enroll,
+			static:   opts.Enroll.StaticKey(),
+			log:      u.log,
+			now:      time.Now,
+			cmdFloor: ExchangeCmdFloor,
+		}
 	}
 	return u, nil
 }
@@ -257,34 +321,16 @@ func productionDialer() *websocket.Dialer {
 	}
 }
 
-// Run keeps the uplink up until the context ends.
+// Run serves phone sessions carried by FTW Cloud until the context ends.
+// It opens no connection to the retired relay.
 func (u *Uplink) Run(ctx context.Context) error {
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		delay, err := u.once(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			u.log.Warn("app uplink dropped; retrying", "retry_in", delay, "err", err)
-		}
-
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	u.tunnel.Run(ctx)
+	return ctx.Err()
 }
 
 // once dials, serves until the connection ends, and says how long to wait.
 func (u *Uplink) once(ctx context.Context) (time.Duration, error) {
-	epoch := CurrentEpoch(u.now().UnixMilli()) + u.epochOffset
+	epoch := u.epoch()
 	handle, err := Handle(u.opts.Enroll.RendezvousSecret(), epoch)
 	if err != nil {
 		// Unrecoverable and not the network's fault. Back off rather than
@@ -292,14 +338,7 @@ func (u *Uplink) once(ctx context.Context) (time.Duration, error) {
 		return backoffCap, err
 	}
 
-	target := fmt.Sprintf("%s/r/%d/%s/box", u.opts.Endpoint, epoch, handle)
-
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	conn, response, err := u.dialer.DialContext(dialCtx, target, nil)
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
+	conn, err := u.dial(ctx, epoch, handle)
 	if err != nil {
 		return u.backoff(), fmt.Errorf("appuplink: dialling the relay: %w", err)
 	}
@@ -308,20 +347,20 @@ func (u *Uplink) once(ctx context.Context) (time.Duration, error) {
 	// this, an hourly rotation would compound the backoff until a box that
 	// works perfectly waits a minute after every rotation.
 	connectedAt := u.now()
-	code, reason, serveErr := u.serve(ctx, conn)
+	end := u.ride(ctx, u.start(ctx, conn, epoch, handle))
 	if u.now().Sub(connectedAt) >= backoffCap {
 		u.attempt = 0
 	}
 
-	switch code {
+	switch end.code {
 	case CloseRotated:
-		u.adoptEpoch(reason)
+		u.adoptEpoch(end.reason)
 		u.attempt = 0
 		u.corrections = 0
-		u.log.Info("relay epoch rotated", "epoch", CurrentEpoch(u.now().UnixMilli())+u.epochOffset)
+		u.log.Info("relay epoch rotated", "epoch", u.epoch())
 		return time.Duration(u.random() * float64(rotateJitter)), nil
 	case CloseEpoch:
-		u.adoptEpoch(reason)
+		u.adoptEpoch(end.reason)
 		u.corrections++
 		if u.corrections > correctionLimit {
 			return u.backoff(), fmt.Errorf("appuplink: the relay keeps refusing our epoch")
@@ -330,8 +369,169 @@ func (u *Uplink) once(ctx context.Context) (time.Duration, error) {
 		// right after one round trip.
 		return 0, nil
 	default:
-		return u.backoff(), serveErr
+		return u.backoff(), end.err
 	}
+}
+
+// epoch is the epoch the box would join now: its clock's guess, corrected by
+// what the relay last told it.
+func (u *Uplink) epoch() int64 {
+	return CurrentEpoch(u.now().UnixMilli()) + u.epochOffset
+}
+
+// dial opens a socket under one epoch's handle. The relay answers a wrong
+// epoch after the upgrade, with a close, so an open socket is not yet an
+// accepted one.
+func (u *Uplink) dial(ctx context.Context, epoch int64, handle string) (*websocket.Conn, error) {
+	target := fmt.Sprintf("%s/r/%d/%s/box", u.opts.Endpoint, epoch, handle)
+
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	conn, response, err := u.dialer.DialContext(dialCtx, target, nil)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	return conn, err
+}
+
+// link is one relay connection, served on its own goroutine.
+type link struct {
+	epoch int64
+	stop  context.CancelFunc
+	done  chan linkEnd
+}
+
+// linkEnd is how a connection ended: the relay's close code and reason, or
+// the error when it ended some other way.
+type linkEnd struct {
+	code   int
+	reason string
+	err    error
+}
+
+func (u *Uplink) start(ctx context.Context, conn *websocket.Conn, epoch int64, handle string) *link {
+	ctx, stop := context.WithCancel(ctx)
+	l := &link{epoch: epoch, stop: stop, done: make(chan linkEnd, 1)}
+	go func() {
+		defer stop()
+		// The exchange socket rides beside this connection, under the same
+		// epoch and handle, and ends with it.
+		if u.exchanges != nil {
+			go u.keepExchange(ctx, epoch, handle)
+		}
+		code, reason, err := u.serve(ctx, conn)
+		l.done <- linkEnd{code: code, reason: reason, err: err}
+	}()
+	return l
+}
+
+// end stops a connection and waits until its sessions are closed.
+func (l *link) end() {
+	if l == nil {
+		return
+	}
+	l.stop()
+	<-l.done
+}
+
+// doneOf is l.done, or nil, which never fires in a select, when there is no
+// connection.
+func doneOf(l *link) chan linkEnd {
+	if l == nil {
+		return nil
+	}
+	return l.done
+}
+
+// ride serves cur until it ends, and joins each new hour's handle beside it.
+//
+// The relay turns its epoch on the hour and from then on refuses the old
+// one, but it closes each old room only on that room's turn in a five-minute
+// spread. A box that moved only when closed left every phone that dialled in
+// between waiting in an empty room for up to five minutes; on 13 Oct 2026 a
+// phone waited from 09:00 until the relay closed its box's room at 09:03:18.
+// So when the hour turns the box also joins the new handle, and keeps the
+// old one until the relay closes it: a phone already talking to the box keeps
+// it, and a phone that dials the new handle finds it.
+//
+// It returns how the last connection ended, once no other is up to carry on.
+func (u *Uplink) ride(ctx context.Context, cur *link) linkEnd {
+	// Early joins live only as long as this call, so none outlives it.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		next    *link
+		joining chan *link
+		tries   int
+		// tryAt is on the real clock, like every other delay here. Zero
+		// until this hour's turn has been seen.
+		tryAt time.Time
+	)
+	check := time.NewTicker(u.turnCheck)
+	defer check.Stop()
+
+	for {
+		select {
+		case end := <-cur.done:
+			if next == nil || ctx.Err() != nil {
+				next.end()
+				return end
+			}
+			if end.code == CloseRotated {
+				u.adoptEpoch(end.reason)
+			}
+			cur, next = next, nil
+			tries, tryAt = 0, time.Time{}
+			u.attempt, u.corrections = 0, 0
+			u.log.Info("relay epoch rotated", "epoch", cur.epoch, "joined_early", true)
+
+		case <-doneOf(next):
+			// The new handle did not hold. Most often the relay has not
+			// read its clock since the hour and still says the old epoch,
+			// which is not a correction to take. The old room carries on.
+			next = nil
+			tries++
+			tryAt = time.Now().Add(u.turnRetry)
+
+		case l := <-joining:
+			joining = nil
+			if l == nil {
+				tries++
+				tryAt = time.Now().Add(u.turnRetry)
+				continue
+			}
+			next = l
+
+		case <-check.C:
+			want := u.epoch()
+			if next != nil || joining != nil || tries >= turnTries || want <= cur.epoch {
+				continue
+			}
+			if tryAt.IsZero() {
+				tryAt = time.Now().Add(time.Duration(u.random() * float64(rotateJitter)))
+			}
+			if time.Now().Before(tryAt) {
+				continue
+			}
+			joining = make(chan *link, 1)
+			go func(result chan<- *link) { result <- u.join(ctx, want) }(joining)
+		}
+	}
+}
+
+// join opens the new hour's handle beside the old one. Nil is a failed try.
+func (u *Uplink) join(ctx context.Context, epoch int64) *link {
+	handle, err := Handle(u.opts.Enroll.RendezvousSecret(), epoch)
+	if err != nil {
+		return nil
+	}
+	conn, err := u.dial(ctx, epoch, handle)
+	if err != nil {
+		u.log.Debug("could not join the new hour's handle yet", "err", err)
+		return nil
+	}
+	return u.start(ctx, conn, epoch, handle)
 }
 
 // serve runs one connection. It returns the close code and reason when the
@@ -365,20 +565,20 @@ func (u *Uplink) serve(ctx context.Context, conn *websocket.Conn) (int, string, 
 	}
 
 	live := &sessions{
+		slots:  u.slots,
 		build:  u.opts.Handler,
 		enroll: u.opts.Enroll,
 		static: u.opts.Enroll.StaticKey(),
 		write:  write,
 		log:    u.log,
 	}
+	here := &liveLink{sessions: live, text: writeText}
 	u.liveMu.Lock()
-	u.live = live
-	u.liveText = writeText
+	u.live = append(u.live, here)
 	u.liveMu.Unlock()
 	defer func() {
 		u.liveMu.Lock()
-		u.live = nil
-		u.liveText = nil
+		u.live = slices.DeleteFunc(u.live, func(l *liveLink) bool { return l == here })
 		u.liveMu.Unlock()
 		live.closeAll()
 	}()

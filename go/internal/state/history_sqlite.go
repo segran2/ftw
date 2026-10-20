@@ -24,7 +24,9 @@ var historyTables = []string{
 	"history_hot", "history_warm", "history_cold", "ts_drivers", "ts_metrics", "ts_samples",
 	"energy_daily", "energy_ledger_meta", "energy_assets", "energy_ledger_entries", "energy_ledger_cursors",
 }
-var sqliteHistoryTables = append(append([]string{}, historyTables...), "ts_series_hour", "ts_archive_days", "ts_buckets", "ts_bucket_days", "ts_legacy_bucket_days", "ts_aggregate_hours", "ts_latest", "history_dashboard", "history_site_energy", "history_site_cursor")
+var sqliteHistoryBaseTables = append(append([]string{}, historyTables...), "ts_series_hour", "ts_archive_days", "ts_buckets", "ts_bucket_days", "ts_legacy_bucket_days", "ts_aggregate_hours", "ts_latest", "history_dashboard", "history_site_energy", "history_site_cursor")
+var historyQualityTables = []string{"history_quality", "history_daily_quality", "history_dashboard_partial", "history_site_energy_partial", "history_partial_cursor", "energy_daily_partial"}
+var sqliteHistoryTables = append(append(append([]string{}, sqliteHistoryBaseTables...), historyQualityTables...), "history_load_estimates", "history_load_estimate_pending", sourceEnergyTable, "history_source_cursor", "history_source_periods")
 
 func ensureHistorySchema(exec func(string) error) error {
 	for _, stmt := range historySchema {
@@ -73,6 +75,13 @@ func (s *Store) openHistory() error {
 			s.history = nil
 		}
 	}()
+	var sourceTables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('history_source_energy','history_source_cursor','history_source_periods')`).Scan(&sourceTables); err != nil {
+		return err
+	}
+	if sourceTables != 0 && sourceTables != 3 {
+		return errors.New("incomplete history source tables; restore a verified full backup")
+	}
 	if err := ensureHistorySchema(func(stmt string) error { _, err := db.Exec(stmt); return err }); err != nil {
 		return fmt.Errorf("history schema: %w", err)
 	}
@@ -137,9 +146,24 @@ func (s *Store) openHistory() error {
 		return err
 	}
 	if RetireRawOnOpen {
+		if err := s.recoverLegacyCharts(context.Background(), generation); err != nil {
+			return err
+		}
 		if err := s.RetireRawHistory(context.Background()); err != nil {
 			return err
 		}
+	}
+	// A process stop has no continuous sampling proof, even when it was brief.
+	// Keep completed energy and quality. Source history may bridge a brief
+	// stop only as a marked estimate; the older paths never bridge it.
+	if _, err := s.history.Exec(`DELETE FROM history_load_estimate_pending;
+ INSERT INTO history_source_cursor VALUES('stopped','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+ UPDATE history_partial_cursor SET value=0 WHERE key IN ('last','residual_eligible');
+ UPDATE history_site_cursor SET value=0 WHERE key='last'`); err != nil {
+		return err
+	}
+	if err := s.refreshSourceDayCache(context.Background()); err != nil {
+		return err
 	}
 	ok = true
 	return nil
@@ -361,8 +385,12 @@ func historyOrder(table string) string {
 		return " ORDER BY path"
 	case "ts_latest":
 		return " ORDER BY driver_id, metric_id"
-	case "history_dashboard", "history_site_energy":
+	case "history_load_estimates", "history_dashboard", "history_site_energy", "history_dashboard_partial", "history_site_energy_partial", sourceEnergyTable:
 		return " ORDER BY start_ms, resolution_ms"
+	case "history_source_periods":
+		return " ORDER BY start_ms"
+	case "history_load_estimate_pending":
+		return " ORDER BY from_ms"
 	case "ts_buckets":
 		return " ORDER BY driver_id, metric_id, start_ms, resolution_ms"
 	case "ts_bucket_days", "ts_legacy_bucket_days":
@@ -371,7 +399,9 @@ func historyOrder(table string) string {
 		return " ORDER BY driver_id, metric_id, hour_ms"
 	case "ts_samples":
 		return " ORDER BY driver_id, metric_id, ts_ms"
-	case "energy_daily":
+	case "history_quality":
+		return " ORDER BY kind, start_ms, resolution_ms"
+	case "energy_daily", "history_daily_quality", "energy_daily_partial":
 		return " ORDER BY day"
 	case "energy_assets":
 		return " ORDER BY asset_id"
@@ -462,6 +492,47 @@ func (s *Store) exportHistoryToSQLite(ctx context.Context, path string) error {
 	if sqliteComplete == 0 || !s.HistoryMigrationStatus().HistoryComplete {
 		return errors.New("finish historical import before exporting a full backup; keep the verified pre-update backup")
 	}
+	// Published older split-history databases have none of the additive quality
+	// tables. Copy that source without upgrading it. A partial set is unsafe:
+	// exporting its rows without their masks could turn unknown values into zero.
+	qualityTables := 0
+	for _, table := range historyQualityTables {
+		var kind string
+		err := src.QueryRowContext(ctx, `SELECT type FROM sqlite_master WHERE name=?`, table).Scan(&kind)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if kind != "table" {
+			return fmt.Errorf("backup history: %s is not a table", table)
+		}
+		qualityTables++
+	}
+	tables := append(append([]string{}, sqliteHistoryBaseTables...), historyQualityTables...)
+	if qualityTables == 0 {
+		tables = sqliteHistoryBaseTables
+	} else if qualityTables != len(historyQualityTables) {
+		return errors.New("incomplete history quality tables; keep the source and restore a verified full backup")
+	}
+	// Estimates are additive and optional in published older backups.
+	var sourceTables int
+	if err := src.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('history_source_energy','history_source_cursor','history_source_periods')`).Scan(&sourceTables); err != nil {
+		return err
+	}
+	if sourceTables != 0 && sourceTables != 3 {
+		return errors.New("incomplete history source tables; keep the source and restore a verified full backup")
+	}
+	for _, table := range []string{"history_load_estimates", "history_load_estimate_pending", sourceEnergyTable, "history_source_cursor", "history_source_periods"} {
+		var exists int
+		if err := src.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&exists); err != nil {
+			return err
+		}
+		if exists != 0 {
+			tables = append(append([]string{}, tables...), table)
+		}
+	}
 	// This is an unpublished scratch file. Flush each small commit, then
 	// pause, so the next goal/session sync does not inherit a dirty backlog.
 	dest, err := openBackupDestination(path)
@@ -473,7 +544,7 @@ func (s *Store) exportHistoryToSQLite(ctx context.Context, path string) error {
 	if err := ensureHistorySchema(func(q string) error { _, err := dest.ExecContext(ctx, q); return err }); err != nil {
 		return err
 	}
-	for _, table := range sqliteHistoryTables {
+	for _, table := range tables {
 		if _, err := dest.ExecContext(ctx, `DELETE FROM `+table); err != nil {
 			return err
 		}
@@ -532,6 +603,13 @@ func validateHistorySamples(samples []Sample) error {
 }
 
 func normalizeHistoryPoint(p HistoryPoint) (HistoryPoint, error) {
+	if p.Sources != nil {
+		for _, v := range []float64{p.Sources.GridW, p.Sources.PVW, p.Sources.BatteryW, p.Sources.EVW, p.Sources.V2XW} {
+			if !finiteHistoryValue(v) {
+				return p, errors.New("non-finite history source")
+			}
+		}
+	}
 	for _, v := range []*float64{&p.GridW, &p.PVW, &p.BatW, &p.LoadW, &p.BatSoC} {
 		if math.IsNaN(*v) || math.IsInf(*v, 0) {
 			return p, errors.New("non-finite history point")
@@ -687,6 +765,31 @@ func requireConvertedBeta(path string) error {
 	err = db.QueryRowContext(ctx, `SELECT COALESCE((SELECT value FROM config WHERE key='history_duckdb_generation'),''),COALESCE((SELECT value FROM config WHERE key='history_sqlite_generation'),''),COALESCE((SELECT value FROM config WHERE key='history_restore_generation'),'')`).Scan(&beta, &selected, &restore)
 	if err == nil && beta != "" && selected == "" && restore == "" {
 		return errors.New("beta history needs conversion: stop Core and run ftw-history-migrate; original sources remain unchanged")
+	}
+	if err == nil && beta != "" {
+		// An older converter may already have selected SQLite. Check its
+		// summaries before Open can upgrade config or retire raw history.
+		if _, err := os.Stat(historyDatabasePath(path)); err != nil {
+			return fmt.Errorf("converted beta history is unavailable; preserve the originals and restore a full backup: %w", err)
+		}
+		history, err := sql.Open("sqlite", ReadOnlyDatabaseURI(historyDatabasePath(path)))
+		if err != nil {
+			return err
+		}
+		defer history.Close()
+		var summarized int
+		if err := history.QueryRowContext(ctx, `SELECT COUNT(*) FROM history_migrations WHERE name=?`, convertedChartSummaries).Scan(&summarized); err != nil {
+			return fmt.Errorf("check converted chart summaries: %w", err)
+		}
+		if summarized == 0 {
+			var raw int
+			if err := history.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM ts_samples)`).Scan(&raw); err != nil {
+				return fmt.Errorf("check remaining converted raw history: %w", err)
+			}
+			if raw != 0 {
+				return errors.New(incompleteConvertedCharts)
+			}
+		}
 	}
 	return nil
 }

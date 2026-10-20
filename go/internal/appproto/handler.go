@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -15,6 +16,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/control"
+	"github.com/srcfl/ftw/go/internal/redact"
+	"github.com/srcfl/ftw/go/protocol"
 )
 
 // Config wires the message layer to the box. Every field except Logger,
@@ -48,11 +51,21 @@ type Config struct {
 	// this build and the subsystem is what is missing.
 	Loadpoints Loadpoints
 
+	// Cars are the owners' cars (docs/cars.md), or nil on a box without
+	// them. The car ops then answer E_UNAVAILABLE.
+	Cars Cars
+
 	// PlannerPrefs applies the Plan card's safety factor and battery-export
 	// permission, or nil before the API server is bound. planner.prefs.set
 	// then answers E_UNAVAILABLE, the same 503 a passthrough meets in that
 	// window.
 	PlannerPrefs PlannerPrefs
+
+	// PlanChargers puts each charger's share on the plan, or nil on a box with
+	// no chargers. PlanFeed pushes the plan when the box replans, or nil for
+	// a box that pushes it only after a command.
+	PlanChargers PlanChargers
+	PlanFeed     *PlanFeed
 
 	// Caller is whose session this is. Required: a session always belongs to
 	// one enrolled device, and a handler that does not know which one cannot
@@ -63,10 +76,46 @@ type Config struct {
 	// privileged request. Required, because revocation is not optional.
 	Grants GrantReader
 
+	// Commands is the box's command log, one table shared by every session.
+	// Required: a handler with a table of its own would let a retry in the
+	// next session act a second time.
+	Commands *CmdLog
+
+	// Exchange makes this a watch's exchange session (ADR 0009, decision 2).
+	// It takes hello, cmd and now, and answers every other request
+	// E_UNKNOWN_OP. It never streams and pushes no plan after a command.
+	// Every frame it sends is lane 0 apart from hello_ok.
+	Exchange bool
+
 	// Caps is what this box advertises. Names must come from the generated
 	// contract constants; a typo is refused at construction rather than
 	// silently hiding a feature in the app.
 	Caps []string
+
+	// Access is the box's agent grants and approval keys, or nil on a box
+	// without them: the agent messages then answer E_UNKNOWN_OP.
+	Access Access
+	// Agents is the box's agent state, one per box like Commands. Required
+	// with Access.
+	Agents *AgentState
+	// Audit keeps who did what through an agent grant. Nil writes nothing.
+	Audit AuditLog
+	// Logs and Redactor serve logs.get, ConfigDoc and Redactor config.get,
+	// Views live.get and loadpoints.get. Each read answers E_UNAVAILABLE
+	// without its ports.
+	Logs      LogSource
+	Redactor  func() *redact.Redactor
+	ConfigDoc func() (any, error)
+	Views     AgentViews
+	// AgentKey cuts the ids in every answer to an agent, and resolves the
+	// ids an agent sends. The box derives it from a secret of its own.
+	AgentKey []byte
+
+	// Cloud answers hello_ok's FTW Cloud session information, or nil while
+	// FTW Cloud is off. Asked once per hello, for every role: a viewer reads
+	// FTW Cloud too and checks the box's signatures the same way. Nil on a
+	// box without the uplink.
+	Cloud func() *CloudSession
 
 	// Source ids for the three frozen power fields. The dictionary points
 	// each reading at one of these, which is how the app turns a number
@@ -91,7 +140,6 @@ type Handler struct {
 	log   *slog.Logger
 	modes []ModeInfo
 	dict  map[string]FieldDef
-	cmds  *cmdLog
 	// ops is this handler's own copy of the operation table.
 	ops map[string]opSpec
 
@@ -133,18 +181,33 @@ type Handler struct {
 	// one hertz while visible, 0.2 hertz while hidden.
 	cadenceEvery uint8
 	cadenceLeft  uint8
-	seq          uint64
+	// lastFrameMs is the box uptime when this session's last reading
+	// left: a snapshot, a delta or a tick. Beat measures silence from it.
+	lastFrameMs int64
+	// resync says a snapshot never left: the next frame sends one.
+	resync bool
+	seq    uint64
 	// lastSent is the value the client was last told for each field. Only
 	// fields actually put on the wire are recorded, so anything dropped to
 	// fit a bucket is simply still different next tick and goes then.
 	lastSent    map[string]int64
 	lastSources map[string]SourceWire
 	lastBlocked []string
+	// planMu holds a plan from read to send, so a newer plan never lands
+	// before an older one. lastPlan is the hash of the plan this session
+	// last got, without its uptime, so a push repeats nothing.
+	planMu   sync.Mutex
+	lastPlan [sha256.Size]byte
+
 	// lastRev is the controlRev this client was last told. A command carries
 	// the rev it expected, so a client left holding a stale one would have
 	// every command refused with no way to find out the new number — the
 	// snapshot is the only message that carries it.
 	lastRev uint64
+	// cmdAudits names the audited commands still waiting for a result.
+	cmdAudits map[string]cmdAudit
+	// untell stops an agent's session hearing how its requests end.
+	untell func()
 }
 
 // DefaultCaps is what this layer alone can back.
@@ -181,6 +244,12 @@ func New(cfg Config) (*Handler, error) {
 		return nil, errors.New("appproto: Sender is required")
 	case cfg.Grants == nil:
 		return nil, errors.New("appproto: Grants is required")
+	case cfg.Commands == nil:
+		return nil, errors.New("appproto: Commands is required")
+	case cfg.Access != nil && cfg.Agents == nil:
+		return nil, errors.New("appproto: Agents is required with Access")
+	case cfg.Caller.Kind == apiauth.KindAgent && cfg.Access == nil:
+		return nil, errors.New("appproto: an agent's session needs Access")
 	}
 
 	// A role nobody recognises carries nothing, and a handler that would
@@ -211,12 +280,11 @@ func New(cfg Config) (*Handler, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Handler{
+	h := &Handler{
 		cfg:          cfg,
 		log:          cfg.Logger.With("component", "appproto"),
 		modes:        wireModes(control.ModeCatalog()),
 		dict:         fieldDict(cfg.SrcGrid, cfg.SrcPV, cfg.SrcBattery),
-		cmds:         newCmdLog(),
 		ops:          defaultOps(),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -225,7 +293,17 @@ func New(cfg Config) (*Handler, error) {
 		cadenceEvery: 1,
 		cadenceLeft:  1,
 		lastSent:     map[string]int64{},
-	}, nil
+	}
+	if h.isAgent() {
+		h.untell = cfg.Agents.subscribe(h.selfID(), h.sendDecided)
+	}
+	// An exchange sends nothing unasked; a watch reads the plan from FTW
+	// Cloud instead. An agent reads the plan by asking, never by a push,
+	// so its reads stay counted and in the audit.
+	if cfg.PlanFeed != nil && !cfg.Exchange && !h.isAgent() {
+		cfg.PlanFeed.join(h)
+	}
+	return h, nil
 }
 
 // Close ends the handler's own work when the session goes.
@@ -236,6 +314,12 @@ func New(cfg Config) (*Handler, error) {
 // passthrough.
 func (h *Handler) Close() {
 	h.cancel()
+	if h.untell != nil {
+		h.untell()
+	}
+	if h.cfg.PlanFeed != nil {
+		h.cfg.PlanFeed.leave(h)
+	}
 	h.histMu.Lock()
 	if h.histCancel != nil {
 		h.histCancel()
@@ -254,6 +338,32 @@ func ScopesForRole(role string) apiauth.ScopeSet {
 	return apiauth.NewScopeSet(apiauth.RoleScopes[role]...)
 }
 
+// GrantScopes lists what an enrolment carries now, in the registry's order.
+//
+// A phone carries its role's scopes. A watch carries those of its role's
+// scopes that its parent's role carries too, so a watch never does more than
+// its phone can do this second (ADR 0009, decision 4). A watch with no parent
+// carries nothing.
+func GrantScopes(role, parentRole string) []string {
+	own := apiauth.RoleScopes[role]
+	if role != apiauth.RoleWatch {
+		return own
+	}
+	parent := ScopesForRole(parentRole)
+	out := make([]string, 0, len(own))
+	for _, scope := range own {
+		if parent.Has(scope) {
+			out = append(out, scope)
+		}
+	}
+	return out
+}
+
+// ScopesForGrant is GrantScopes as a set.
+func ScopesForGrant(role, parentRole string) apiauth.ScopeSet {
+	return apiauth.NewScopeSet(GrantScopes(role, parentRole)...)
+}
+
 // liveCaller is whose session this is, as the box's records stand this second.
 //
 // Not the snapshot the handshake took. A socket outlives a revoke, and it
@@ -269,14 +379,19 @@ func ScopesForRole(role string) apiauth.ScopeSet {
 // that is the right way round — the app drawing a button is presentation, and
 // the box refusing it is the enforcement.
 func (h *Handler) liveCaller() (apiauth.Caller, bool) {
-	role, epoch, ok := h.cfg.Grants.Grant()
+	grant, ok := h.cfg.Grants.Grant()
 	if !ok {
 		return apiauth.Caller{}, false
 	}
+	if h.isAgent() && (grant.Agent == nil || grant.Agent.Expired || grant.Agent.NoClock) {
+		// An agent past its expiry, or with no clock to tell, holds
+		// nothing. agentGate says which, where an answer needs it.
+		return apiauth.Caller{}, false
+	}
 	caller := h.cfg.Caller
-	caller.Role = role
-	caller.Epoch = epoch
-	caller.Scopes = ScopesForRole(role)
+	caller.Role = grant.Role
+	caller.Epoch = grant.Epoch
+	caller.Scopes = ScopesForEnrolment(grant)
 	return caller, true
 }
 
@@ -305,17 +420,55 @@ func (h *Handler) Handle(ctx context.Context, frame []byte) error {
 		h.log.Warn("undecodable frame dropped", "err", err)
 		return nil
 	}
-	return h.dispatch(ctx, f.Envelope)
+	return dropped(h.dispatch(ctx, f.Envelope))
+}
+
+// dropped is err, unless it says only that the carrier lost one frame: the
+// session goes on after that.
+func dropped(err error) error {
+	if errors.Is(err, ErrDropped) {
+		return nil
+	}
+	return err
 }
 
 func (h *Handler) dispatch(ctx context.Context, env Envelope) error {
+	if h.cfg.Exchange {
+		return h.dispatchExchange(ctx, env)
+	}
+	if h.isAgent() {
+		return h.dispatchAgent(ctx, env)
+	}
+	if env.By != "" && env.ID != nil {
+		// Only a support session names who made a call.
+		return h.sendError(env.ID, ErrorBody{Code: ErrUnknownOp, Args: map[string]any{"field": "by"}})
+	}
 	switch env.T {
 	case MsgHello:
 		return h.onHello(env)
 	case MsgSub:
 		return h.onSub(env)
 	case MsgCmd:
-		return h.onCmd(ctx, env)
+		return h.onCmd(ctx, env, "")
+	case protocol.MsgApprovalKeySet:
+		return h.onApprovalKeySet(env)
+	case protocol.MsgAgentInviteCreate, protocol.MsgAgentInviteList, protocol.MsgAgentInviteCancel:
+		return h.onAgentInvite(env)
+	case protocol.MsgAgentAdd:
+		return h.onAgentAdd(env)
+	case protocol.MsgAgentWiden:
+		return h.onAgentWiden(env)
+	case protocol.MsgAgentRevoke:
+		return h.onAgentRevoke(env)
+	case protocol.MsgAgentList:
+		return h.onAgentList(env)
+	case protocol.MsgAgentConfirm:
+		return h.onAgentConfirm(ctx, env)
+	case protocol.MsgAuditGet:
+		return h.onAuditGet(env)
+	case protocol.MsgHealthGet, protocol.MsgLogsGet, protocol.MsgConfigGet, protocol.MsgEventsGet, protocol.MsgDiagRun,
+		protocol.MsgLiveGet, protocol.MsgLoadpointsGet, protocol.MsgDriversGet, protocol.MsgCarsGet:
+		return h.onRead(env)
 	case MsgPlanGet:
 		return h.onPlanGet(env.ID)
 	case MsgPriceGet:
@@ -373,17 +526,24 @@ func (h *Handler) onHello(env Envelope) error {
 
 	caps := h.cfg.Caps
 	hint := ""
+	var cloud *CloudSession
 	if proto == ProtoFloor {
 		// Floor mode speaks the frozen subset and nothing else. Advertising
 		// more would invite an app that cannot use it to try.
 		caps = []string{CapStatusCore}
 		hint = HintAppUpdate
+	} else if h.cfg.Cloud != nil && !h.isAgent() {
+		// An agent reads through its own session; FTW Cloud's session
+		// information is a phone's.
+		cloud = h.cfg.Cloud()
 	}
 
 	source, syncedAtMs := h.cfg.Clock.Sync()
 	id := h.cfg.Info.Identity()
 
-	fastSub := hello.Sub != nil && boot == nil
+	// An agent never streams: the snapshot's source table names devices.
+	// Its view of now is live.get, counted and audited like any read.
+	fastSub := hello.Sub != nil && boot == nil && !h.isAgent()
 	body := HelloOK{
 		Proto: proto,
 		Mode:  mode,
@@ -401,6 +561,7 @@ func (h *Handler) onHello(env Envelope) error {
 		Role:       h.cfg.Caller.Role,
 		Scopes:     h.cfg.Caller.Scopes.Names(),
 		Subscribed: fastSub,
+		Cloud:      cloud,
 	}
 
 	h.mu.Lock()
@@ -474,6 +635,10 @@ func (h *Handler) onSub(env Envelope) error {
 }
 
 func (h *Handler) applySub(sub Sub) error {
+	if h.isAgent() {
+		// The second lock on the same door: no path gives an agent a stream.
+		return nil
+	}
 	bucket := sub.Bucket
 	if bucket != 256 && bucket != 512 {
 		// Lane 0 is one of two sizes for the life of the session. An
@@ -503,9 +668,10 @@ func (h *Handler) applySub(sub Sub) error {
 	h.mu.Unlock()
 
 	// Keep subscribed false until the full snapshot is on the wire. Otherwise
-	// the one-second ticker can race ahead and send a delta before the snapshot
-	// that gives it meaning.
-	if err := h.sendSnapshot(); err != nil {
+	// the pulse or an arrival can race ahead and send a delta before the
+	// snapshot that gives it meaning. A snapshot the carrier dropped is sent
+	// again with the first frame.
+	if err := h.sendSnapshot(); err != nil && !errors.Is(err, ErrDropped) {
 		return err
 	}
 	h.mu.Lock()
@@ -514,8 +680,8 @@ func (h *Handler) applySub(sub Sub) error {
 	return nil
 }
 
-// sendSnapshot puts the full site state on the bulk lane and records what the
-// client now knows.
+// sendSnapshot puts the full site state on the bulk lane, in line with lane
+// 0, and records what the client now knows once it has left.
 func (h *Handler) sendSnapshot() error {
 	uptimeMs := h.cfg.Clock.UptimeMs()
 	snap := h.cfg.Site.Snapshot()
@@ -526,17 +692,7 @@ func (h *Handler) sendSnapshot() error {
 		blocked = []string{}
 	}
 
-	h.mu.Lock()
-	h.lastSent = make(map[string]int64, len(fields))
-	for k, v := range fields {
-		h.lastSent[k] = v
-	}
-	h.lastSources = sources
-	h.lastBlocked = blocked
-	h.lastRev = snap.ControlRev
-	h.mu.Unlock()
-
-	return h.sendBulk(MsgSnap, nil, Snap{
+	f, err := h.bulkFrame(MsgSnap, nil, Snap{
 		UptimeMs:          uptimeMs,
 		ControlRev:        snap.ControlRev,
 		Dict:              h.dict,
@@ -544,13 +700,41 @@ func (h *Handler) sendSnapshot() error {
 		Sources:           sources,
 		DispatchBlockedBy: blocked,
 	})
+	if err == nil {
+		err = h.sendInLine(f)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err != nil {
+		h.resync = true
+		return err
+	}
+	h.resync = false
+	h.lastSent = make(map[string]int64, len(fields))
+	for k, v := range fields {
+		h.lastSent[k] = v
+	}
+	h.lastSources = sources
+	h.lastBlocked = blocked
+	h.lastRev = snap.ControlRev
+	h.lastFrameMs = uptimeMs
+	return nil
 }
 
 // Tick consumes one global one-second pulse. The handler gates that pulse to
 // this subscription's 1 Hz or 0.2 Hz cadence. On each due pulse it emits a
 // frame even when nothing changed, so the relay cannot distinguish an idle
 // house from an active one within the chosen cadence.
+//
+// Only a session over the relay ticks. A session that FTW Cloud carries is
+// streamed with Push and Beat instead (docs/protocol-cloud.md, "Tunnel").
 func (h *Handler) Tick() error {
+	if h.isAgent() {
+		if err := h.agentTick(); err != nil {
+			return err
+		}
+	}
 	h.mu.Lock()
 	if !h.subscribed {
 		h.mu.Unlock()
@@ -562,6 +746,53 @@ func (h *Handler) Tick() error {
 		return nil
 	}
 	h.cadenceLeft = h.cadenceEvery
+	h.mu.Unlock()
+	return h.stream()
+}
+
+// Visible says Push would send: the session streams and someone sees it.
+func (h *Handler) Visible() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscribed && h.cadenceEvery == 1
+}
+
+// Push sends a frame now: a driver has just finished a poll. A delta of
+// what changed, or a tick when nothing did, so a frame's timing shows when
+// the box read its devices and never which reading moved. Nothing while
+// hidden, where the session asked for one frame in five seconds and Beat
+// sends it.
+func (h *Handler) Push() error {
+	if !h.Visible() {
+		return nil
+	}
+	return h.stream()
+}
+
+// Beat sends a frame when none has left for the subscribed period, so the
+// phone hears the session is alive while nothing in the house moves, and
+// the hidden session gets its one frame in five seconds. Call it more often
+// than the period; it decides.
+func (h *Handler) Beat() error {
+	h.mu.Lock()
+	if !h.subscribed {
+		h.mu.Unlock()
+		return nil
+	}
+	period := int64(h.cadenceEvery) * 1000
+	quiet := h.cfg.Clock.UptimeMs() - h.lastFrameMs
+	h.mu.Unlock()
+	if quiet < period {
+		return nil
+	}
+	return h.stream()
+}
+
+// stream sends one lane 0 frame: a delta of what changed since the client
+// was last told, or a tick when nothing did. A frame the carrier dropped is
+// not recorded as sent, so the next one carries the same news.
+func (h *Handler) stream() error {
+	h.mu.Lock()
 	bucket := h.bucket
 	h.mu.Unlock()
 
@@ -576,16 +807,21 @@ func (h *Handler) Tick() error {
 	// command will be refused for a conflict it cannot see. Only the snapshot
 	// carries the number, so a change in it costs one bulk frame — which is
 	// also how the client resyncs mid-session rather than on reconnect.
+	//
+	// A field that stopped coming is the same kind of news. A delta carries
+	// values, not absences, so a phase the meter no longer reports would stay
+	// on the client at its last value; the snapshot replaces the client's
+	// whole set instead.
+	fields := fieldValues(snap, h.modes)
 	h.mu.Lock()
-	stale := snap.ControlRev != h.lastRev
+	stale := h.resync || snap.ControlRev != h.lastRev || anyGone(h.lastSent, fields)
 	h.mu.Unlock()
 	if stale {
 		if err := h.sendSnapshot(); err != nil {
-			return err
+			return dropped(err)
 		}
 	}
 
-	fields := fieldValues(snap, h.modes)
 	sources := wireSources(snap, uptimeMs)
 	blocked := snap.DispatchBlockedBy
 	if blocked == nil {
@@ -605,7 +841,7 @@ func (h *Handler) Tick() error {
 	h.mu.Unlock()
 
 	if len(changed) == 0 && !sourcesMoved {
-		return h.sendControl(MsgTick, nil, Tick{Seq: seq, UptimeMs: uptimeMs}, 0, bucket)
+		return h.sendTick(seq, uptimeMs, bucket)
 	}
 
 	body := Delta{Seq: seq, UptimeMs: uptimeMs, Fields: changed}
@@ -622,9 +858,19 @@ func (h *Handler) Tick() error {
 	if err != nil {
 		return err
 	}
+	if sourcesMoved && body.Sources == nil {
+		// The source table did not fit the bucket, and a source going
+		// stale is the news the freshness model exists to show. The
+		// snapshot carries it, with every reading; lane 0 still gets its
+		// frame.
+		if err := h.sendSnapshot(); err != nil {
+			return dropped(err)
+		}
+		return h.sendTick(seq, uptimeMs, bucket)
+	}
 
 	if err := h.sendControl(MsgDelta, nil, body, flags, bucket); err != nil {
-		return err
+		return dropped(err)
 	}
 
 	h.mu.Lock()
@@ -635,6 +881,18 @@ func (h *Handler) Tick() error {
 		h.lastSources = sources
 		h.lastBlocked = blocked
 	}
+	h.lastFrameMs = uptimeMs
+	h.mu.Unlock()
+	return nil
+}
+
+// sendTick sends lane 0's frame when nothing changed.
+func (h *Handler) sendTick(seq uint64, uptimeMs int64, bucket int) error {
+	if err := h.sendControl(MsgTick, nil, Tick{Seq: seq, UptimeMs: uptimeMs}, 0, bucket); err != nil {
+		return dropped(err)
+	}
+	h.mu.Lock()
+	h.lastFrameMs = uptimeMs
 	h.mu.Unlock()
 	return nil
 }
@@ -645,7 +903,8 @@ func (h *Handler) Tick() error {
 // The bucket never grows and the frame never fragments, because both would
 // make frame size a function of what happened in the house — which is the one
 // thing lane 0's constancy exists to hide. Dropped fields are simply not
-// recorded as sent, so they are still different on the next tick and go then.
+// recorded as sent, so they are still different on the next frame and go
+// then. A source table that does not fit goes in a snapshot (stream).
 // Field ids ascend by importance: 1-9 are the frozen core view.
 func (h *Handler) fitDelta(body *Delta, bucket int) (map[string]int64, uint8, error) {
 	const headerBytes = 6
@@ -709,6 +968,16 @@ func (h *Handler) fitDelta(body *Delta, bucket int) (map[string]int64, uint8, er
 	return nil, 0, fmt.Errorf("appproto: an empty delta does not fit a %d-byte bucket", bucket)
 }
 
+// anyGone reports whether a field the client was sent is missing now.
+func anyGone(sent, now map[string]int64) bool {
+	for k := range sent {
+		if _, ok := now[k]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func fidOf(key string) uint64 {
 	v, err := strconv.ParseUint(key, 10, 32)
 	if err != nil {
@@ -722,7 +991,8 @@ func fidOf(key string) uint64 {
 // Commands
 // --------------------------------------------------------------------------
 
-func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
+// onCmd takes a command. by is the staff id on a support session's call.
+func (h *Handler) onCmd(ctx context.Context, env Envelope, by string) error {
 	var cmd Cmd
 	if err := Unmarshal(env.B, &cmd); err != nil {
 		h.log.Warn("undecodable cmd dropped", "err", err)
@@ -738,17 +1008,21 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 			Args:      map[string]any{"t": MsgCmd, "missing": "cmdId"},
 		})
 	}
+	if h.isAgent() {
+		h.noteCmd(cmd.CmdID, cmdAudit{by: by, what: MsgCmd, target: cmd.Op})
+	}
+	return h.runCmd(ctx, cmd, by)
+}
+
+// runCmd makes every check and acts. An owner's confirmation of an agent's
+// request comes here too, as a command of its own.
+func (h *Handler) runCmd(ctx context.Context, cmd Cmd, by string) error {
 
 	// Idempotency first. A retry must return the original outcome, not act a
-	// second time — that is the entire reason the key exists.
-	if rec, ok := h.cmds.lookup(cmd.CmdID); ok {
-		if err := h.sendCmdAck(rec.ack); err != nil {
-			return err
-		}
-		if rec.result != nil {
-			return h.sendCmdResult(*rec.result)
-		}
-		return nil
+	// second time — that is the entire reason the key exists. The box keeps
+	// the table, so the retry may come in any session of the same device.
+	if rec, ok := h.cfg.Commands.lookup(h.cmdRoot(), cmd.CmdID); ok {
+		return h.replayCmd(rec)
 	}
 
 	uptimeMs := h.cfg.Clock.UptimeMs()
@@ -783,20 +1057,17 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 	// Who is asking, as the box's records stand right now — the same question
 	// the passthrough asks, answered the same way. A phone revoked or demoted
 	// mid-session must not get one last command through on the strength of
-	// what its handshake said.
-	caller, enrolled := h.liveCaller()
-	if !enrolled {
-		if err := h.sendCmdResult(CmdResult{
-			CmdID: cmd.CmdID,
-			State: CmdRejected,
-			Error: &ErrorBody{
-				Code:      ErrGrantRevoked,
-				Retryable: ErrorRetryable[ErrGrantRevoked],
-			},
-		}); err != nil {
+	// what its handshake said. An agent meets its grant's expiry, allowlist,
+	// rate and caps here too.
+	caller, cmd, refusal, end := h.cmdCaller(cmd, by)
+	if refusal != nil {
+		if err := h.sendCmdResult(CmdResult{CmdID: cmd.CmdID, State: CmdRejected, Error: refusal}); err != nil {
 			return err
 		}
-		return h.Terminate(TerminateRevoked)
+		if end != "" {
+			return h.Terminate(end)
+		}
+		return nil
 	}
 
 	// The scope the operation declares, checked against the scope this
@@ -805,7 +1076,7 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 	// command was refused by nothing at all. This is the line that makes a
 	// role real on the command lane; the passthrough's role gate is the same
 	// property on the other one.
-	if !caller.Scopes.Has(spec.scope) {
+	if !h.isAgent() && !caller.Scopes.Has(spec.scope) {
 		return h.sendCmdResult(CmdResult{
 			CmdID: cmd.CmdID,
 			State: CmdRejected,
@@ -882,22 +1153,61 @@ func (h *Handler) onCmd(ctx context.Context, env Envelope) error {
 		return h.loadpointSoCSet(cmd, uptimeMs)
 	case OpLoadpointSurplusOnlySet:
 		return h.loadpointSurplusOnlySet(cmd, uptimeMs)
+	case OpCarGoalSet, OpCarSoCSet, OpSessionCarSet, OpCarAdd, OpCarUpdate, OpCarRemove:
+		return h.carOp(cmd, uptimeMs)
 	default:
 		return fmt.Errorf("appproto: op %q is in the table but has no handler", cmd.Op)
 	}
 }
 
+// cmdRoot is the device whose command ids this session spends: the enrolled
+// device itself, or for a watch the phone that added it. A subject is stable
+// across sessions and names nobody else.
+func (h *Handler) cmdRoot() string {
+	if grant, ok := h.cfg.Grants.Grant(); ok && grant.Root != "" {
+		return grant.Root
+	}
+	return h.cfg.Caller.Subject
+}
+
+// replayCmd answers a command id the box has already taken with what happened
+// then.
+func (h *Handler) replayCmd(rec *cmdRecord) error {
+	if err := h.sendCmdAck(rec.ack); err != nil {
+		return err
+	}
+	if rec.result != nil {
+		return h.sendCmdResult(*rec.result)
+	}
+	return nil
+}
+
 // acceptCmd takes the intent: mints the lease, remembers the command id and
 // tells the app. From here on a retry replays whatever outcome follows
 // rather than acting a second time.
-func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (CmdAck, error) {
+//
+// took is false when another session of the same device took this id first,
+// between this session's lookup and now. The stored record has then been
+// replayed, and the caller must not act.
+func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (took bool, err error) {
 	ack := CmdAck{
 		CmdID:       cmd.CmdID,
 		LeaseID:     h.cfg.NewLeaseID(),
 		ExpiresAtMs: uptimeMs + LeaseMs,
 	}
-	h.cmds.remember(cmd.CmdID, ack, uptimeMs)
-	return ack, h.sendCmdAck(ack)
+	root := h.cmdRoot()
+	if rec, fresh := h.cfg.Commands.remember(root, cmd.CmdID, ack, uptimeMs); !fresh {
+		return false, h.replayCmd(rec)
+	}
+	if err := h.sendCmdAck(ack); err != nil && !errors.Is(err, ErrDropped) {
+		// The box has not acted, and the app never heard the ack. Keeping
+		// the id would answer its retry with an ack and no result.
+		h.cfg.Commands.forget(root, cmd.CmdID)
+		return false, err
+	}
+	// An ack the carrier dropped is one lost frame: the box acts, and the
+	// result tells the app.
+	return true, nil
 }
 
 // settleAndReport records the outcome, reports it, and pushes a fresh plan
@@ -905,35 +1215,36 @@ func (h *Handler) acceptCmd(cmd Cmd, uptimeMs int64) (CmdAck, error) {
 // the box means to do next, and the app must not show the old intent beside
 // the new state with neither looking wrong.
 func (h *Handler) settleAndReport(cmdID string, res CmdResult) error {
-	h.cmds.settle(cmdID, res)
+	h.cfg.Commands.settle(h.cmdRoot(), cmdID, res)
 	if err := h.sendCmdResult(res); err != nil {
 		return err
 	}
-	if res.State == CmdApplied {
+	// An exchange answers with two frames of one size and nothing after
+	// them, so a watch reads the new plan from FTW Cloud instead.
+	if res.State == CmdApplied && !h.cfg.Exchange {
 		return h.sendPlan(nil)
 	}
 	return nil
 }
 
+// modeArg is the mode a site.mode.set names. control.IsValidMode is the
+// box's own validator, shared with the HTTP API and Home Assistant. A second
+// list here would be a second place for the three to disagree.
+func modeArg(op string, args map[string]any) (control.Mode, *ErrorBody) {
+	raw, _ := args["mode"].(string)
+	if !control.IsValidMode(control.Mode(raw)) {
+		return "", badArg(op, "mode", raw)
+	}
+	return control.Mode(raw), nil
+}
+
 func (h *Handler) setMode(ctx context.Context, cmd Cmd, uptimeMs int64) error {
-	raw, _ := cmd.Args["mode"].(string)
-	wanted := control.Mode(raw)
-	if !control.IsValidMode(wanted) {
-		// control.IsValidMode is the box's own validator, shared with the
-		// HTTP API and Home Assistant. A second list here would be a second
-		// place for the three to disagree.
-		return h.sendCmdResult(CmdResult{
-			CmdID: cmd.CmdID,
-			State: CmdRejected,
-			Error: &ErrorBody{
-				Code:      ErrUnknownOp,
-				Retryable: false,
-				Args:      map[string]any{"op": cmd.Op, "arg": "mode", "value": raw},
-			},
-		})
+	wanted, bad := modeArg(cmd.Op, cmd.Args)
+	if bad != nil {
+		return h.rejectWith(cmd, bad)
 	}
 
-	if _, err := h.acceptCmd(cmd, uptimeMs); err != nil {
+	if took, err := h.acceptCmd(cmd, uptimeMs); !took || err != nil {
 		return err
 	}
 
@@ -1003,7 +1314,13 @@ func (h *Handler) onPlanGet(id *uint32) error {
 	return h.sendPlan(id)
 }
 
-func (h *Handler) sendPlan(id *uint32) error {
+func (h *Handler) sendPlan(id *uint32) error { return h.writePlan(id, false) }
+
+// writePlan reads the plan and sends it. With skipSame it sends nothing when
+// this session already has this plan.
+func (h *Handler) writePlan(id *uint32, skipSame bool) error {
+	h.planMu.Lock()
+	defer h.planMu.Unlock()
 	body := planFrom(
 		h.cfg.Plans.Latest(),
 		h.cfg.Plans.Rev(),
@@ -1011,14 +1328,38 @@ func (h *Handler) sendPlan(id *uint32) error {
 		h.cfg.Clock.UptimeMs(),
 		h.cfg.Clock.Now(),
 	)
+	if h.cfg.PlanChargers != nil {
+		body.Chargers = h.cfg.PlanChargers.PlanChargers(h.cfg.Clock.Now())
+		if h.isAgent() {
+			// An agent knows chargers and cars by the ids loadpoints.get
+			// and cars.get gave it, never by the box's names. A copy: the
+			// source may hand every session the same slice.
+			body.Chargers = slices.Clone(body.Chargers)
+			for i := range body.Chargers {
+				body.Chargers[i].ID = h.agentLoadpointID(body.Chargers[i].ID)
+				body.Chargers[i].CarID = h.agentCarID(body.Chargers[i].CarID)
+			}
+		}
+	}
+	same := body
+	same.UptimeMs = 0
+	raw, err := Marshal(same)
+	if err != nil {
+		return err
+	}
+	key := sha256.Sum256(raw)
+	if skipSame && key == h.lastPlan {
+		return nil
+	}
 
 	// The optimizer plans further than the wire carries: 193 fifteen-minute
 	// slots encode to ~17 kB and the largest bulk bucket is 16 kB. Send the
 	// nearest slots that fit and drop the far tail — the app shows twelve
-	// hours, and slots two days out are a guess about a guess. What must
-	// never happen is the alternative: an encode error here used to kill the
-	// whole session, which the app experienced as "the box hangs up whenever
-	// I open the plan".
+	// hours, and slots two days out are a guess about a guess. Then the far
+	// windows of each charger, for the same reason. What must never happen is
+	// the alternative: an encode error here used to kill the whole session,
+	// which the app experienced as "the box hangs up whenever I open the
+	// plan".
 	for {
 		env, err := newEnvelope(MsgPlan, id, body)
 		if err != nil {
@@ -1029,13 +1370,33 @@ func (h *Handler) sendPlan(id *uint32) error {
 			return err
 		}
 		if bulkBucketFor(len(raw)) != 0 {
-			return h.send(Frame{Lane: LaneBulk, Bucket: bulkBucketFor(len(raw)), Envelope: env})
+			if err := h.send(Frame{Lane: LaneBulk, Bucket: bulkBucketFor(len(raw)), Envelope: env}); err != nil {
+				return err
+			}
+			h.lastPlan = key
+			return nil
 		}
-		if len(body.Slots) <= 1 {
-			return fmt.Errorf("appproto: a single plan slot does not fit any bulk bucket")
+		switch {
+		case len(body.Slots) > 1:
+			body.Slots = body.Slots[:len(body.Slots)*3/4]
+		case trimWindows(body.Chargers):
+		default:
+			return fmt.Errorf("appproto: a plan of one slot and one window per charger does not fit any bulk bucket")
 		}
-		body.Slots = body.Slots[:len(body.Slots)*3/4]
 	}
+}
+
+// trimWindows drops the far quarter of each charger's windows, keeping the
+// next one, and reports whether anything went.
+func trimWindows(chargers []PlanCharger) bool {
+	trimmed := false
+	for i := range chargers {
+		if n := len(chargers[i].Windows); n > 1 {
+			chargers[i].Windows = chargers[i].Windows[:max(1, n*3/4)]
+			trimmed = true
+		}
+	}
+	return trimmed
 }
 
 // --------------------------------------------------------------------------
@@ -1048,7 +1409,7 @@ func (h *Handler) Terminate(reason string) error {
 	h.subscribed = false
 	bucket := h.bucket
 	h.mu.Unlock()
-	return h.sendControl(MsgSessionTerminate, nil, SessionTerminate{Reason: reason}, 0, bucket)
+	return dropped(h.sendControl(MsgSessionTerminate, nil, SessionTerminate{Reason: reason}, 0, bucket))
 }
 
 // --------------------------------------------------------------------------
@@ -1063,9 +1424,22 @@ func (h *Handler) sendCmdAck(ack CmdAck) error {
 }
 
 func (h *Handler) sendCmdResult(res CmdResult) error {
+	h.auditCmdResult(res)
+	if h.isAgent() {
+		res = h.forAgentResult(res)
+	}
 	h.mu.Lock()
 	bucket := h.bucket
 	h.mu.Unlock()
+	if res.Car != nil || res.Charger != nil {
+		// A car rides lane 0 only when it fits the session's bucket: a full
+		// one with a long name does not fit 256 B. Without it the result
+		// still settles the command, and the app reads the car again.
+		const headerBytes = 6
+		if size, err := encodedSize(MsgCmdResult, res); err != nil || size+headerBytes > bucket {
+			res.Car, res.Charger = nil, nil
+		}
+	}
 	return h.sendControl(MsgCmdResult, nil, res, 0, bucket)
 }
 
@@ -1075,6 +1449,9 @@ func (h *Handler) sendCmdResult(res CmdResult) error {
 // id, a window the box could not serve would raise a session-wide banner and
 // make the whole app look broken over one chart the user could simply narrow.
 func (h *Handler) sendError(id *uint32, body ErrorBody) error {
+	if h.isAgent() {
+		body.Args = h.forAgent(body.Args)
+	}
 	h.mu.Lock()
 	bucket := h.bucket
 	h.mu.Unlock()
@@ -1092,19 +1469,27 @@ func (h *Handler) sendControl(t string, id *uint32, body any, flags uint8, bucke
 // sendBulk sizes the bucket from the encoded body rather than a guess, so a
 // long mode catalogue or a wide source table cannot silently overrun.
 func (h *Handler) sendBulk(t string, id *uint32, body any) error {
-	env, err := newEnvelope(t, id, body)
+	f, err := h.bulkFrame(t, id, body)
 	if err != nil {
 		return err
+	}
+	return h.send(f)
+}
+
+func (h *Handler) bulkFrame(t string, id *uint32, body any) (Frame, error) {
+	env, err := newEnvelope(t, id, body)
+	if err != nil {
+		return Frame{}, err
 	}
 	raw, err := EncodeEnvelope(env)
 	if err != nil {
-		return err
+		return Frame{}, err
 	}
 	bucket := bulkBucketFor(len(raw))
 	if bucket == 0 {
-		return fmt.Errorf("appproto: %s is %d bytes, larger than the biggest bulk bucket", t, len(raw))
+		return Frame{}, fmt.Errorf("appproto: %s is %d bytes, larger than the biggest bulk bucket", t, len(raw))
 	}
-	return h.send(Frame{Lane: LaneBulk, Bucket: bucket, Envelope: env})
+	return Frame{Lane: LaneBulk, Bucket: bucket, Envelope: env}, nil
 }
 
 func (h *Handler) send(f Frame) error {
@@ -1113,4 +1498,18 @@ func (h *Handler) send(f Frame) error {
 		return fmt.Errorf("appproto: encode %s: %w", f.Envelope.T, err)
 	}
 	return h.cfg.Sender.Send(bytes)
+}
+
+// sendInLine sends a bulk frame in line with lane 0 where the carrier can
+// (InLineSender), and as any other frame where it cannot.
+func (h *Handler) sendInLine(f Frame) error {
+	s, ok := h.cfg.Sender.(InLineSender)
+	if !ok {
+		return h.send(f)
+	}
+	bytes, err := h.cfg.Codec.EncodeFrame(f)
+	if err != nil {
+		return fmt.Errorf("appproto: encode %s: %w", f.Envelope.T, err)
+	}
+	return s.SendInLine(bytes)
 }

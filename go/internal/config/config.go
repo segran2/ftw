@@ -43,13 +43,16 @@ type Config struct {
 	Nova             *Nova              `yaml:"nova,omitempty" json:"nova,omitempty"`
 	DeviceRepository *DeviceRepository  `yaml:"device_repository,omitempty" json:"device_repository,omitempty"`
 	OCPP             *OCPP              `yaml:"ocpp,omitempty" json:"ocpp,omitempty"`
+	Setup            *Setup             `yaml:"setup,omitempty" json:"setup,omitempty"`
+	ForecastPriors   *ForecastPriors    `yaml:"forecast_priors,omitempty" json:"forecast_priors,omitempty"`
 
 	// LoadWarnings collects recoverable problems Parse repaired instead of
 	// refusing the file: an on-disk config an older version accepted must
 	// still boot, or the operator loses the UI they would fix it with. The
 	// write path (Settings save, bootstrap) never populates this — it calls
 	// Validate directly and stays strict. Never serialized.
-	LoadWarnings []string `yaml:"-" json:"-"`
+	LoadWarnings      []string `yaml:"-" json:"-"`
+	LoadpointWarnings []string `yaml:"-" json:"-"`
 	// Retired names settings of removed features that loading dropped so
 	// they cannot steer the site. Startup warns once for each;
 	// DropRetiredSettings deletes them from stored settings.
@@ -59,6 +62,9 @@ type Config struct {
 	ConfigDatabase         string `yaml:"config_database,omitempty" json:"-"`
 	Revision               int64  `yaml:"-" json:"-"`
 	LANPasswordHash        string `yaml:"-" json:"-"`
+	// Startup write ownership stays in force until restart, including after
+	// saving a different proxy mode or a failed listener start.
+	ModbusProxyWriteOwners map[string]bool `yaml:"-" json:"-"`
 }
 
 // OCPP configures the built-in OCPP 1.6J and 2.0.1 Central System. Chargers connect to
@@ -243,10 +249,10 @@ type FleetPing struct {
 	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
 }
 
-// DefaultFleetPingEndpoint is the fleet-report door on FTW's relay. The relay
+// DefaultFleetPingEndpoint is the anonymous fleet-report route on FTW Cloud. It
 // adds the report to daily totals and discards the request; a failed ping is
 // forgotten, never retried.
-const DefaultFleetPingEndpoint = "https://relay.ftw.energy/fleet"
+const DefaultFleetPingEndpoint = "https://cloud.ftw.energy/v1/fleet"
 
 // On reports whether the ping is switched on, and is the only place that
 // answers it.
@@ -270,7 +276,7 @@ func (f *FleetPing) On() bool {
 // this address after FTW moved the collector, and the aggregate would
 // quietly lose every box that had ever saved its settings.
 func (f *FleetPing) Resolved() string {
-	if f == nil || f.Endpoint == "" {
+	if f == nil || f.Endpoint == "" || strings.TrimSpace(f.Endpoint) == "https://relay.ftw.energy/fleet" {
 		return DefaultFleetPingEndpoint
 	}
 	return f.Endpoint
@@ -1352,6 +1358,7 @@ func (c Config) MaskSecrets() Config {
 // wherever the incoming value is empty (the UI sends "" for masked fields).
 // Call this before saving a config received from the API.
 func (incoming *Config) PreserveMaskedSecrets(existing *Config) {
+	incoming.ModbusProxyWriteOwners = existing.ModbusProxyWriteOwners
 	incoming.ConfigDatabase = existing.ConfigDatabase
 	incoming.Revision = existing.Revision
 	incoming.LANPasswordHash = existing.LANPasswordHash
@@ -1911,6 +1918,12 @@ func isLegacyDefaultDriverRepository(repo DriverRepositorySource) bool {
 // Validate ensures the config is internally consistent and safe to run with.
 func (c *Config) Validate() error {
 	c.NormalizeUnits()
+	if err := c.validateSetup(); err != nil {
+		return err
+	}
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	if c.State != nil && c.State.ColdRetentionDays < 0 {
 		return fmt.Errorf("state.cold_retention_days must be >= 0, got %d", c.State.ColdRetentionDays)
 	}
@@ -2026,7 +2039,7 @@ func (c *Config) Validate() error {
 	if c.Site.MinDispatchIntervalS < 0 {
 		return errors.New("site.min_dispatch_interval_s must be >= 0")
 	}
-	if c.Fuse.MaxAmps <= 0 {
+	if c.Fuse.MaxAmps < 0 || c.Fuse.MaxAmps == 0 && !c.MeasurementOnly() {
 		return errors.New("fuse.max_amps must be > 0")
 	}
 	if c.Fuse.Phases <= 0 {
@@ -2302,6 +2315,9 @@ func SaveAtomic(path string, c *Config) error {
 }
 
 func saveAtomic(w durableWriter, path string, c *Config) error {
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	// Driver paths are resolved to absolute-ish paths at Load() time.
 	// Convert them back to config-relative before writing so that
 	// repeated save cycles don't accumulate extra "../" prefixes.

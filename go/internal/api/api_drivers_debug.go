@@ -197,6 +197,7 @@ func (s *Server) configuredDriver(name string) (config.Driver, bool) {
 	}
 	for _, d := range s.deps.Cfg.Drivers {
 		if d.Name == name {
+			d.ObserveOnly = d.ObserveOnly || s.deps.Cfg.ModbusProxyOwnsWrites(d)
 			return d, true
 		}
 	}
@@ -230,6 +231,17 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 		cfg = wrapped.Drivers[0]
 	}
 
+	s.runDriverTest(w, r, cfg, nil)
+}
+
+// runDriverTest also serves setup drafts. A setup caller supplies credentials
+// from its exact draft and a private rotation sink; it never borrows or writes
+// the live Settings document.
+func (s *Server) runDriverTest(w http.ResponseWriter, r *http.Request, cfg config.Driver, prepareProbe func(*drivers.Registry, string)) {
+	if strings.TrimSpace(cfg.Lua) == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing driver lua path"})
+		return
+	}
 	// Resolve UI-relative Lua paths the same way config.Load does.
 	baseDir := "."
 	if s.deps.ConfigPath != "" {
@@ -286,7 +298,12 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	reg.MQTTFactory = s.deps.DriverMQTTFactory
 	reg.ModbusFactory = s.deps.DriverModbusFactory
 	reg.ARPLookup = s.deps.DriverARPLookup
-	probeChangedSharedSecret := s.wireDriverProbeSecrets(reg, testName, probe)
+	probeChangedSharedSecret := func() string { return "" }
+	if prepareProbe != nil {
+		prepareProbe(reg, testName)
+	} else {
+		probeChangedSharedSecret = s.wireDriverProbeSecrets(reg, testName, probe)
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
@@ -750,7 +767,7 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 	// below it is what you reach for when the report does not settle the
 	// question. Shipping them together means the person asking for help
 	// sends one file and never has to pick the right one.
-	addFile("00-help-report.md", []byte(s.buildSupportReport(r.Context(), time.Now())))
+	addFile("00-help-report.md", []byte(redactDumpLog(s.buildSupportReport(r.Context(), now))))
 
 	manifest := map[string]any{
 		"generated_at": now.Format(time.RFC3339),
@@ -764,6 +781,8 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 			"00-help-report.md",
 			"config.redacted.yaml",
 			"drivers.json",
+			"planner.json",
+			"loadpoints.json",
 			"logs/global.log",
 			"logs/<driver>.log",
 			"telemetry/<driver>__<metric>.csv",
@@ -782,6 +801,8 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 	// All driver health in one file — easier to scan than one-per-driver.
 	healthBody, _ := json.MarshalIndent(s.deps.Tel.AllHealth(), "", "  ")
 	addFile("drivers.json", healthBody)
+	addFile("planner.json", supportJSON(s.supportPlanner(now)))
+	addFile("loadpoints.json", supportJSON(s.loadpointsPayload(now)))
 
 	// Logs. Lua host.log and HTTP error bodies often carry OAuth JSON;
 	// redact before the zip leaves the house.

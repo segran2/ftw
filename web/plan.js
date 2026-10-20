@@ -233,7 +233,29 @@ import {
     const badge = document.getElementById(id);
     if (!badge) return;
     badge.className = `plan-state-badge is-${planState.tone}`;
+    badge.dataset.state = planState.key;
     badge.textContent = planState.label;
+  }
+
+  function renderPlanWarningDetails(brief) {
+    let details = document.getElementById('plan-warning-details');
+    if (!brief.warningDetails) {
+      if (details) details.remove();
+      return;
+    }
+    if (!details) {
+      const constraint = document.getElementById('plan-constraint');
+      if (!constraint) return;
+      details = document.createElement('details');
+      details.id = 'plan-warning-details';
+      details.className = 'plan-warning-details';
+      const summary = document.createElement('summary');
+      summary.textContent = 'Show details';
+      details.append(summary, document.createElement('pre'));
+      constraint.parentElement.insertAdjacentElement('afterend', details);
+    }
+    const message = details.querySelector('pre');
+    if (message.textContent !== brief.warningDetails) message.textContent = brief.warningDetails;
   }
 
   function renderOverviewPlanBrief(brief) {
@@ -256,12 +278,14 @@ import {
       plan,
       status: state.status || {},
       socOpts: state.socOpts,
+      planning: state.planMeta || {},
     });
     applyStateBadge('plan-state-badge', brief.state);
     setText('plan-next-action', brief.next.action);
     setText('plan-next-time', brief.next.time);
     setText('plan-main-reason', brief.reason);
     setText('plan-constraint', brief.constraint);
+    renderPlanWarningDetails(brief);
     setText('plan-forecast-state', brief.forecast.label);
     setText('plan-forecast-detail', brief.forecast.detail);
     setText('plan-solver-state', brief.planner.label);
@@ -330,6 +354,7 @@ import {
     alert.textContent = solver.backend === "ev_reserve"
       ? "FTW is using a reserve plan for the departure target. Price optimisation is unavailable."
         + (missingWh > 1 ? ` The car is ${(missingWh / 1000).toFixed(1)} kWh short at departure. Check charging limits or allow more time.` : "")
+        + reason
       : 'Mathematical optimizer unavailable. This plan uses the built-in Go fallback.' + reason;
   }
 
@@ -780,6 +805,8 @@ import {
     if (summary) {
       if (!state.enabled || !state.enabled.mpc) {
         summary.textContent = unavailablePlannerCopy(state.enabled && state.enabled.mpcReason).summary;
+      } else if (state.planMeta && state.planMeta.error && !state.planMeta.replanning) {
+        summary.textContent = 'Cannot plan · ' + state.planMeta.error;
       } else if (!plan) {
         const visibleInputs = [];
         if (state.prices && state.prices.length) visibleInputs.push('prices');
@@ -824,7 +851,7 @@ import {
             ? `${solver.engine} fallback`
             : [solver.engine, solver.backend].filter(Boolean).join(' / ');
           const solverTitle = solver.fallback
-            ? `Primary optimizer failed: ${solver.fallback_reason || 'unknown error'}`
+            ? `Reserve plan: ${solver.fallback_reason || 'price optimisation unavailable'}`
             : `Solver status: ${solver.status || 'unknown'}; formulation: ${solver.formulation || 'unknown'}; solve: ${(solver.solve_ms || 0).toFixed(1)} ms`;
           parts.push(
             `<span title="${escapeHTML(solverTitle)}"><span class="s-label">solver </span>` +

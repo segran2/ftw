@@ -164,3 +164,13 @@ test('calculated site headroom explains an EV shortfall without claiming a vendo
   assert.doesNotMatch(controlStatus({...ev, site_headroom: {...ev.site_headroom, battery_charge_w: 0}}).text, /battery/);
   assert.equal(controlStatus({...ev, site_headroom: {...ev.site_headroom, projected_max_a: NaN}}).title, 'Not following');
 });
+
+
+test('limited positive EV offer does not explain prolonged zero delivery', () => {
+ const missing=controlStatus(row({kind:'ev',status:'not_following',reason:'no_power_response',severity:'warning',requested_w:10350,sent_w:6900,actual_w:0,requested_a:15,offered_a:10,device_reason:'limited by dynamic charger current'}));
+ assert.equal(missing.title,'Not following');
+ assert.match(missing.text,/6.9 kW charge.*no power/);
+ const capped=controlStatus(row({kind:'ev',status:'limited',reason:'fuse_limit',sent_w:6900,actual_w:6800}));
+ assert.equal(capped.title,'Limited by site power limits');
+ assert.match(capped.text,/fuse and import limits/);
+});

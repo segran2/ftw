@@ -1764,6 +1764,10 @@ footer {
 .app-device-row button {
   flex: 0 0 auto;
 }
+/* A watch sits under the phone that added it. */
+.app-device-watch {
+  padding-left: 16px;
+}
 /* Who the next code is for, on one line and wrapping on a narrow screen.
    Only one code is ever live, so these belong together rather than scattered
    down the panel as if they were independent settings. How the code travels —
@@ -1830,6 +1834,185 @@ footer {
   font-size: 0.75rem;
   line-height: 1.5;
   color: var(--text-dim);
+}
+
+/* ---- Access settings tab ---- */
+/* Who outside the house may reach it. The page reads top to bottom in the
+   order an owner acts: what is missing, the code, the offer, what waits for
+   a yes, and who has access now. */
+.access-lede {
+  margin: 0 0 10px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.access-quiet {
+  margin: 4px 0;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+/* What stops a grant is the first thing on the page, set apart from the
+   help around it, with the button that fixes it. */
+.access-blocked {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--amber);
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--amber) 10%, transparent);
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.access-blocked p { margin: 0 0 8px; }
+.access-blocked button { margin-right: 8px; }
+.access-code-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.modal-body .access-code-row input[type="text"] {
+  flex: 1 1 auto;
+  max-width: 14ch;
+  font-size: 1.1rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.access-code-row .btn-send { margin-top: 0; }
+.access-note { margin: 6px 0 0; font-size: 0.85rem; min-height: 1.2em; }
+#access-invites .access-invite-code {
+  display: block;
+  box-sizing: border-box;
+  width: 10ch;
+  padding: 12px;
+  margin: 12px 0 4px;
+  color: var(--text);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: 1.6rem/1.5 var(--mono, monospace);
+  letter-spacing: 0.08em;
+}
+#access-invites button { margin-right: 8px; }
+#access-invites .access-card { overflow-wrap: anywhere; }
+.access-error { margin: 6px 0 0; color: var(--red-e); font-size: 0.85rem; }
+.access-error:empty { display: none; }
+.access-warn { margin: 4px 0; color: var(--amber); font-size: 0.85rem; line-height: 1.4; }
+.access-done { color: var(--green-e); font-size: 0.85rem; }
+/* The offer, and a row being changed. A card, because it is one decision. */
+.access-card {
+  margin: 12px 0 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+}
+.access-card.access-done { border-color: var(--green-e); color: var(--text); }
+.access-card.access-done p:first-child { color: var(--green-e); font-weight: 600; }
+.access-title { margin: 0 0 6px; font-size: 1rem; line-height: 1.3; overflow-wrap: anywhere; }
+.access-heading { margin: 12px 0 2px; font-weight: 600; font-size: 0.85rem; }
+.access-subheading { margin: 10px 0 2px; color: var(--text-dim); font-size: 0.8rem; }
+.modal-body label.checkbox-row.access-check { margin: 4px 0; font-size: 0.85rem; }
+.modal-body label.checkbox-row.access-control-toggle { margin-top: 14px; font-weight: 600; font-size: 0.85rem; }
+.access-control {
+  margin-left: 6px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+}
+.access-cap-input { display: flex; gap: 8px; align-items: center; }
+.modal-body .access-cap-input input[type="number"] { max-width: 9ch; }
+.access-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.access-actions button { margin-top: 0; }
+.access-code-row button:disabled,
+.access-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* One assistant with access, or one request. Its name takes the line. */
+.access-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+.access-row:last-child { border-bottom: 0; }
+.access-row-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.access-row-name { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.access-row details { margin-top: 4px; font-size: 0.8rem; color: var(--text-dim); }
+.access-may { margin: 4px 0 0; padding-left: 18px; }
+.access-args {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 6px 0;
+  font-size: 0.8rem;
+}
+.access-args dt { color: var(--text-dim); }
+.access-args dd { margin: 0; overflow-wrap: anywhere; }
+.access-why { margin: 6px 0; overflow-wrap: anywhere; }
+
+/* ---- Cars settings tab ---- */
+/* One car per row: what can be changed, then how the box knows it. */
+.cars-lede {
+  margin: 0 0 10px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.cars-quiet {
+  margin: 4px 0;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+.cars-note { margin: 6px 0 0; font-size: 0.85rem; }
+.cars-note:empty { display: none; }
+.cars-error { margin: 6px 0 0; color: var(--red-e); font-size: 0.85rem; }
+.cars-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+.cars-row:last-child { border-bottom: 0; }
+.cars-edit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: end;
+}
+.modal-body .cars-edit label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+.modal-body .cars-edit input[type="text"] { width: 16ch; max-width: 100%; }
+.modal-body .cars-edit input[name="capacity"],
+.modal-body .cars-edit input[inputmode="decimal"] { width: 8ch; }
+.modal-body .cars-edit input[name="vin"] { width: 19ch; }
+.cars-edit .btn-send { margin-top: 0; }
+.cars-edit button:disabled,
+.cars-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.cars-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 10px 0 4px;
+  font-size: 0.8rem;
+}
+.cars-facts dt { color: var(--text-dim); }
+.cars-facts dd { margin: 0; overflow-wrap: anywhere; }
+.cars-actions { margin-top: 6px; }
+.cars-remove {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--red-e);
+  font: inherit;
+  font-size: 0.8rem;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 /* Collapse the generic two-column settings rows to a single column on phones,
@@ -2344,3 +2527,5 @@ body.ftw-app .forecast-card .twin-profile-toggle button { min-height: 40px; font
 .cs-row[data-tone="warning"] { border-color: var(--amber); }
 .cs-row[data-tone="alarm"] { border-color: var(--red-e); }
 .cs-device { color: var(--fg-dim); }
+
+.history-data-warning { color: var(--accent-e, #f5b942); font-size: 13px; margin: 8px 0; }

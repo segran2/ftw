@@ -34,6 +34,8 @@ jobs:
     name: verify, package and publish native ${{ inputs.channel }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      newly_published: ${{ steps.publication.outputs.newly_published }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,11 +55,6 @@ jobs:
           test "${GITHUB_REF}" = refs/heads/master
           test -n "${GH_TOKEN}"
           [[ "${CHANNEL}" = beta || "${CHANNEL}" = stable ]]
-          latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
-          if [[ ! "${latest}" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
-            echo "public latest must stay on a 2.x stable release (found ${latest})" >&2
-            exit 1
-          fi
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
             > "${RUNNER_TEMP}/native-release-pages.json"
@@ -66,6 +63,7 @@ jobs:
           # Stable checks out an older beta's source below, which may lack
           # this checker; keep the current one.
           cp scripts/check-native-schema.py "${RUNNER_TEMP}/check-native-schema.py"
+          cp scripts/write-native-release-notes.py "${RUNNER_TEMP}/write-native-release-notes.py"
           if [ "${CHANNEL}" = stable ]; then
             if [[ ! "${TAG}" =~ ^v0\.[0-9]+\.[0-9]+$ ]] ||
                [[ ! "${SOURCE_BETA}" =~ ^v0\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] ||
@@ -186,13 +184,12 @@ jobs:
               "sha256": assets,
           }
           (release / "ftw-native-release.json").write_text(json.dumps(receipt, indent=2) + "\n")
-          notes = f"Native FTW {receipt['tag']} from {receipt['commit']}.\n\n"
-          if receipt["source_beta"]:
-              notes += f"Promoted from site-tested {receipt['source_beta']}.\n\n"
-          notes += f"<!-- ftw-state-schema-v2:{receipt['state_schema']} -->\n"
-          (release / "notes.md").write_text(notes)
           PY
-      - name: Anchor immutable tag and publish without moving legacy latest
+          python3 "${RUNNER_TEMP}/write-native-release-notes.py" \
+            "${RUNNER_TEMP}/native-release/ftw-native-release.json" CHANGELOG.md \
+            "${RUNNER_TEMP}/native-release/notes.md" --repo "${GITHUB_REPOSITORY}"
+      - name: Anchor immutable tag and publish the selected channel
+        id: publication
         if: ${{ !inputs.dry_run }}
         env:
           CHANNEL: ${{ inputs.channel }}
@@ -264,13 +261,66 @@ jobs:
               "${release_dir}/ftw-native-release.json"
           if jq -e '.isDraft == true' <<<"${release_info}" >/dev/null; then
             gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --draft=false --latest=false --verify-tag
-          fi
-          latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
-          if [[ ! "${latest}" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
-            echo "native publication changed the old latest slot to ${latest}" >&2
-            exit 1
+              --draft=false --latest=false --verify-tag --notes-file "${release_dir}/notes.md"
+            echo "newly_published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "newly_published=false" >> "${GITHUB_OUTPUT}"
           fi
       - name: Report verified dry run
         if: ${{ inputs.dry_run }}
         run: echo "Verified native packages without creating a tag or release."
+
+  ha-addon:
+    name: Offer the published beta to the Home Assistant app
+    needs: publish
+    if: ${{ !inputs.dry_run && inputs.channel == 'beta' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify publication and request a pin PR
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          HA_ADDON_DISPATCH_TOKEN: ${{ secrets.HA_ADDON_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HA_ADDON_DISPATCH_TOKEN}" ]; then
+            echo "::notice::HA_ADDON_DISPATCH_TOKEN is absent; pin the Home Assistant app manually."
+            exit 0
+          fi
+          [[ "${TAG}" =~ ^v0\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease,assets | \
+            jq -e --arg tag "${TAG}" '
+              .tagName == $tag and .isDraft == false and .isPrerelease == true and
+              ([.assets[].name] | . as $names |
+                ["ftw-linux-amd64.tar.gz", "ftw-linux-amd64.tar.gz.sha256",
+                 "ftw-linux-arm64.tar.gz", "ftw-linux-arm64.tar.gz.sha256",
+                 "ftw-native-release.json"] | all(. as $name | $names | index($name) != null))
+            ' >/dev/null
+          receipt_dir=$(mktemp -d)
+          trap 'rm -rf "${receipt_dir}"' EXIT
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern ftw-native-release.json --dir "${receipt_dir}"
+          jq -e --arg tag "${TAG}" '
+            .schema == 1 and .channel == "beta" and .tag == $tag and
+            (.sha256.amd64 | test("^[0-9a-f]{64}$")) and
+            (.sha256.arm64 | test("^[0-9a-f]{64}$"))
+          ' "${receipt_dir}/ftw-native-release.json" >/dev/null
+          jq -n --arg tag "${TAG}" \
+            '{event_type:"ftw-native-release", client_payload:{tag:$tag, channel:"beta"}}' \
+            > "${receipt_dir}/dispatch.json"
+          GH_TOKEN="${HA_ADDON_DISPATCH_TOKEN}" gh api --method POST \
+            repos/srcfl/home-assistant-addons/dispatches --input "${receipt_dir}/dispatch.json"
+
+  discord:
+    needs: publish
+    if: ${{ !inputs.dry_run && needs.publish.outputs.newly_published == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-discord.yml
+    with:
+      tag: ${{ inputs.tag }}
+    secrets:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}

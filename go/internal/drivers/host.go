@@ -125,6 +125,13 @@ type HostEnv struct {
 	// this so a buggy driver_fingerprint cannot reconfigure hardware: bundled
 	// drivers otherwise have allowWrite as a no-op.
 	ProbeReadOnly bool
+	// DeviceReadOnly blocks device writes in every Lua phase when an
+	// external Modbus controller owns the endpoint.
+	DeviceReadOnly bool
+	// ControlBlocked is a live installation gate, including init and poll.
+	// Authentication paths come from this driver's catalog metadata.
+	ControlBlocked func() bool
+	SetupAuthPaths []string
 
 	// BatteryCapacityWh mirrors the operator's `battery_capacity_wh`
 	// declaration for this driver. Zero means "no physical battery
@@ -142,9 +149,13 @@ type HostEnv struct {
 	BatteryTelemetryOnly bool
 
 	mu sync.Mutex
-	// Desired poll interval — driver can set via host.set_poll_interval OR
-	// return it from driver_poll. We persist the last hint here.
-	PollIntervalMS int32
+	// Standing poll interval, 5 s until the driver calls
+	// host.set_poll_interval. Once it has, that interval wins over anything
+	// driver_poll returns.
+	PollIntervalMS  int32
+	pollIntervalSet bool
+	// scheduledPoll is the wait the run loop armed last, standing or returned.
+	scheduledPoll time.Duration
 	// Identity set by driver / capability layer.
 	// Make + SN are reported via host.set_make / host.set_sn.
 	// Endpoint is the protocol+host+port string set by the registry when
@@ -182,6 +193,12 @@ type HostEnv struct {
 	// ReserveVehicleWake checkpoints a telemetry wake before the driver sends it.
 	// The host binds this to hardware identity, independent of the driver name.
 	ReserveVehicleWake func(makeName, serial string) (bool, time.Duration, error)
+
+	// SiteLocation returns the site's latitude and longitude, or false when
+	// the site has none. host.site_location() gives it only to a vehicle
+	// driver, which turns its car's position into site_distance_m so the
+	// car's coordinates never leave the driver.
+	SiteLocation func() (lat, lon float64, ok bool)
 
 	// Poll-scoped Modbus evidence prevents a Modbus driver from turning failed
 	// reads into fresh zero-valued telemetry. The Lua runtime holds emissions
@@ -241,6 +258,18 @@ func (h *HostEnv) permissionAllowed(permission string) bool {
 // device, so it is admitted here instead, confined to the single path the
 // signed manifest names and only for a driver published read-only.
 func (h *HostEnv) allowAuthPost(rawURL string) bool {
+	if h.ControlBlocked != nil && h.ControlBlocked() && h.RuntimePolicy == nil {
+		parsed, err := net_url.Parse(rawURL)
+		if err != nil {
+			return false
+		}
+		for _, path := range h.SetupAuthPaths {
+			if path != "" && parsed.Path == path {
+				return true
+			}
+		}
+		return false
+	}
 	if h.RuntimePolicy == nil || !h.RuntimePolicy.ReadOnly {
 		return false
 	}
@@ -261,6 +290,12 @@ func (h *HostEnv) allowAuthPost(rawURL string) bool {
 }
 
 func (h *HostEnv) allowWrite(permission string) error {
+	if h.ControlBlocked != nil && h.ControlBlocked() {
+		return fmt.Errorf("%s: setup measurement mode blocks device writes", permission)
+	}
+	if h.DeviceReadOnly {
+		return fmt.Errorf("%s: external Modbus client owns control; FTW only reads", permission)
+	}
 	if h.ProbeReadOnly {
 		return fmt.Errorf("%s: fingerprint probe cannot write", permission)
 	}
@@ -540,6 +575,7 @@ func (h *HostEnv) log(level int32, msg string) {
 func (h *HostEnv) setPollInterval(ms int32) {
 	h.mu.Lock()
 	h.PollIntervalMS = ms
+	h.pollIntervalSet = true
 	h.mu.Unlock()
 }
 
@@ -792,14 +828,66 @@ func (h *HostEnv) stampIdentity(raw []byte) []byte {
 	return out
 }
 
-// PollInterval returns the driver's current requested poll cadence.
+// PollInterval returns the driver's standing poll cadence.
 func (h *HostEnv) PollInterval() time.Duration {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.standingPollIntervalLocked()
+}
+
+func (h *HostEnv) standingPollIntervalLocked() time.Duration {
 	if h.PollIntervalMS <= 0 {
 		return 5 * time.Second
 	}
 	return time.Duration(h.PollIntervalMS) * time.Millisecond
+}
+
+// Bounds for an interval a driver returns from driver_poll. The control
+// loop ticks every two seconds by default, and a phone sees a reading once a
+// second over the relay, so a read faster than a second mostly costs the
+// device's bus; some catalog drivers return 200 ms or 50 ms. Through FTW
+// Cloud each poll reaches the phone as it lands, up to five a second, so a
+// driver that sets a faster interval is seen at that rate. The ceiling is half the default
+// 60 s watchdog window, so a returned wait cannot make a driver stale by
+// itself: myuplink returns 60 s after a good read. A driver that needs longer
+// sets it with host.set_poll_interval, as the vehicle drivers do.
+const (
+	minReturnedPollInterval = time.Second
+	maxReturnedPollInterval = 30 * time.Second
+)
+
+// returnedPollInterval converts milliseconds returned by driver_poll. It caps
+// before converting: a Lua number can exceed the range of time.Duration.
+func returnedPollInterval(ms float64) time.Duration {
+	ms = math.Min(ms, float64(maxReturnedPollInterval/time.Millisecond))
+	return time.Duration(ms) * time.Millisecond
+}
+
+// nextPollInterval picks the wait before the next driver_poll. An interval
+// set with host.set_poll_interval wins, unbounded, as it always has. A driver
+// that never set one gets the positive interval its last poll returned,
+// within bounds, or the 5 s default.
+func (h *HostEnv) nextPollInterval(returned time.Duration) time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := h.standingPollIntervalLocked()
+	if !h.pollIntervalSet && returned > 0 {
+		next = min(max(returned, minReturnedPollInterval), maxReturnedPollInterval)
+	}
+	h.scheduledPoll = next
+	return next
+}
+
+// ScheduledPollInterval returns the wait the run loop armed last, or the
+// standing interval before the first poll has run.
+func (h *HostEnv) ScheduledPollInterval() time.Duration {
+	h.mu.Lock()
+	scheduled := h.scheduledPoll
+	h.mu.Unlock()
+	if scheduled > 0 {
+		return scheduled
+	}
+	return h.PollInterval()
 }
 
 // Identity returns (make, serial) set by the driver.

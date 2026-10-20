@@ -1023,6 +1023,23 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_component_updates_component
 			ON component_updates(kind, component_id, started_at_ms DESC)`,
 
+		// Who did what through an agent grant, and every change to one
+		// (docs/agents.md, The audit log). An owner reads it. Folded reads
+		// (count > 0) and everything else each keep AgentAuditRowsKept
+		// rows, and both AgentAuditDaysKept days.
+		`CREATE TABLE IF NOT EXISTS agent_audit (
+			seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+			at_ms     INTEGER NOT NULL,
+			actor     TEXT NOT NULL,
+			role      TEXT NOT NULL DEFAULT '',
+			principal TEXT NOT NULL DEFAULT '',
+			by_staff  TEXT NOT NULL DEFAULT '',
+			what      TEXT NOT NULL,
+			target    TEXT NOT NULL DEFAULT '',
+			result    TEXT NOT NULL,
+			count     INTEGER NOT NULL DEFAULT 0
+		) STRICT`,
+
 		`CREATE TABLE IF NOT EXISTS nova_ders (
 			device_id   TEXT NOT NULL,
 			der_type    TEXT NOT NULL,
@@ -1376,6 +1393,8 @@ func (s *Store) batteryModelKey(driverName string) string {
 
 // HistoryPoint is one row of the history table.
 type HistoryPoint struct {
+	Sources      *HistorySources `json:",omitempty"`
+	Missing      HistoryMissing
 	N            int64 `json:"n,omitempty"`
 	ResolutionMS int64 `json:"resolution_ms,omitempty"`
 	FirstMS      int64 `json:"first_ms,omitempty"`
@@ -1390,6 +1409,9 @@ type HistoryPoint struct {
 
 // RecordHistory inserts a live hot-tier entry into SQLite.
 func (s *Store) RecordHistory(p HistoryPoint) error {
+	if p.Missing != 0 {
+		return errors.New("partial history must use the aggregate tick writer")
+	}
 	var normalizeErr error
 	p, normalizeErr = normalizeHistoryPoint(p)
 	if normalizeErr != nil {
@@ -1412,6 +1434,9 @@ func (s *Store) RecordHistory(p HistoryPoint) error {
 // A retry is safe: the last history point for each timestamp wins.
 func (s *Store) BulkRecordHistory(pts []HistoryPoint) error {
 	for _, p := range pts {
+		if p.Missing != 0 {
+			return errors.New("partial history must use the aggregate tick writer")
+		}
 		if _, err := normalizeHistoryPoint(p); err != nil {
 			return err
 		}
@@ -1473,58 +1498,85 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 	if s.history == nil || untilMs < sinceMs {
 		return nil, nil
 	}
+	// Source energy is retained by minute. Do not paint a minute's mean as
+	// separate ten-second Load observations in either history client.
+	cut, sourceMode, err := s.sourceEnergyFrom(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sourceMode = sourceMode && untilMs >= cut
+	queryFrom := sinceMs
+	bucketMs := int64(0)
+	if maxPoints > 0 {
+		bucketMs = (untilMs - sinceMs + int64(maxPoints)) / int64(maxPoints)
+		bucketMs = max(1, bucketMs)
+	}
+	if sourceMode {
+		if maxPoints > 0 {
+			bucketMs = (untilMs - sinceMs + int64(maxPoints) - 1) / int64(maxPoints)
+		}
+		var sourceWidth int64
+		if err := s.history.QueryRowContext(ctx, `SELECT COALESCE(MAX(resolution_ms),?) FROM history_source_energy WHERE start_ms>=? AND start_ms<? AND start_ms+resolution_ms>?`, ArchiveResolutionMS, sinceMs-maxSourceEnergyWidth, untilMs, sinceMs).Scan(&sourceWidth); err != nil {
+			return nil, err
+		}
+		bucketMs = max(ArchiveResolutionMS, ((bucketMs+ArchiveResolutionMS-1)/ArchiveResolutionMS)*ArchiveResolutionMS)
+		bucketMs = max(sourceWidth, ((bucketMs+sourceWidth-1)/sourceWidth)*sourceWidth)
+		queryFrom = bucketStart(sinceMs, ArchiveResolutionMS)
+	}
 	// Union across all three tiers. Dedupe on ts_ms preferring hot over warm over cold.
 	// COALESCE to 0 so NULL columns (from partial aggregations) scan cleanly.
 	const tierUnion = `
 		WITH all_rows AS (
-			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 0 AS tier,1 AS n,1 AS resolution_ms,ts_ms AS first_ms FROM history_hot
+			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 0 AS tier,1 AS n,1 AS resolution_ms,ts_ms AS first_ms,0 AS missing FROM history_hot
 			WHERE ts_ms BETWEEN ? AND ?
 			UNION ALL
-			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 1,1,900000,ts_ms FROM history_warm
+			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 1,1,900000,ts_ms,0 FROM history_warm
 			WHERE ts_ms BETWEEN ? AND ?
 			UNION ALL
-			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 2,1,86400000,ts_ms FROM history_cold
+			SELECT ts_ms, grid_w, pv_w, bat_w, load_w, bat_soc, 2,1,86400000,ts_ms,0 FROM history_cold
 			WHERE ts_ms BETWEEN ? AND ?
-		UNION ALL SELECT last_ms,grid_w,pv_w,bat_w,load_w,bat_soc,-1,n,resolution_ms,first_ms FROM history_dashboard WHERE last_ms BETWEEN ? AND ?
+		UNION ALL SELECT last_ms,grid_w,pv_w,bat_w,load_w,bat_soc,-1,n,d.resolution_ms,first_ms,COALESCE(q.missing,0) FROM history_dashboard d LEFT JOIN history_quality q ON q.kind='dashboard' AND q.start_ms=d.start_ms AND q.resolution_ms=d.resolution_ms WHERE last_ms BETWEEN ? AND ?
+		UNION ALL SELECT last_ms,grid_w,pv_w,bat_w,load_w,bat_soc,-2,n,d.resolution_ms,first_ms,COALESCE(q.missing,0) FROM history_dashboard_partial d LEFT JOIN history_quality q ON q.kind='partial_dashboard' AND q.start_ms=d.start_ms AND q.resolution_ms=d.resolution_ms WHERE last_ms BETWEEN ? AND ?
  ),
 		deduped AS (
 			SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ts_ms ORDER BY tier) AS rn FROM all_rows) WHERE rn=1
 		)
 	`
+	rangeUnion := tierUnion
+	if sourceMode {
+		rangeUnion = strings.ReplaceAll(tierUnion, "ts_ms BETWEEN ? AND ?", "ts_ms >= ? AND ts_ms < ?")
+		rangeUnion = strings.ReplaceAll(rangeUnion, "last_ms BETWEEN ? AND ?", "last_ms >= ? AND last_ms < ?")
+	}
 	var (
-		rows *sql.Rows
-		err  error
+		rows     *sql.Rows
+		queryErr error
 	)
-	if maxPoints > 0 && untilMs >= sinceMs {
+	if bucketMs > 0 && untilMs >= sinceMs {
 		// Ceil the bucket width; SQLite MAX selects JSON from its newest row.
-		bucketMs := (untilMs - sinceMs + int64(maxPoints)) / int64(maxPoints)
-		if bucketMs < 1 {
-			bucketMs = 1
-		}
-		rows, err = s.history.QueryContext(ctx, tierUnion+`, bucketed AS (
+		rows, queryErr = s.history.QueryContext(ctx, rangeUnion+`, bucketed AS (
 			SELECT MAX(ts_ms) AS ts_ms,
 			       SUM(COALESCE(grid_w, 0)*n)/SUM(n) AS grid_w, SUM(COALESCE(pv_w, 0)*n)/SUM(n) AS pv_w,
 			       SUM(COALESCE(bat_w, 0)*n)/SUM(n) AS bat_w, SUM(COALESCE(load_w, 0)*n)/SUM(n) AS load_w,
-			       SUM(COALESCE(bat_soc, 0)*n)/SUM(n) AS bat_soc,SUM(n) AS n,MAX(resolution_ms) AS resolution_ms,MIN(first_ms) AS first_ms
+			       SUM(COALESCE(bat_soc, 0)*n)/SUM(n) AS bat_soc,SUM(n) AS n,MAX(resolution_ms) AS resolution_ms,MIN(first_ms) AS first_ms,`+historyMissingAggregate+` AS missing
 			FROM deduped GROUP BY (ts_ms - ?) / ?
 		)
 		SELECT ts_ms,grid_w,pv_w,bat_w,load_w,bat_soc,
-		COALESCE((SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
+		COALESCE((SELECT json FROM history_dashboard_partial WHERE last_ms=b.ts_ms),(SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
  (SELECT json FROM history_hot WHERE ts_ms=b.ts_ms),
 		         (SELECT json FROM history_warm WHERE ts_ms=b.ts_ms),
-		         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms
-		FROM bucketed b ORDER BY ts_ms`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, bucketMs)
+		         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms,missing
+		FROM bucketed b ORDER BY ts_ms`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, queryFrom, bucketMs)
 	} else {
-		rows, err = s.history.QueryContext(ctx, tierUnion+`
+		rows, queryErr = s.history.QueryContext(ctx, rangeUnion+`
 			SELECT ts_ms,COALESCE(grid_w,0),COALESCE(pv_w,0),COALESCE(bat_w,0),COALESCE(load_w,0),COALESCE(bat_soc,0),
-			COALESCE((SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
+			COALESCE((SELECT json FROM history_dashboard_partial WHERE last_ms=b.ts_ms),(SELECT json FROM history_dashboard WHERE last_ms=b.ts_ms),
  (SELECT json FROM history_hot WHERE ts_ms=b.ts_ms),
 			         (SELECT json FROM history_warm WHERE ts_ms=b.ts_ms),
-			         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms
-			FROM deduped b ORDER BY ts_ms LIMIT ?`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, maxRawSeriesPoints+1)
+			         (SELECT json FROM history_cold WHERE ts_ms=b.ts_ms),'{}'),n,resolution_ms,first_ms,missing
+			FROM deduped b ORDER BY ts_ms LIMIT ?`, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, sinceMs, untilMs, maxRawSeriesPoints+1)
 	}
-	if err != nil {
-		return nil, err
+	if queryErr != nil {
+		return nil, queryErr
 	}
 	defer rows.Close()
 
@@ -1532,8 +1584,11 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 	var bytes int
 	for rows.Next() {
 		var p HistoryPoint
-		if err := rows.Scan(&p.TsMs, &p.GridW, &p.PVW, &p.BatW, &p.LoadW, &p.BatSoC, &p.JSON, &p.N, &p.ResolutionMS, &p.FirstMS); err != nil {
+		if err := rows.Scan(&p.TsMs, &p.GridW, &p.PVW, &p.BatW, &p.LoadW, &p.BatSoC, &p.JSON, &p.N, &p.ResolutionMS, &p.FirstMS, &p.Missing); err != nil {
 			return all, err
+		}
+		if sourceMode {
+			p.ResolutionMS = max(p.ResolutionMS, bucketMs)
 		}
 		if p.ResolutionMS > 1 {
 			var detail map[string]any
@@ -1551,13 +1606,27 @@ func (s *Store) loadArchiveHistory(ctx context.Context, sinceMs, untilMs int64, 
 		}
 		all = append(all, p)
 	}
-	return all, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if sourceMode {
+		if err := s.applySourceLoadHistory(ctx, all, queryFrom, untilMs, bucketMs); err != nil {
+			return nil, err
+		}
+	}
+	return all, nil
 }
 
 // DayEnergy is the set of Wh totals over a time range, in site convention:
 // Import/Export are grid-boundary W split on sign; PV and LoadWh are always
 // positive accumulations; BatCharged/BatDischarged split bat_w on sign.
 type DayEnergy struct {
+	Missing HistoryMissing
+	// observed records flows with a known integration interval, including
+	// measured zero. It is derived from history rows, not persisted in the
+	// closed-day cache, whose totals retain their full-range quality mask.
+	observed        HistoryMissing
 	ImportWh        float64
 	ExportWh        float64
 	PVWh            float64
@@ -1571,6 +1640,23 @@ type DayEnergy struct {
 	// real measurement. Callers use this to tell "no data yet" apart from a
 	// genuine zero (mirrors the old `len(pts) > 1` guard).
 	Intervals int64
+}
+
+// MeasuredValue returns the recorded subtotal without claiming a complete
+// range. Positive energy proves a contribution even when a minute bucket
+// combines known and missing intervals; zero needs a known interval.
+func (d DayEnergy) MeasuredValue(flag HistoryMissing, value float64) any {
+	if d.Intervals > 0 && (d.Missing&flag == 0 || d.observed&flag != 0 || value > 0) {
+		return value
+	}
+	return nil
+}
+
+func (d DayEnergy) observedFlows() HistoryMissing {
+	if d.Intervals > 0 {
+		return d.observed | (MissingPower &^ d.Missing)
+	}
+	return d.observed
 }
 
 // DailyEnergy integrates history W columns over [sinceMs, untilMs] and returns
@@ -1713,13 +1799,13 @@ func (s *Store) dailyEnergyFromArchive(sinceMs, untilMs int64) (DayEnergy, error
 // authoritative — no TTL, no staleness check needed.
 func (s *Store) LoadDailyEnergy(day string) (DayEnergy, bool, error) {
 	const q = `
-		SELECT import_wh, export_wh, pv_wh, bat_charged_wh, bat_discharged_wh, load_wh
-		FROM energy_daily WHERE day = ?
+		SELECT import_wh, export_wh, pv_wh, bat_charged_wh, bat_discharged_wh, load_wh,q.missing,q.n
+		FROM energy_daily_partial d JOIN history_daily_quality q ON q.day=d.day WHERE d.day = ?
 	`
 	var d DayEnergy
 	err := s.history.QueryRow(q, day).Scan(
 		&d.ImportWh, &d.ExportWh, &d.PVWh,
-		&d.BatChargedWh, &d.BatDischargedWh, &d.LoadWh,
+		&d.BatChargedWh, &d.BatDischargedWh, &d.LoadWh, &d.Missing, &d.Intervals,
 	)
 	if err == sql.ErrNoRows {
 		return DayEnergy{}, false, nil
@@ -1735,10 +1821,21 @@ func (s *Store) LoadDailyEnergy(day string) (DayEnergy, bool, error) {
 // persisted via this method (the day is still accumulating); callers
 // should gate on "is closed day" before saving.
 func (s *Store) SaveDailyEnergy(day string, de DayEnergy) error {
+	return s.saveDailyEnergy(day, de, nil)
+}
+
+// SaveDailyEnergyForSourceMode cannot repopulate a legacy cache after the
+// first source batch invalidated it. The check and write share the writer
+// lock and transaction; an in-flight older API request may simply skip saving.
+func (s *Store) SaveDailyEnergyForSourceMode(day string, de DayEnergy, expectedSourceMode bool) error {
+	return s.saveDailyEnergy(day, de, &expectedSourceMode)
+}
+
+func (s *Store) saveDailyEnergy(day string, de DayEnergy, expectedSourceMode *bool) error {
 	s.historyWriteMu.Lock()
 	defer s.historyWriteMu.Unlock()
 	const q = `
-		INSERT INTO energy_daily(
+		INSERT INTO energy_daily_partial(
 			day, import_wh, export_wh, pv_wh, bat_charged_wh, bat_discharged_wh, load_wh, computed_at_ms
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(day) DO UPDATE SET
@@ -1750,12 +1847,37 @@ func (s *Store) SaveDailyEnergy(day string, de DayEnergy) error {
 			load_wh           = excluded.load_wh,
 			computed_at_ms    = excluded.computed_at_ms
 	`
-	_, err := s.history.Exec(q, day,
+	tx, err := s.history.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if expectedSourceMode != nil {
+		// Acquire SQLite's writer before checking the method, including when
+		// no cursor exists. Never upgrade a deferred read transaction to write.
+		if _, err := tx.Exec(`UPDATE history_source_cursor SET value=value WHERE key='through'`); err != nil {
+			return err
+		}
+		var current bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM history_source_cursor WHERE key='through')`).Scan(&current); err != nil {
+			return err
+		}
+		if current != *expectedSourceMode {
+			return nil
+		}
+	}
+	_, err = tx.Exec(q, day,
 		de.ImportWh, de.ExportWh, de.PVWh,
 		de.BatChargedWh, de.BatDischargedWh, de.LoadWh,
 		time.Now().UnixMilli(),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO history_daily_quality VALUES(?,?,?) ON CONFLICT(day) DO UPDATE SET missing=excluded.missing,n=excluded.n`, day, de.Missing, de.Intervals); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CountHistoryWithoutMarker returns the number of history rows across all

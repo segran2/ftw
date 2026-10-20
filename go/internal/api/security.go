@@ -120,6 +120,26 @@ func Authenticate(next http.Handler, policy MutationPolicy) http.Handler {
 	})
 }
 
+// remoteProved reports whether a request has shown what a protected request
+// must: it came from a local client to a local host name, or it carries
+// FTW_API_TOKEN where the policy asks remote callers for it. A read that is
+// open to anyone uses it to leave out what identifies a person's property,
+// such as a car's VIN, which a protected request would have had to prove
+// itself to see.
+func remoteProved(r *http.Request, policy MutationPolicy) bool {
+	if !policy.RequireTokenForRemote {
+		return true
+	}
+	reqAuthority, err := parseAuthority(r.Host)
+	if err != nil {
+		return false
+	}
+	if isLocalAuthority(reqAuthority) && isLocalClient(r.RemoteAddr) {
+		return true
+	}
+	return strings.TrimSpace(policy.Token) != "" && validBearerToken(r.Header.Get("Authorization"), policy.Token)
+}
+
 func lanAuthOn(policy MutationPolicy) bool {
 	return policy.LANAuthEnabled != nil && policy.LANAuthEnabled()
 }
@@ -134,7 +154,8 @@ func lanAuthExempt(path string) bool {
 }
 
 func decideLANCaller(r *http.Request, policy MutationPolicy, houseOK bool) apiauth.Caller {
-	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || houseOK {
+	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || houseOK ||
+		validBearerToken(r.Header.Get("Authorization"), policy.Token) {
 		return localCaller(r)
 	}
 	return lanViewerCaller(r)
@@ -240,6 +261,7 @@ func requiresMutationProtection(r *http.Request) bool {
 func protectedReadPath(path string) bool {
 	switch path {
 	case "/api/config",
+		"/api/setup/draft",
 		"/api/support/dump",
 		"/api/support/report",
 		"/api/logs",
@@ -268,6 +290,9 @@ func protectedReadPath(path string) bool {
 		"/api/notifications/vapid",
 		"/api/device_repository/catalog",
 		"/api/app-link/status",
+		"/api/agents",
+		"/api/agents/audit",
+		"/api/agent-invites",
 		"/api/ocpp/chargers":
 		return true
 	}

@@ -3,6 +3,9 @@ package appproto
 import (
 	"context"
 	"errors"
+	"github.com/srcfl/ftw/go/protocol"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -44,9 +47,36 @@ type fakeLoadpoints struct {
 	surplusCalls   int
 	onSurplus      func()
 	persistenceErr error
+
+	// powerW is what Readings reports the charger drawing.
+	powerW float64
+	// car is what each charger carries about its car, and socSource and
+	// socEstimate where its level came from.
+	car         protocol.ChargerCar
+	carByID     map[string]protocol.ChargerCar
+	socSource   string
+	socEstimate bool
 }
 
 func (f *fakeLoadpoints) WaitForPersistence(context.Context) error { return f.persistenceErr }
+
+func (f *fakeLoadpoints) carOn(id string) protocol.ChargerCar {
+	if c, ok := f.carByID[id]; ok {
+		return c
+	}
+	return f.car
+}
+
+func (f *fakeLoadpoints) Readings() []LoadpointReading {
+	out := []LoadpointReading{}
+	for _, id := range slices.Sorted(maps.Keys(f.ids)) {
+		out = append(out, LoadpointReading{
+			ID: id, Plugged: f.plugged, SoC: f.soc, SoCKnown: f.plugged && f.socKnown, PowerW: f.powerW, Car: f.carOn(id),
+			SoCSource: f.socSource, SoCEstimate: f.socEstimate,
+		})
+	}
+	return out
+}
 
 func TestLoadpointWriteDoesNotConfirmUncommittedChoice(t *testing.T) {
 	h, lp, _, rec, _ := newEVRig(t)
@@ -86,6 +116,22 @@ func (f *fakeLoadpoints) ObservedHold(id string, _ time.Time) (loadpoint.ManualH
 		return loadpoint.ManualHold{}, false
 	}
 	return f.hold, true
+}
+
+func (f *fakeLoadpoints) HoldIfOwn(id string, h loadpoint.ManualHold, now time.Time) bool {
+	if cur, held := f.ObservedHold(id, now); held && cur.SetBy != h.SetBy {
+		return false
+	}
+	f.Hold(id, h)
+	return true
+}
+
+func (f *fakeLoadpoints) ClearHoldIfOwn(id, setBy string, now time.Time) bool {
+	if cur, held := f.ObservedHold(id, now); !held || cur.SetBy != setBy {
+		return false
+	}
+	f.ClearHold(id)
+	return true
 }
 
 func (f *fakeLoadpoints) Boost(id string, lease loadpoint.BatteryBoostLease, _ time.Time) error {

@@ -3,37 +3,60 @@ package telemetry
 import (
 	"encoding/json"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/units"
 )
 
-// VehicleMaxAge is the freshness window past which a DerVehicle reading
-// is considered stale enough to ignore for control decisions. Picked
-// conservatively at 5 min so a vehicle driver that has lost contact
-// (asleep car, paired-proxy outage, cloud-API throttle) cannot keep an
-// old SoC live as ground truth. Tighter than this would churn against
-// vendors whose backends only refresh on a 60–120 s cadence; looser
-// would mean acting on a value that no longer reflects reality.
+// VehicleMaxAge is how long a car's charging state counts as live: what
+// wakes the car and what tells the box its goal is done. Picked at 5 min so
+// a vehicle driver that has lost contact (asleep car, paired-proxy outage,
+// cloud-API throttle) cannot keep an old state live. It no longer ages the
+// car's level: a level stays the car's until energy flows (docs/cars.md).
 const VehicleMaxAge = 5 * time.Minute
 
-// VehicleAnchorMaxAge bounds how old a car reading may be and still anchor
-// a loadpoint's SoC estimate. The loadpoint adds the energy delivered since
-// the reading, so age adds only metering error. Cloud sources such as the
-// VW Group portal report every 15 minutes.
-const VehicleAnchorMaxAge = time.Hour
+// A vehicle driver may give the car's distance from the site instead of
+// at_site. Within SiteNearM the car is here; beyond SiteAwayM it is
+// elsewhere; between, the box does not know. The site's position is the
+// weather pin, set for forecasts with a click on a map shown at zoom 11, so
+// it can be off by a kilometre or more. A car that wrongly reads as
+// elsewhere turns the only car into a visitor (docs/cars.md), which is worse
+// than not knowing.
+const (
+	SiteNearM = 300.0
+	SiteAwayM = 5000.0
+)
 
-// VehiclePick is the "best matching" DerVehicle reading for a loadpoint:
-// the one most likely to be the car physically connected right now.
-// Empty Driver means "no usable reading" — the caller should fall back
-// to whatever inferred SoC was already in place.
-type VehiclePick struct {
-	Driver        string
-	SoC           float64 // bounded [0,1]
-	ChargeLimit   float64 // bounded [0,1]
-	ChargingState string
-	Stale         bool      // false for usable picks; retained in the result shape
-	UpdatedAt     time.Time // wall-clock of the last fresh SoC observation
+// atSiteFromDistance turns a distance from the site into the car's at_site.
+// Nil is unknown, as is a distance that is not a finite, non-negative number.
+func atSiteFromDistance(m *float64) *bool {
+	if m == nil || math.IsNaN(*m) || math.IsInf(*m, 0) || *m < 0 {
+		return nil
+	}
+	switch {
+	case *m <= SiteNearM:
+		v := true
+		return &v
+	case *m > SiteAwayM:
+		v := false
+		return &v
+	}
+	return nil
+}
+
+// pluggedSinceFrom reads plugged_since_ms, the unix ms at which the car's
+// source saw its cable take the state plugged says. Zero is unknown, as is a
+// time before 2020 or more than a day ahead of now.
+func pluggedSinceFrom(ms *float64, now time.Time) time.Time {
+	if ms == nil || math.IsNaN(*ms) || math.IsInf(*ms, 0) {
+		return time.Time{}
+	}
+	t := time.UnixMilli(int64(*ms))
+	if t.Before(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)) || t.After(now.Add(24*time.Hour)) {
+		return time.Time{}
+	}
+	return t
 }
 
 // VehicleConnectedRank scores how likely a DerVehicle driver is to be
@@ -43,9 +66,8 @@ type VehiclePick struct {
 // translated inside each Lua driver). Higher rank = more likely
 // connected. Negative = explicitly not connected; caller should skip.
 //
-// Single source of truth for the rank table — both main.go (MPC plan
-// inputs) and api.go (loadpoint decoration) call this so multi-vehicle
-// pick decisions stay consistent.
+// The cars runtime reads a rank of 1 or more as the car's word that a cable
+// is in, and 3 as the car charging.
 func VehicleConnectedRank(chargingState string) int {
 	switch chargingState {
 	case "Charging", "Starting":
@@ -61,159 +83,13 @@ func VehicleConnectedRank(chargingState string) int {
 	}
 }
 
-// PickBestVehicle scans the store for the single DerVehicle reading
-// most likely to be the car connected right now: highest
-// VehicleConnectedRank, tiebreak by freshness. Returns a zero-value
-// VehiclePick if no usable reading exists.
-//
-// Defenses applied here (do NOT skip — every vehicle driver pulls
-// from a network trust boundary, whether a local BLE proxy, an
-// in-LAN OEM gateway, or a cloud API):
-//   - SoC bounded to [0,1] — a misbehaving driver reporting 2.0 or
-//     -0.5 must not be able to overcharge or freeze EV charging.
-//   - ChargeLimit bounded to [0,1] — same risk.
-//   - Stale by `now − SoCUpdatedAt > VehicleMaxAge` — wallclock check on
-//     the last fresh SoC observation, even when newer power or metadata
-//     updates carry the last-known value forward. A driver that stops
-//     publishing SoC mustn't keep it live forever.
-//   - Explicit `stale=true` — a driver that knows its upstream value is stale
-//     can stop control from using it before the wallclock limit.
-//   - Driver health-online check — offline drivers contribute nothing.
-//
-// Lives in telemetry/ rather than api/ or cmd/ because both packages
-// need it and the dependency direction otherwise cycles.
-func PickBestVehicle(s *Store, now time.Time) VehiclePick {
-	return pickBestVehicle(s, 0, now, VehicleMaxAge, false)
-}
-
-// PickBestVehicleForLoadpoint adds connection-evidence gating: when
-// the loadpoint is delivering power right now (current_power_w over
-// the threshold), the picker requires the vehicle's charging_state
-// to be Charging or Starting (rank 3). Any other state — including
-// Stopped/Complete on a vehicle parked elsewhere — is rejected, so
-// a second car returning SoC from outside this charger cannot win
-// the pick on freshness alone.
-//
-// When the loadpoint is plugged but idle (no current draw), gating
-// falls back to the standard rank-based pick. We don't have strong
-// evidence which car is connected during idle, but the planner is
-// also not actively committing power, so a wrong pick during this
-// window is much lower-impact than during active delivery.
-func PickBestVehicleForLoadpoint(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
-	minRank := 0 // any non-Disconnected
-	if lpDeliveringPower {
-		// Strict: only Charging/Starting count as evidence the vehicle
-		// is on this charger. A vehicle reporting Stopped while another
-		// loadpoint is at 11 kW is definitely not the connected one.
-		minRank = 3
-	}
-	return pickBestVehicle(s, minRank, now, VehicleMaxAge, false)
-}
-
-// PickVehicleForAnchor applies the loadpoint gates with VehicleAnchorMaxAge.
-// Its SoC is a past observation: anchor it at UpdatedAt, never as now.
-func PickVehicleForAnchor(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
-	minRank := 0
-	if lpDeliveringPower {
-		minRank = 3
-	}
-	return pickBestVehicle(s, minRank, now, VehicleAnchorMaxAge, false)
-}
-
-// PickBestVehicleForDisplay retains an otherwise valid last-known vehicle
-// observation after the five-minute control freshness window. The returned
-// pick is marked stale, so presentation can show provenance and age without
-// making the old SoC usable by MPC or control.
-func PickBestVehicleForDisplay(s *Store, lpDeliveringPower bool, now time.Time) VehiclePick {
-	minRank := 0
-	if lpDeliveringPower {
-		minRank = 3
-	}
-	return pickBestVehicle(s, minRank, now, VehicleMaxAge, true)
-}
-
-// PickVehicleForCompletion requires one vehicle source. Rank and freshness
-// cannot bind one of several cars to a charger or prove that its goal is done.
-// Callers must also check that only one loadpoint is connected.
-func PickVehicleForCompletion(s *Store, now time.Time) VehiclePick {
-	if s == nil || len(s.ReadingsByType(DerVehicle)) != 1 {
-		return VehiclePick{}
-	}
-	return pickBestVehicle(s, 1, now, VehicleMaxAge, false)
-}
-
-func pickBestVehicle(s *Store, minRank int, now time.Time, maxAge time.Duration, allowAgeStale bool) VehiclePick {
-	if s == nil {
-		return VehiclePick{}
-	}
-	var best VehiclePick
-	bestRank := -1
-	for _, vr := range s.ReadingsByType(DerVehicle) {
-		socValue := vr.SoC
-		socUpdatedAt := vr.SoCUpdatedAt
-		cachedDisplay := false
-		if allowAgeStale {
-			if value, observedAt, ok := cachedVehicleDisplay(s, vr); ok {
-				socValue = &value
-				socUpdatedAt = observedAt
-				cachedDisplay = true
-			}
-		}
-		if socValue == nil {
-			continue
-		}
-		if h := s.DriverHealth(vr.Driver); h == nil || !h.IsOnline() {
-			continue
-		}
-		if socUpdatedAt.IsZero() {
-			continue
-		}
-		age := now.Sub(socUpdatedAt)
-		if age > maxAge && !allowAgeStale {
-			// Reading is older than we're willing to trust as ground
-			// truth — driver probably stopped publishing. Skip rather
-			// than risk acting on a stale SoC.
-			continue
-		}
-		var meta struct {
-			ChargingState  string  `json:"charging_state"`
-			ChargeLimit    float64 `json:"charge_limit"`
-			ChargeLimitPct float64 `json:"charge_limit_pct"`
-			Stale          bool    `json:"stale"`
-		}
-		if len(vr.Data) > 0 {
-			_ = json.Unmarshal(vr.Data, &meta)
-		}
-		if meta.Stale && !allowAgeStale {
-			continue
-		}
-		rank := VehicleConnectedRank(meta.ChargingState)
-		if rank < 0 || rank < minRank {
-			continue
-		}
-		if rank < bestRank || (rank == bestRank && !socUpdatedAt.After(best.UpdatedAt)) {
-			continue
-		}
-		soc := units.ClampFraction(*socValue)
-		limit := units.ClampFraction(units.DecodeJSONFraction(meta.ChargeLimit, meta.ChargeLimitPct))
-		best = VehiclePick{
-			Driver:        vr.Driver,
-			SoC:           soc,
-			ChargeLimit:   limit,
-			ChargingState: meta.ChargingState,
-			Stale:         age > VehicleMaxAge || meta.Stale || cachedDisplay,
-			UpdatedAt:     socUpdatedAt,
-		}
-		bestRank = rank
-	}
-	return best
-}
-
 // Cached car reports can arrive before any fresh report after a restart.
 // Store.SoC intentionally retains only control-trusted observations. Read the
-// latest raw report for presentation alone, requiring its explicit cache flag
-// and the driver's measured SoC age. Never synthesize a fresh receipt time.
-func cachedVehicleDisplay(s *Store, vr *DerReading) (float64, time.Time, bool) {
+// latest raw report with its explicit cache flag and measured SoC age. It may
+// be displayed or anchored in a session with known metering history, but must
+// never become a live observation or confirm completion. Never synthesize a
+// fresh receipt time.
+func cachedVehicleObservation(s *Store, vr *DerReading) (float64, time.Time, bool) {
 	var report struct {
 		SoC      *float64 `json:"soc"`
 		SoCFresh *bool    `json:"soc_fresh"`
@@ -232,4 +108,101 @@ func cachedVehicleDisplay(s *Store, vr *DerReading) (float64, time.Time, bool) {
 		return 0, time.Time{}, false
 	}
 	return units.DecodeJSONFraction(0, raw), receivedAt.Add(-time.Duration(age * float64(time.Second))), true
+}
+
+// VehicleObservation is one vehicle driver's newest level report. The cars
+// runtime binds each driver to a car (docs/cars.md), so nothing here ranks
+// one driver against another or ages a reading out: a level with no energy
+// delivered since stays the car's level however old it is.
+type VehicleObservation struct {
+	Driver        string
+	SoC           float64   // bounded [0,1]
+	ChargeLimit   float64   // bounded [0,1], 0 when unknown
+	ChargingState string    // the canonical vocabulary of VehicleConnectedRank
+	At            time.Time // when the car measured SoC
+	// Stale is the driver's own stale flag, or a cached replay. Such a
+	// level may anchor an estimate, but its charging state is not live.
+	Stale bool
+	// Plugged and AtSite are the car's own word on its cable and place,
+	// when its driver gives them. Nil is unknown. AtSite comes from
+	// at_site, or else from site_distance_m.
+	Plugged *bool
+	AtSite  *bool
+	// PluggedSince is when the car's source saw its cable take the state
+	// Plugged says, by its own clock: Home Assistant's last_changed, or the
+	// first reading that showed it. Zero is unknown.
+	PluggedSince time.Time
+	// ReportedAt is when the driver last reported anything, which can be
+	// later than At: a cable changes without a new level.
+	ReportedAt time.Time
+}
+
+// Live reports whether the charging state is current enough to act on:
+// not stale, and measured within VehicleMaxAge.
+func (o VehicleObservation) Live(now time.Time) bool {
+	age := now.Sub(o.At)
+	return !o.Stale && age >= 0 && age <= VehicleMaxAge
+}
+
+// VehicleObservations lists the newest level report of every online vehicle
+// driver, sorted by driver name. Every vehicle driver pulls from a network
+// trust boundary, so the bounds hold here: SoC and charge limit within
+// [0,1] (the store refuses an SoC outside it), an offline driver contributes
+// nothing, and a carried value keeps the time the car measured it. A cached
+// cloud report, with its measured age, stands in when the driver has no
+// fresher level; it is marked stale.
+func VehicleObservations(s *Store) []VehicleObservation {
+	if s == nil {
+		return nil
+	}
+	var out []VehicleObservation
+	for _, vr := range s.ReadingsByType(DerVehicle) {
+		if h := s.DriverHealth(vr.Driver); h == nil || !h.IsOnline() {
+			continue
+		}
+		socValue, at := vr.SoC, vr.SoCUpdatedAt
+		cached := false
+		if value, observedAt, ok := cachedVehicleObservation(s, vr); ok &&
+			(socValue == nil || at.IsZero() || !observedAt.Before(at)) {
+			socValue, at, cached = &value, observedAt, true
+		}
+		if socValue == nil || at.IsZero() {
+			continue
+		}
+		var meta struct {
+			ChargingState  string   `json:"charging_state"`
+			ChargeLimit    float64  `json:"charge_limit"`
+			ChargeLimitPct float64  `json:"charge_limit_pct"`
+			Stale          bool     `json:"stale"`
+			Plugged        *bool    `json:"plugged"`
+			PluggedSince   *float64 `json:"plugged_since_ms"`
+			AtSite         *bool    `json:"at_site"`
+			SiteDistanceM  *float64 `json:"site_distance_m"`
+		}
+		if len(vr.Data) > 0 {
+			_ = json.Unmarshal(vr.Data, &meta)
+		}
+		atSite := meta.AtSite
+		if atSite == nil {
+			atSite = atSiteFromDistance(meta.SiteDistanceM)
+		}
+		var since time.Time
+		if meta.Plugged != nil {
+			since = pluggedSinceFrom(meta.PluggedSince, vr.UpdatedAt)
+		}
+		out = append(out, VehicleObservation{
+			Driver:        vr.Driver,
+			SoC:           units.ClampFraction(*socValue),
+			ChargeLimit:   units.ClampFraction(units.DecodeJSONFraction(meta.ChargeLimit, meta.ChargeLimitPct)),
+			ChargingState: meta.ChargingState,
+			At:            at,
+			Stale:         meta.Stale || cached,
+			Plugged:       meta.Plugged,
+			AtSite:        atSite,
+			PluggedSince:  since,
+			ReportedAt:    vr.UpdatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Driver < out[j].Driver })
+	return out
 }

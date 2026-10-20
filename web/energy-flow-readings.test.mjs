@@ -3,6 +3,56 @@ import { describe, it } from "node:test";
 
 import { flowReadingsFromStatus, fmtKwhShort } from "./components/energy-flow-readings.js";
 
+it("shows current household power without a note about the past energy mean", () => {
+  const estimate = {watts: 886, from_ms: Date.UTC(2026,9,18,10), to_ms: Date.UTC(2026,9,18,10,1), age_ms: 90000, end_age_ms:60000, energy_basis:'mixed', timing_basis: 'mixed'};
+  const status = {load_w: 1800, load_estimate: estimate, energy:{today:{load_wh:2000,import_wh:500,history_quality:'estimated'}}};
+  const result = flowReadingsFromStatus(status);
+  assert.equal(result.load, 1.8);
+  assert.equal(result.loadEstimated, true);
+  assert.equal(status.load_w, 1800);
+  assert.equal(result.selfPoweredPctToday, null);
+  assert.equal("homeEstimateNote" in result, false);
+  assert.equal(flowReadingsFromStatus({...status,load_estimate:{watts:null}}).load, 1.8);
+  assert.equal(flowReadingsFromStatus({...status,load_estimate:{...estimate,end_age_ms:181000}}).load, 1.8);
+  assert.equal(flowReadingsFromStatus({...status,load_w:null}).load, null);
+});
+
+it("never lets a past zero mean overwrite a positive current Load", () => {
+  const status={load_w:1234,history_quality:"complete",load_estimate:{watts:0,from_ms:1000,to_ms:11000,end_age_ms:60000}};
+  const result=flowReadingsFromStatus(status);
+  assert.equal(result.load,1.234);
+  const missing=flowReadingsFromStatus({...status,load_w:null,history_quality:"incomplete"});
+  assert.equal(missing.load,null);
+});
+
+it("keeps a qualified power balance visible while the energy interval is unavailable", () => {
+  for (const reason of ["incomplete_source_window", "charger_source_time_unavailable", "stale_source_window"]) {
+    const status = {load_w: 1234, history_quality: "complete", load_estimate:{watts:null, reason}};
+    const result = flowReadingsFromStatus(status);
+    assert.equal(result.load, 1.234);
+    assert.equal(result.loadEstimated, true);
+    assert.equal(status.load_estimate.watts, null);
+  }
+});
+
+it("distinguishes a real zero balance from missing, invalid or stale inputs", () => {
+  const base = {history_quality:"complete",load_estimate:{watts:null,reason:"incomplete_source_window"}};
+  assert.equal(flowReadingsFromStatus({...base,load_w:0}).load,0);
+  for (const value of [undefined, null, "0", NaN, Infinity, -1]) {
+    const result = flowReadingsFromStatus({...base,load_w:value});
+    assert.equal(result.load,null);
+  }
+});
+
+it("renders Core load validity without another history-quality decision", () => {
+  for (const quality of ["complete", "incomplete", "balance_mismatch"]) {
+    const status = {history_quality: quality, load_estimate: {watts: null}};
+    assert.equal(flowReadingsFromStatus({...status, load_w: 1234}).load, 1.234);
+    assert.equal(flowReadingsFromStatus({...status, load_w: 0}).load, 0);
+    assert.equal(flowReadingsFromStatus({...status, load_w: null}).load, null);
+  }
+});
+
 const LIVE = {
   grid_w: 500,
   load_w: 970,
@@ -26,6 +76,23 @@ const LIVE = {
 };
 
 describe("flowReadingsFromStatus", () => {
+  it("keeps a missing solar day total unknown instead of inventing zero", () => {
+    const status = structuredClone(LIVE);
+    status.energy.today.pv_wh = null;
+    const solar = flowReadingsFromStatus(status).planets.find(p => p.role === "pv");
+    assert.equal(solar.dailyKwh, "Unknown");
+  });
+
+  it("marks measured day energy after a gap without inferring a daily share", () => {
+    const status = structuredClone(LIVE);
+    status.energy.today.pv_wh = null;
+    status.energy.today.load_wh = null;
+    status.energy.today.measured = {pv_wh: 600, load_wh: 1200};
+    const result = flowReadingsFromStatus(status);
+    assert.equal(result.planets.find(p => p.role === "pv").dailyKwh, "≥ 0.60 kWh");
+    assert.equal(result.selfPoweredPctToday, null);
+  });
+
   it("draws one planet per live driver and hides a spare offline inverter", () => {
     const r = flowReadingsFromStatus(LIVE);
     assert.deepEqual(

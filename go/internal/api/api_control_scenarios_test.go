@@ -381,6 +381,7 @@ func TestLoadBalancedChargerReadsAsLimited(t *testing.T) {
 		{"named", `,"current_limited_by":"load_balancer"`, 8300, "limited", "load_balancer_limit", "info"},
 		{"held at zero", `,"current_limited_by":"load_balancer"`, 0, "limited", "load_balancer_limit", "info"},
 		{"not named", ``, 8300, "not_following", "power_below_target", "warning"},
+		{"zero without a named limiter", ``, 0, "not_following", "no_power_response", "warning"},
 		{"above target", `,"current_limited_by":"load_balancer"`, 13000, "not_following", "power_above_target", "warning"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

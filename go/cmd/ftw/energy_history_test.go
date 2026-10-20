@@ -82,16 +82,16 @@ func TestBuildHistoryPointExcludesUnavailableTelemetry(t *testing.T) {
 
 	point, available := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "site-meter"},
 		now.UnixMilli(), time.Minute)
-	if available {
-		t.Fatalf("offline site meter produced history: %+v", point)
+	if !available || point.Missing&state.MissingGrid == 0 {
+		t.Fatalf("offline site meter became known or lost live devices: %+v", point)
 	}
 
 	tel.Update("site-meter", telemetry.DerMeter, 800, nil, nil)
 	tel.RecordDriverSuccess("site-meter")
 	point, available = buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "site-meter"},
 		now.UnixMilli(), time.Minute)
-	if available {
-		t.Fatalf("missing PV/battery treated as zero in household history: %+v", point)
+	if !available || point.Missing&(state.MissingPV|state.MissingBattery|state.MissingLoad) == 0 {
+		t.Fatalf("missing PV/battery became known or lost live meter: %+v", point)
 	}
 	// The aggregate becomes known only after every significant flow recovers.
 	tel.Update("stale-pv", telemetry.DerPV, -800, nil, nil)
@@ -140,8 +140,8 @@ func TestBuildHistoryPointRequiresFreshEVAndV2X(t *testing.T) {
 
 	point, available := buildHistoryPoint(tel, tickPersistControl{SiteMeterDriver: "site-meter"},
 		now.UnixMilli(), time.Minute)
-	if available {
-		t.Fatalf("aged EV/V2X became zero household demand: %+v", point)
+	if !available || point.Missing&(state.MissingEV|state.MissingV2X|state.MissingLoad) == 0 {
+		t.Fatalf("aged EV/V2X became known or lost live meter: %+v", point)
 	}
 
 }
@@ -162,6 +162,9 @@ func TestPersistTelemetryTickUsesPersistenceFreshness(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
+			if err := st.EnableHistoryAggregation(); err != nil {
+				t.Fatal(err)
+			}
 			tickMS := time.Now().Add(-5 * time.Second).UnixMilli()
 			tel := telemetry.NewStore()
 			tel.EnsureDriverHealth("meter")
@@ -183,21 +186,40 @@ func TestPersistTelemetryTickUsesPersistenceFreshness(t *testing.T) {
 			if (len(history) == 1) != tc.wantSaved {
 				t.Fatalf("history = %+v, want saved=%v", history, tc.wantSaved)
 			}
-			if tc.wantSaved && (history[0].TsMs != tickMS || history[0].LoadW != 1200) {
-				t.Fatalf("tick timestamp or household power changed: %+v", history[0])
+			if tc.wantSaved && (history[0].TsMs != tickMS || history[0].GridW != 1200 || history[0].Missing&state.MissingLoad == 0) {
+				t.Fatal("fresh grid receipt lost or instantaneous Load entered history")
+			}
+			if tc.wantSaved {
+				p, _ := buildHistoryPoint(tel, ctrl, tickMS, time.Minute)
+				if p.Sources.AtMS < sampleAt.UnixMilli() || p.Sources.Missing != 0 {
+					t.Fatal("fresh source snapshot predates receipt or became unknown")
+				}
 			}
 			assets, err := st.EnergyAssets()
 			if err != nil {
 				t.Fatal(err)
 			}
-			consumerSaved := false
+			consumerListed := false
 			for _, asset := range assets {
 				if asset.AssetID == observedConsumerAssetID {
-					consumerSaved = asset.LastSeenMS == sampleAt.UnixMilli()
+					consumerListed = true
+					if asset.Kind != state.AssetObservedConsumer || !asset.ReadOnly || asset.LastSeenMS < sampleAt.UnixMilli() {
+						t.Fatal("consumer metadata lost its kind, read-only status or snapshot time")
+					}
 				}
 			}
-			if consumerSaved != tc.wantSaved {
-				t.Fatalf("consumer ledger assets = %+v, want saved=%v", assets, tc.wantSaved)
+			if consumerListed != tc.wantSaved {
+				t.Fatalf("consumer listed=%v, want %v", consumerListed, tc.wantSaved)
+			}
+			consumer, _, err := st.LoadEnergyHistory(state.EnergyHistoryQuery{
+				AssetID: observedConsumerAssetID, SinceMS: tickMS - 1,
+				UntilMS: time.Now().Add(5 * time.Minute).UnixMilli(), BucketMS: state.EnergyLedgerBucketMS, Limit: 10,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(consumer) != 0 {
+				t.Fatal("single instantaneous reading entered consumer interval history")
 			}
 		})
 	}
@@ -247,6 +269,9 @@ func TestStaleMeterTickKeepsSamplesAndIndependentLedgerWithoutDispatch(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := st.EnableHistoryAggregation(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = st.Close() })
 	pvDeviceID, err := st.RegisterDevice(state.Device{
 		DriverName: "solar", Make: "PV Maker", Serial: "PV-42",
@@ -282,19 +307,19 @@ func TestStaleMeterTickKeepsSamplesAndIndependentLedgerWithoutDispatch(t *testin
 	tel.Update("solar", telemetry.DerPV, -400, nil, json.RawMessage(`{"generation_wh":110}`))
 	tel.Get("solar", telemetry.DerPV).UpdatedAt = now
 	tel.RecordDriverSuccess("solar")
-	if _, err := persistTelemetryTick(st, tel, ctrl, now.Add(time.Second).UnixMilli(), time.Minute, testEnergyIdentity(st)); err != nil {
+	if _, err := persistTelemetryTick(st, tel, ctrl, time.Now().UnixMilli(), time.Minute, testEnergyIdentity(st)); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := st.FlushHistory(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	history, err := st.LoadHistory(base.UnixMilli(), now.Add(time.Second).UnixMilli(), 0)
+	history, err := st.LoadHistory(base.UnixMilli(), time.Now().Add(time.Second).UnixMilli(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(history) != 0 {
-		t.Fatalf("stale meter wrote legacy history: %+v", history)
+	if len(history) == 0 || history[0].Missing&state.MissingGrid == 0 {
+		t.Fatalf("stale meter lost independent history or became known: %+v", history)
 	}
 	samples, err := st.LoadSeries("solar", "pv_w", 0, time.Now().Add(time.Second).UnixMilli(), 0)
 	if err != nil {

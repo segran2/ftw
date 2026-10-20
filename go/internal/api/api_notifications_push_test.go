@@ -334,8 +334,8 @@ func TestRulesGetShowsDefaultsAndStoresNothing(t *testing.T) {
 		if e.Type != defaults[i].Type {
 			t.Fatalf("event %d is %q, want %q", i, e.Type, defaults[i].Type)
 		}
-		if e.Enabled {
-			t.Fatalf("default rule %q came back enabled", e.Type)
+		if e.Enabled != defaults[i].Enabled {
+			t.Fatalf("default rule %q came back enabled=%v", e.Type, e.Enabled)
 		}
 	}
 
@@ -386,9 +386,19 @@ func TestRulesPutSeedsDefaultsOnFirstTouch(t *testing.T) {
 	if notif == nil || len(notif.Events) < len(notifications.DefaultRules()) {
 		t.Fatalf("defaults not seeded: %+v", notif)
 	}
+	// Everything is opt-in except the FTW Cloud and agent notices, which
+	// every owner should hear without having asked, and car.which: with
+	// several cars and no answer, the box plans for a visitor until someone
+	// taps, and only this asks (docs/cars.md).
+	onByDefault := map[string]bool{
+		notifications.PushCloudGranted: true, notifications.PushCloudRevoked: true,
+		notifications.PushAgentAdded: true, notifications.PushAgentRequest: true,
+		notifications.PushAgentExpiring: true, notifications.PushApprovalKeySet: true,
+		notifications.PushOwnerAdded: true, notifications.PushCarWhich: true,
+	}
 	enabled := 0
 	for _, e := range notif.Events {
-		if e.Enabled {
+		if e.Enabled && !onByDefault[e.Type] {
 			enabled++
 			if e.Type != notifications.PushUpdateInstalled {
 				t.Fatalf("seeded rule %q came up enabled", e.Type)

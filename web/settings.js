@@ -83,6 +83,17 @@
     openBtn.click();
   };
 
+  // A first-run restart returns to the existing local owner controls. No
+  // URL parameter can approve a grant, accept terms or save a password.
+  if (window.location && new URLSearchParams(window.location.search).get("setup") === "assistant") {
+    window.addEventListener("load", function () {
+      var url = new URL(window.location.href);
+      url.searchParams.delete("setup");
+      window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+      S.open("access");
+    }, {once: true});
+  }
+
   function closeSettings() {
     modal.classList.add("hidden");
     if (returnFocus && returnFocus.isConnected && returnFocus.getClientRects().length) {
@@ -147,19 +158,23 @@
     setStatus("Saving...");
     var headers = { "Content-Type": "application/json" };
     if (configETag) headers["If-Match"] = configETag;
-    return apiFetch("/api/config", {
+    return prepareSetupConnection().then(function () { return apiFetch("/api/config", {
       method: "POST",
       headers: headers,
       body: JSON.stringify(currentConfig),
-    })
+    }); })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || ("HTTP " + r.status)); });
         configETag = r.headers && r.headers.get ? r.headers.get("ETag") : configETag;
         return r.json();
       })
       .then(function (res) {
-        setStatus("Saved ✓", "success");
-        setTimeout(function () { setStatus(""); }, 2000);
+        var warnings = res && Array.isArray(res.warnings) ? res.warnings : [];
+        var savedText = "Saved ✓" + (warnings.length ? " " + warnings.join(" ") : "");
+        setStatus(savedText, warnings.length ? "warning" : "success");
+        if (!warnings.length) setTimeout(function () {
+          if (statusEl.textContent === savedText) setStatus("");
+        }, 2000);
         // A tab that shows what the box says about itself, rather than what
         // the form holds, is stale from here until it asks again.
         var saved = S.tabs[currentTab];
@@ -180,6 +195,18 @@
       .catch(function (e) {
         setStatus("Save failed: " + e.message, "error");
         throw e;
+      });
+  }
+
+  function prepareSetupConnection() {
+    if (!currentConfig || !currentConfig.setup || currentConfig.setup.measurement_only) return Promise.resolve();
+    return apiFetch("/api/setup/connection", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({fuse: currentConfig.fuse})})
+      .then(function (r) { return r.json().then(function (body) { if (!r.ok) throw new Error(body.error || "Could not check the electricity connection."); return body; }); })
+      .then(function (review) {
+        if (!currentConfig.setup.connection_confirmed || currentConfig.setup.connection_digest !== review.connection_digest) {
+          navigateTab("control");
+          throw new Error("Review the electricity connection and confirm the shown values under Equipment control, then save again.");
+        }
       });
   }
 
@@ -315,6 +342,7 @@
   function setStatus(msg, kind) {
     statusEl.textContent = msg || "";
     statusEl.className = "settings-status" + (kind ? " " + kind : "");
+    statusEl.setAttribute("role", kind === "warning" || kind === "error" ? "alert" : "status");
   }
 
   // Async tabs register a field when they insert it, before the user can edit it.
@@ -400,7 +428,9 @@
 
   function renderTab(tab) {
     var hadBodyFocus = bodyEl.contains(document.activeElement);
-    saveBtn.hidden = tab === "loadpoints" || (tab === "devices" && !!S.chargerSetup);
+    // Access and Cars change nothing in the config: each of their buttons
+    // asks the box.
+    saveBtn.hidden = tab === "loadpoints" || tab === "access" || tab === "cars" || (tab === "devices" && !!S.chargerSetup);
     saveBtn.style.display = saveBtn.hidden ? "none" : "";
     var def = S.tabs[tab];
     if (!def) {

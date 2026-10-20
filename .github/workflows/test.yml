@@ -99,6 +99,36 @@ jobs:
         # tests still check queue latency, cancellation and operation limits.
         run: go test -count=1 -timeout 300s ./...
 
+      # go/protocol is its own module, so ./... above skips it. FTW Cloud
+      # imports it, and it must build without the box.
+      - name: Protocol module
+        working-directory: go/protocol
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+      - name: Protocol module imports nothing from the box
+        run: bash .github/scripts/check-protocol-boundary.sh go/protocol
+      # FTW Cloud reads and never controls. The uplink's build graph says so:
+      # it reaches no control, API or loadpoint code.
+      - name: FTW Cloud uplink imports nothing that controls
+        run: bash .github/scripts/check-cloudlink-imports.sh go
+
+  race:
+    name: core (Go race detector)
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache-dependency-path: go/go.sum
+      - name: Fetch the bundled drivers
+        run: make drivers
+      - name: Race detector on the packages the control loop shares
+        run: bash .github/scripts/race.sh
+
   web:
     name: web
     needs: changes
@@ -336,11 +366,12 @@ jobs:
     name: go test + vet
     if: always()
     needs:
-      [changes, core, web, drivers, compose, e2e, contract]
+      [changes, core, race, web, drivers, compose, e2e, contract]
     runs-on: ubuntu-latest
     env:
       RESULTS: >-
         ${{ needs.changes.result }} ${{ needs.core.result }}
+        ${{ needs.race.result }}
         ${{ needs.web.result }}
         ${{ needs.drivers.result }}
         ${{ needs.compose.result }}

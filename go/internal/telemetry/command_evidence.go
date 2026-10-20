@@ -8,7 +8,8 @@ import (
 
 // CommandEvidence records a driver call, not proof that hardware obeyed it.
 // Keep one command per device function so a hybrid's PV cap cannot replace
-// its battery command. The registry clears these records on driver restart.
+// its battery command. A restart clears response proof; outstanding battery
+// orders retain only their small unconfirmed bound until raw power replaces it.
 //
 // A device keeps one measurement record while FTW sends it the same action.
 // Modes that retune the target every tick must not restart the proof on each
@@ -29,6 +30,10 @@ type CommandEvidence struct {
 	PowerObservedSince    time.Time
 	LastObservation       time.Time
 	LastMeasuredAt        time.Time
+	// NoPower is an observed EV stop during uninterrupted positive orders.
+	// Retuning the current cannot restart this clock; a pause, failed command,
+	// missing measurement or observed power ends it.
+	NoPowerSince, NoPowerAt time.Time
 	// LastGapW is the latest fresh reading's distance from the commands in
 	// force during the response delay. Nil until such a reading arrives.
 	LastGapW *float64
@@ -40,6 +45,17 @@ type CommandEvidence struct {
 	// household load cannot rewrite the site comparison for that step.
 	StepAfter   map[string]ControlBaseline
 	StepAfterAt time.Time
+	// A battery order can reach hardware after a newer, lower order. Keep
+	// its highest signed target even when Recent evicts it. Only a fresh
+	// source observation after the lower run's response delay can reduce it.
+	// This is command evidence, not a second power history or a live reading.
+	batteryUpperW     float64
+	batteryUpperKnown bool
+	batteryLowerW     float64
+	batteryLowerSince time.Time
+	batteryReleased   bool
+	batteryOrderAt    time.Time
+	cleared           bool
 }
 
 // CommandPoint is one command FTW sent, kept for the response-delay check.
@@ -89,6 +105,11 @@ func (s *Store) BeginCommand(driver string, payload []byte, now time.Time) Comma
 	if json.Unmarshal(payload, &request) != nil {
 		return CommandEvidence{}
 	}
+	// Resume changes permission to draw, not the current limit. Keep the
+	// accepted limit and its measured response while this optional call runs.
+	if request.Action == "ev_resume" && request.PowerW == nil {
+		return CommandEvidence{}
+	}
 	if request.Action == "ev_pause" {
 		zero := 0.0
 		request.PowerW = &zero
@@ -105,6 +126,18 @@ func (s *Store) BeginCommand(driver string, payload []byte, now time.Time) Comma
 	}
 	k := driver + ":" + kind
 	old, ok := s.commands[k]
+	if kind == "battery" {
+		c.batteryOrderAt = now
+		c.batteryUpperW, c.batteryUpperKnown = old.batteryUpperW, old.batteryUpperKnown
+		c.batteryLowerW, c.batteryLowerSince = old.batteryLowerW, old.batteryLowerSince
+		if c.PowerW != nil {
+			if !c.batteryUpperKnown || *c.PowerW >= c.batteryUpperW {
+				c.batteryUpperW, c.batteryUpperKnown, c.batteryLowerSince = *c.PowerW, true, time.Time{}
+			} else if c.batteryLowerSince.IsZero() || *c.PowerW > c.batteryLowerW {
+				c.batteryLowerW, c.batteryLowerSince = *c.PowerW, now
+			}
+		}
+	}
 	if ok && old.Result != "released" {
 		c.LastMeasuredAt = old.LastMeasuredAt
 	}
@@ -112,6 +145,9 @@ func (s *Store) BeginCommand(driver string, payload []byte, now time.Time) Comma
 	// step, a failed or unknown call, or a return to device control needs new
 	// proof against the new target.
 	if ok && old.Action == c.Action && (old.Result == "accepted" || old.Result == "pending") {
+		if kind == "ev" && old.PowerW != nil && c.PowerW != nil && *old.PowerW > 100 && *c.PowerW > 100 {
+			c.NoPowerSince, c.NoPowerAt = old.NoPowerSince, old.NoPowerAt
+		}
 		c.Recent, c.MaxAge = append([]CommandPoint(nil), old.Recent...), old.MaxAge
 		if !materialStep(old.PowerW, c.PowerW) {
 			c.Since, c.Baseline, c.StepAfter, c.StepAfterAt = old.Since, old.Baseline, old.StepAfter, old.StepAfterAt
@@ -169,6 +205,9 @@ func (s *Store) CommandEvidence(driver, kind string) (CommandEvidence, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	c, ok := s.commands[driver+":"+kind]
+	if c.cleared {
+		return CommandEvidence{}, false
+	}
 	c.Baseline, c.StepAfter = copyWindows(c.Baseline), copyWindows(c.StepAfter)
 	c.Recent = append([]CommandPoint(nil), c.Recent...)
 	for _, p := range []**float64{&c.PowerW, &c.LastGapW} {
@@ -183,9 +222,42 @@ func (s *Store) CommandEvidence(driver, kind string) (CommandEvidence, bool) {
 func (s *Store) ClearCommandEvidence(driver string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.clearCommandEvidenceLocked(driver, time.Now())
+}
+
+// BatteryCommandUpperW is the highest battery target not yet replaced by
+// source-time power evidence. Failed calls and driver resets do not prove
+// that an order failed to reach hardware. A newer computed offer also needs
+// room while it waits for the driver actor; an earlier default/reset retires
+// old computed offers. Offers are not retained as measurements or commands.
+func (s *Store) BatteryCommandUpperW(driver string, offers ...CommandPoint) (float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c := s.commands[driver+":battery"]
+	upper := c.batteryUpperW
+	for _, offer := range offers {
+		if c.batteryUpperKnown && offer.At.After(c.batteryOrderAt) {
+			upper = math.Max(upper, offer.PowerW)
+		}
+	}
+	return upper, c.batteryUpperKnown
+}
+
+// Called under mu. Drop response/UI evidence on restart, but retain the
+// small outstanding order bound until a new raw observation clears it.
+func (s *Store) clearCommandEvidenceLocked(driver string, now time.Time) {
 	for k, c := range s.commands {
 		if c.Driver == driver {
-			delete(s.commands, k)
+			if c.Kind == "battery" && c.batteryUpperKnown {
+				since := c.batteryLowerSince
+				if !c.batteryReleased || since.IsZero() {
+					since = now
+				}
+				s.commands[k] = CommandEvidence{Driver: driver, Kind: "battery", Result: "released", cleared: true,
+					batteryUpperW: math.Max(0, c.batteryUpperW), batteryUpperKnown: true, batteryLowerSince: since, batteryReleased: true, batteryOrderAt: now}
+			} else {
+				delete(s.commands, k)
+			}
 		}
 	}
 }
@@ -193,11 +265,26 @@ func (s *Store) ClearCommandEvidence(driver string) {
 // EndCommandControl invalidates comparisons with an earlier command when the
 // actor returns the device to its own control. Keep failed attempts visible.
 func (s *Store) EndCommandControl(driver string, failed bool) {
+	s.endCommandControlAt(driver, failed, time.Now())
+}
+
+func (s *Store) endCommandControlAt(driver string, failed bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, c := range s.commands {
 		if c.Driver != driver {
 			continue
+		}
+		if c.Kind == "battery" && c.batteryUpperKnown {
+			// Returning to autonomous control can also stop discharge. A
+			// successful default call is still not a measured response.
+			c.batteryUpperW = math.Max(0, c.batteryUpperW)
+			if !c.batteryReleased || c.batteryLowerSince.IsZero() {
+				c.batteryLowerSince = now
+			}
+			c.batteryLowerW = 0
+			c.batteryReleased = true
+			c.batteryOrderAt = now
 		}
 		if failed {
 			c.Result = "default_failed"
@@ -255,13 +342,38 @@ func (c CommandEvidence) commandGap(power float64, at time.Time) float64 {
 func (s *Store) observeCommand(driver string, kind DerType, power float64, data json.RawMessage, now time.Time) {
 	k := driver + ":" + kind.String()
 	c, ok := s.commands[k]
-	if !ok || c.Result != "accepted" || c.PowerW == nil {
+	if !ok {
+		return
+	}
+	if kind == DerBattery && c.batteryUpperKnown && !c.batteryLowerSince.IsZero() {
+		observation, fresh := ControlPowerObservation(power, data, now)
+		if fresh && !observation.Seen().Before(c.batteryLowerSince.Add(ResponseDelay("battery"))) &&
+			!observation.Seen().After(now) && now.Sub(observation.Seen()) <= ControlWindowDuration {
+			// The lower run's maximum also covers intermediate orders that
+			// may not yet have arrived, even when Recent no longer has them.
+			upper := math.Max(c.batteryLowerW, observation.PowerW)
+			if c.batteryReleased {
+				upper = math.Max(0, upper)
+			} else if c.PowerW != nil {
+				upper = math.Max(*c.PowerW, upper)
+			}
+			if upper < c.batteryUpperW {
+				c.batteryUpperW = upper
+				if upper <= c.batteryLowerW {
+					c.batteryLowerSince = time.Time{}
+				}
+			}
+		}
+		s.commands[k] = c
+	}
+	if c.Result != "accepted" || c.PowerW == nil || c.cleared {
 		return
 	}
 	var d struct {
 		SetpointW *float64 `json:"setpoint_w"`
 	}
 	if json.Unmarshal(data, &d) != nil {
+		c.NoPowerSince, c.NoPowerAt = time.Time{}, time.Time{}
 		c.ReadbackMismatchSince, c.PowerMismatchSince, c.PowerMatchSince = time.Time{}, time.Time{}, time.Time{}
 		c.PowerObservedSince, c.LastObservation = time.Time{}, time.Time{}
 		s.commands[k] = c
@@ -296,6 +408,17 @@ func (s *Store) observeCommand(driver string, kind DerType, power float64, data 
 	// A change-only source that confirms an unchanged sample states the power
 	// at the confirmation time; an unconfirmed repeat adds nothing new.
 	power, observedAt := observation.PowerW, observation.Seen()
+	if kind == DerEV {
+		switch {
+		case !fresh || !finite(power) || *c.PowerW <= 100 || math.Abs(power) >= 100:
+			c.NoPowerSince, c.NoPowerAt = time.Time{}, time.Time{}
+		case observedAt.After(c.NoPowerAt) && (!c.NoPowerSince.IsZero() || !observedAt.Before(c.Since)):
+			if c.NoPowerSince.IsZero() || observedAt.Sub(c.NoPowerAt) > max(time.Minute, c.MaxAge) {
+				c.NoPowerSince = observedAt
+			}
+			c.NoPowerAt = observedAt
+		}
+	}
 	// A cached sample from before the run cannot show its response. Repeated
 	// delivery of one source sample also cannot extend a measured time window.
 	if !fresh || !finite(power) || observedAt.Before(c.Since) {

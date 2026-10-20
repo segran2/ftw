@@ -37,6 +37,7 @@ package mpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -391,6 +392,11 @@ type Plan struct {
 	// persisted Diagnostic for deterministic replay.
 	OptimizerInput       json.RawMessage    `json:"-"`
 	LoadpointShortfallWh map[string]float64 `json:"loadpoint_shortfall_wh,omitempty"`
+	// CautionOff is set when the planning style asks for forecast caution and
+	// this plan uses the point forecast instead: the caution inputs were
+	// invalid, or a caution plan could not keep the point plan's limits and
+	// departure goals. The planning warnings say why.
+	CautionOff bool `json:"caution_off,omitempty"`
 }
 
 // ShadowPlan is a challenger candidate calculated alongside the active plan.
@@ -635,6 +641,18 @@ func OptimizeContext(ctx context.Context, slots []Slot, p Params) (Plan, error) 
 	A := p.ActionLevels
 	if A < 3 {
 		A = 3
+	}
+	// Bound allocation before constructing any grid. The two value/policy
+	// tables use 16 bytes per state plus slice headers. Cancellation cannot
+	// stop make from exhausting the box or panicking on an integer overflow.
+	evLevels := 1
+	if p.Loadpoint.active() {
+		evLevels = max(2, p.Loadpoint.Levels)
+	}
+	workingBytes := (float64(N)+1)*float64(S)*(16*float64(evLevels)+48) + (float64(A)+1)*8
+	const maxDPWorkingBytes = 64 * 1024 * 1024
+	if workingBytes > maxDPWorkingBytes {
+		return Plan{}, fmt.Errorf("Core DP exceeds its 64 MiB working memory budget")
 	}
 
 	socStep := (p.SoCMax - p.SoCMin) / float64(S-1)

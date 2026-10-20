@@ -12,6 +12,7 @@
 // 42 is the no-modules / unit-test fallback. Do not import the
 // component from here — that would pull Custom Elements into Node tests.
 import {withControlMarks} from "../control-feedback.js";
+import {formatEnergyToday} from "../energy-today.js";
 
 function idleW() {
   return (typeof window !== "undefined" && window.FTW_FLOW_IDLE_W) || 42;
@@ -79,21 +80,16 @@ export function flowReadingsFromStatus(status, opts) {
   const batterySub = opts && opts.batterySub;
   const planets = [];
   const today = (status && status.energy && status.energy.today) || {};
-  const importKwh = (num(today.import_wh) ?? 0) / 1000;
-  const exportKwh = (num(today.export_wh) ?? 0) / 1000;
-  const pvKwhTotal = (num(today.pv_wh) ?? 0) / 1000;
-  const loadKwhTotal = (num(today.load_wh) ?? 0) / 1000;
-  const batChargedKwh = (num(today.bat_charged_wh) ?? 0) / 1000;
-  const batDischargedKwh = (num(today.bat_discharged_wh) ?? 0) / 1000;
-
-  const pvDailyStr = `${fmtKwhShort(pvKwhTotal)} kWh`;
+  const importWh = num(today.import_wh);
+  const loadWh = num(today.load_wh);
+  const pvDailyStr = formatEnergyToday(today, "pv_wh");
   const gridDailyParts = [
-    { text: `↓ ${fmtKwhShort(importKwh)}`, color: "var(--red-e)", bold: true },
-    { text: `↑ ${fmtKwhShort(exportKwh)}`, color: "var(--green-e)", bold: true },
+    { text: `↓ ${formatEnergyToday(today, "import_wh", false)}`, color: "var(--red-e)", bold: true },
+    { text: `↑ ${formatEnergyToday(today, "export_wh", false)}`, color: "var(--green-e)", bold: true },
   ];
   const batDailyParts = [
-    { text: `↑ ${fmtKwhShort(batChargedKwh)}`, color: "var(--green-e)", bold: true },
-    { text: `↓ ${fmtKwhShort(batDischargedKwh)}`, color: "var(--red-e)", bold: true },
+    { text: `↑ ${formatEnergyToday(today, "bat_charged_wh", false)}`, color: "var(--green-e)", bold: true },
+    { text: `↓ ${formatEnergyToday(today, "bat_discharged_wh", false)}`, color: "var(--red-e)", bold: true },
   ];
 
   const gridW = num(status && status.grid_w);
@@ -211,17 +207,25 @@ export function flowReadingsFromStatus(status, opts) {
     if (!live[role]) planets.push(...offline[role]);
   }
 
-  const loadW = num(status && status.load_w);
+  const hasEstimate = status?.load_estimate != null;
+  // Core qualifies this balance, including missing flows and stale meters.
+  // A past energy interval is separate from Power now: it must neither hide
+  // nor overwrite current household power. Never derive another balance from
+  // independently smoothed display readings here.
+  const rawLoad = num(status?.load_w);
+  const powerBalanceW = rawLoad !== null && rawLoad >= 0 ? rawLoad : null;
+  const loadW = powerBalanceW;
   // Today's share is kWh already in the box, not the live meter. A
   // quiet meter blanks % SELF-POWERED NOW (unknown instantaneous load)
   // but must not hide a day that already happened.
   let selfPoweredPctToday = null;
-  if (loadKwhTotal > 0.001) {
-    selfPoweredPctToday = Math.max(0, Math.min(100, (1 - importKwh / loadKwhTotal) * 100));
+  if (loadWh > 1 && importWh !== null && today.history_quality !== "estimated") {
+    selfPoweredPctToday = Math.max(0, Math.min(100, (1 - importWh / loadWh) * 100));
   }
 
   return {
     load: loadW === null ? null : loadW / 1000,
+    loadEstimated: hasEstimate,
     planets: withControlMarks(planets, status?.control_feedback, opts?.live !== false),
     selfPoweredPctToday,
   };

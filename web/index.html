@@ -95,12 +95,14 @@
         <button data-tab="control" class="active">Control</button>
         <button data-tab="devices">Devices</button>
         <button data-tab="loadpoints">Chargers</button>
+        <button data-tab="cars">Cars</button>
         <button data-tab="price">Price</button>
         <button data-tab="weather">Weather</button>
         <button data-tab="batteries">Batteries</button>
         <button data-tab="planner">Planner</button>
         <button data-tab="app">FTW app</button>
-        <button data-tab="ha">Home Assistant</button>
+        <button data-tab="access">Access</button>
+        <button data-tab="ha">Integrations</button>
         <button data-tab="notifications">Notifications</button>
         <button data-tab="system">System</button>
       </div>
@@ -215,6 +217,9 @@
         </div>
       </div>
     </section>
+
+    <!-- The owner's cars, apart from the chargers; filled by cars.js. -->
+    <section class="overview-card overview-cars" id="overview-cars" aria-labelledby="overview-cars-title" hidden></section>
 
     <section class="overview-outlook" aria-label="Immediate outlook">
       <section class="overview-card" id="overview-price" aria-label="Electricity price">
@@ -435,6 +440,7 @@
 
         <div class="chart-container">
           <canvas id="power-chart" width="800" height="260"></canvas>
+          <p id="chart-history-quality" class="history-data-warning" role="status" hidden></p>
         </div>
         <div class="chart-legend" id="chart-legend">
           <span class="legend-item" data-toggle="grid"><span class="legend-color" style="background:#ef4444"></span> Grid</span>
@@ -955,10 +961,10 @@
   <ftw-modal id="grid-modal" style="--ftw-modal-max-width:420px">
     <span slot="title">Grid</span>
     <div id="grid-modal-body">
-      <!-- Peak import ceiling (tariff cap, hard rule across all modes).
-           Default off — operator opts in via the checkbox. When on, the
-           slider value caps grid import; battery briefly bridges while
-           EV throttles. See PR for the full enforcement matrix. -->
+      <!-- Peak import ceiling (power tariff, across all modes). Default
+           off — operator opts in via the checkbox. When on, the slider
+           value caps the mean grid import over each clock hour; the EV and
+           battery follow the hour's budget left. -->
       <div class="control-card">
         <div class="card-label">Peak import limit</div>
         <label class="ftw-toggle">
@@ -971,7 +977,7 @@
           <span id="peak-limit-value" class="slider-current">5000 W</span>
           <button id="peak-limit-send" class="btn-send" disabled>Save</button>
         </div>
-        <div class="card-sub card-hint">Hard cap on grid import (tariff peak). Off = no cap; only the physical fuse applies.</div>
+        <div class="card-sub card-hint">Caps the average grid import over each clock hour (power tariff). Off = no cap; only the physical fuse applies.</div>
       </div>
 
       <!-- Grid target (legacy PI setpoint for manual modes). -->
@@ -987,7 +993,8 @@
     </div>
   </ftw-modal>
 
-  <script src="/lan-auth.js?v=lan1"></script>
+  <script src="/project-statistics.js?v=terms2"></script>
+  <script src="/lan-auth.js?v=terms2"></script>
   <script type="module" src="/control-feedback-view.js"></script>
   <script src="/app.js?v=noask1"></script>
   <script src="/settings.js?v=diag3"></script>
@@ -995,13 +1002,15 @@
   <script src="/settings/driver-editor.js?v=aceedit1"></script>
   <script src="/settings/tabs/devices.js?v=catcards2"></script>
   <script src="/settings/tabs/loadpoints.js?v=lp7"></script>
+  <script src="/settings/tabs/cars.js?v=cars1"></script>
   <script src="/settings/tabs/price.js?v=demand1"></script>
   <script src="/settings/tabs/weather.js?v=mlcov1"></script>
   <script src="/settings/tabs/batteries.js?v=tabsplit1"></script>
   <script src="/settings/tabs/planner.js?v=cvxpy1"></script>
   <script src="/settings/tabs/ha.js?v=modbusproxy2"></script>
-  <script src="/settings/tabs/app.js?v=applink2"></script>
-  <script src="/settings/tabs/fleet.js?v=fleetping2"></script>
+  <script src="/settings/tabs/app.js?v=terms2"></script>
+  <script src="/settings/tabs/access.js?v=access5"></script>
+  <script src="/settings/tabs/fleet.js?v=terms2"></script>
   <script src="/settings/tabs/notifications.js?v=tabsplit2"></script>
   <script src="/settings/tabs/ev.js?v=tabsplit2"></script>
   <script src="/settings/tabs/system.js?v=menu1"></script>

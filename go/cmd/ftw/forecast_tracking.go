@@ -36,6 +36,7 @@ type forecastSite struct {
 	Timezone              string
 	Options               telemetry.ForecastOptions
 	HistoryOptions        telemetry.ForecastOptions // chart and site energy; outside every revision
+	HistorySun            historySun                // where unknown PV reads as 0 W after sunset; outside every revision
 	PVLearningStartedMS   int64
 	LoadLearningStartedMS int64
 }
@@ -71,9 +72,10 @@ type forecastTracker struct {
 	mu                   sync.RWMutex
 	errors               []forecasting.ErrorSample
 	observations         []forecasting.Observation
-	accumulator          telemetry.ForecastAccumulator
 	lastRevision         string
 	pvAccumulator        telemetry.ForecastAccumulator
+	pendingPV            map[int64]forecasting.Observation // PV quarters waiting for their household decision
+	loadNextMS           int64                             // first quarter whose household load is undecided
 	stopped              bool
 	clock                func() time.Time
 	learningMu           sync.RWMutex
@@ -89,16 +91,19 @@ type forecastTracker struct {
 	observationLoadValid bool
 	issueArchiveError    bool
 	sourceChoice         forecastSourceChoice // guarded by mu
+
+	learningRecoveryChecked string // guarded by learningMu; physical learning identity
+	learningRecoveryAfterMS int64  // a pre-sync clock retries when archived evidence becomes available
 }
 
 func (f *forecastTracker) Start(ctx context.Context) error {
-	if err := f.restoreLearning(ctx); err != nil {
-		return err
-	}
 	initCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	err := f.store.InitForecastArchive(initCtx)
 	cancel()
 	if err != nil {
+		return err
+	}
+	if err := f.restoreLearning(ctx); err != nil {
 		return err
 	}
 	f.queue = make(chan forecastJob, 8)
@@ -246,8 +251,8 @@ func (f *forecastTracker) observe(ctx context.Context) {
 		if f.configMu != nil {
 			f.configMu.RUnlock()
 		}
-		f.accumulator = telemetry.ForecastAccumulator{}
 		f.pvAccumulator = telemetry.ForecastAccumulator{}
+		f.pendingPV, f.loadNextMS = nil, 0
 		f.lastRevision = ""
 		return
 	}
@@ -268,7 +273,7 @@ func (f *forecastTracker) observe(ctx context.Context) {
 	f.observationPVValid, f.observationLoadValid = r.PVValid, r.Valid
 	f.mu.Unlock()
 	var jobs []forecastObservationJob
-	for _, o := range f.observationIntervals(r, site, now) {
+	for _, o := range f.observationIntervals(ctx, r, site, now) {
 		job := forecastObservationJob{observation: o, site: site, away: f.away != nil && f.away(time.UnixMilli(o.StartMS))}
 		rows, _ := f.store.LoadForecasts(o.StartMS-time.Hour.Milliseconds(), o.EndMS)
 		if weather := forecastRow(usableTrackingWeather(rows, o.AvailableAtMS), o.StartMS, o.AvailableAtMS); weather != nil && weather.FetchedAtMs >= site.WeatherSinceMS {
@@ -283,34 +288,64 @@ func (f *forecastTracker) observe(ctx context.Context) {
 	f.acceptObservations(flushCtx, jobs, f.flushObservations)
 }
 
+// maxHouseholdDecisionWait bounds how long a PV quarter waits for history to
+// close the same quarter. Past it, PV goes alone and that load is given up.
+const maxHouseholdDecisionWait = 2 * time.Minute
+
 // observationIntervals keeps the two measurement claims independent. Unknown
 // battery power invalidates household load, but cannot erase valid PV evidence.
-func (f *forecastTracker) observationIntervals(r telemetry.ForecastReading, site forecastSite, now time.Time) []forecasting.Observation {
-	if site.Revision != f.lastRevision {
-		f.accumulator = telemetry.ForecastAccumulator{}
+// Household load comes from closed history intervals, the evidence behind
+// daily Home use. Observations are immutable, so PV waits until history has
+// decided its quarter and each quarter is emitted once.
+func (f *forecastTracker) observationIntervals(ctx context.Context, r telemetry.ForecastReading, site forecastSite, now time.Time) []forecasting.Observation {
+	const quarter = int64(15 * time.Minute / time.Millisecond)
+	nowMS := now.UnixMilli()
+	if site.Revision != f.lastRevision || f.loadNextMS == 0 {
+		// Start at the next whole quarter: one observed under an earlier
+		// revision, or before this process, never becomes a label.
 		f.pvAccumulator = telemetry.ForecastAccumulator{}
+		f.pendingPV = map[int64]forecasting.Observation{}
+		f.loadNextMS = (nowMS + quarter - 1) / quarter * quarter
 		f.lastRevision = site.Revision
-	}
-	byStart := map[int64]forecasting.Observation{}
-	for _, v := range f.accumulator.Observe(r) {
-		byStart[v.Start.UnixMilli()] = forecasting.Observation{StartMS: v.Start.UnixMilli(), EndMS: v.End.UnixMilli(), AvailableAtMS: now.UnixMilli(), LoadW: v.HouseholdW, LoadKnown: true, Quality: v.Quality, ConfigVersion: site.Revision}
 	}
 	pv := r
 	pv.Valid = r.PVValid
 	pv.HouseholdW = 0
 	pv.Latest = r.PVLatest
 	for _, v := range f.pvAccumulator.Observe(pv) {
-		key := v.Start.UnixMilli()
-		o, ok := byStart[key]
-		if !ok {
-			o = forecasting.Observation{StartMS: key, EndMS: v.End.UnixMilli(), AvailableAtMS: now.UnixMilli(), Quality: "complete_pv_v1", ConfigVersion: site.Revision}
+		if v.End.UnixMilli() <= f.loadNextMS {
+			continue // its quarter is decided and may already be archived
 		}
-		o.PVW = math.Max(0, -v.PVW)
-		o.PVKnown = v.PVValid
+		key := v.Start.UnixMilli()
+		f.pendingPV[key] = forecasting.Observation{StartMS: key, EndMS: v.End.UnixMilli(), Quality: "complete_pv_v1", ConfigVersion: site.Revision, PVW: math.Max(0, -v.PVW), PVKnown: v.PVValid}
+	}
+	byStart := map[int64]forecasting.Observation{}
+	if f.store != nil {
+		loads, closed, err := f.store.HouseholdIntervals(ctx, f.loadNextMS, nowMS, quarter)
+		if err != nil {
+			slog.Warn("forecast: household intervals unavailable", "err", err)
+		}
+		for _, v := range loads {
+			byStart[v.StartMS] = forecasting.Observation{StartMS: v.StartMS, EndMS: v.EndMS, LoadW: v.LoadW, LoadKnown: true, Quality: state.HouseholdIntervalQuality, ConfigVersion: site.Revision}
+		}
+		f.loadNextMS = max(f.loadNextMS, closed)
+	}
+	for key, o := range f.pendingPV {
+		if o.EndMS > f.loadNextMS && f.store != nil && nowMS-o.EndMS < maxHouseholdDecisionWait.Milliseconds() {
+			continue
+		}
+		// A released quarter is decided: history cannot add its load later.
+		f.loadNextMS = max(f.loadNextMS, o.EndMS)
+		if load, ok := byStart[key]; ok {
+			load.PVW, load.PVKnown = o.PVW, o.PVKnown
+			o = load
+		}
 		byStart[key] = o
+		delete(f.pendingPV, key)
 	}
 	out := make([]forecasting.Observation, 0, len(byStart))
 	for _, o := range byStart {
+		o.AvailableAtMS = nowMS
 		out = append(out, o)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartMS < out[j].StartMS })
@@ -603,7 +638,8 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 			selected[i].PredictionStartMS = point.PredictionStartMS
 			// Measured errors keep legacy PV only where legacy has weather for
 			// this interval; elsewhere the quality rule decides.
-			pvChoice := choice.PV.Source
+			lead := forecasting.LeadBucket(issued.OriginMS, point.StartMS)
+			pvChoice := choice.PV[lead].Source
 			if pvChoice == "legacy" && !selected[i].PVKnown {
 				pvChoice = ""
 			}
@@ -614,8 +650,9 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 			}
 			// Without measured evidence a cold load can still be the worker's
 			// generic prior, so the frozen profile and heating prior stay.
-			loadReady := point.LoadQuality != "cold_start" || choice.Load.Source == "energyplan"
-			if choice.Load.Source != "legacy" && loadReady && usablePrimaryForecast(point.LoadKnown, point.LoadQuality, point.LoadW) {
+			loadChoice := choice.Load[lead].Source
+			loadReady := point.LoadQuality != "cold_start" || loadChoice == "energyplan"
+			if loadChoice != "legacy" && loadReady && usablePrimaryForecast(point.LoadKnown, point.LoadQuality, point.LoadW) {
 				resolved[i].LoadW = point.LoadW
 				selected[i].LoadW, selected[i].LoadKnown, selected[i].LoadQuality = point.LoadW, true, point.LoadQuality
 				selected[i].LoadSource, selected[i].ModelLoad = "energyplan", point.ModelLoad
@@ -637,7 +674,7 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 			}
 			net := s.LoadW + s.PVW
 			end := s.StartMs + int64(s.LenMin)*time.Minute.Milliseconds()
-			band := riskCalibrator.BandForInterval(forecastMixSeries(pvSeries, loadSeries), "net", max(s.StartMs, origin.UnixMilli()), end, net)
+			band := riskCalibrator.BandForSiteInterval(forecastMixSeries(pvSeries, loadSeries), "net", forecastSiteContext(site), max(s.StartMs, origin.UnixMilli()), end, net)
 			if band.Method == forecasting.BandMethodEmpirical {
 				extra := math.Max(0, k*(band.HighW-net))
 				pvLoss := math.Min(-s.PVW, extra)
@@ -670,7 +707,7 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 			}
 		}
 	}
-	in.Record = func(base, planning []mpc.Slot, decisionID string, issued int64) {
+	in.Record = func(base, planning []mpc.Slot, recoveredLoad []bool, decisionID string, issued int64) {
 		issue := makeIssue(base, issued)
 		issue.DecisionID = decisionID
 		if prediction != nil {
@@ -679,6 +716,9 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 		}
 		version := forecastModelRevision(issue.Models)
 		issue.Series[0].ModelVersion = version
+		// Core may recover with a prior after the selected model fails. Keep
+		// its accepted inputs separate from the raw worker and legacy series.
+		selected = recoveredForecastSources(selected, recoveredLoad)
 		issue.Series[0].Points = primaryForecastPoints(base, issue.Series[0].Points, selected)
 		issue.Series = append(issue.Series, forecasting.Series{Name: "planning", ModelVersion: version,
 			Points: primaryForecastPoints(planning, forecastPoints(planning, frozen, site, origin, load), selected)})
@@ -714,6 +754,19 @@ func (f *forecastTracker) Snapshot(_ time.Time, weather []state.ForecastPoint) m
 
 func usablePrimaryForecast(known bool, quality string, watts float64) bool {
 	return known && (quality == "cold_start" || quality == "learning" || quality == "ready") && watts >= 0 && !math.IsNaN(watts) && !math.IsInf(watts, 0)
+}
+
+// A load Core recovered belongs to that recovery, not the model whose raw
+// prediction was rejected. Risk adjustments keep the recovered source.
+func recoveredForecastSources(selected []forecasting.Point, recoveredLoad []bool) []forecasting.Point {
+	out := append([]forecasting.Point(nil), selected...)
+	for i, recovered := range recoveredLoad {
+		if recovered && i < len(out) {
+			out[i].LoadSource, out[i].LoadQuality = "core_recovery", "fallback"
+			out[i].ModelLoad = nil
+		}
+	}
+	return out
 }
 
 // Preserve the source and quality used for each signal, while recording the
@@ -956,9 +1009,9 @@ func applyForecastBandsWith(issue *forecasting.Issue, calibrator *forecasting.Ca
 		for j := range s.Points {
 			p := &s.Points[j]
 			start := max(p.StartMS, p.PredictionStartMS)
-			p.PVBand = calibrator.BandForInterval(s.Name, "pv", start, p.EndMS, p.PVW)
+			p.PVBand = calibrator.BandForSiteInterval(s.Name, "pv", issue.Site, start, p.EndMS, p.PVW)
 			p.LoadBand = calibrator.BandForInterval(s.Name, "load", start, p.EndMS, p.LoadW)
-			p.NetBand = calibrator.BandForInterval(s.Name, "net", start, p.EndMS, p.LoadW-p.PVW)
+			p.NetBand = calibrator.BandForSiteInterval(s.Name, "net", issue.Site, start, p.EndMS, p.LoadW-p.PVW)
 		}
 	}
 }

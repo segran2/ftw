@@ -7,6 +7,8 @@
   const evPlanUI = import("/ev-plan.js").catch(function () { return null; });
   const POLL_INTERVAL = 2000;        // status poll cadence — snappier cards
   const historyMigrationUI = import("/history-migration.js").catch(function () { return null; });
+  const energyTodayUI = import("/energy-today.js").catch(function () { return null; });
+  const carsUI = import("/cars.js").catch(function () { return null; });
   function updateHistoryMigration(health) {
     historyMigrationUI.then(function (ui) { if (ui) ui.updateMigrationBanner(health); }).catch(function () {});
     if (updateBadge && typeof updateBadge.setBootHealth === "function") updateBadge.setBootHealth(health);
@@ -95,6 +97,7 @@
     load: [],
     timestamps: [],
     // Energy counters (cumulative Wh, today-scoped)
+    quality: [],
     e_import: [],
     e_export: [],
     e_pv: [],
@@ -155,12 +158,12 @@
   }
 
   // Ensure a battery-driver slot exists. Backfills bat/target arrays
-  // with zeros up to current timestamps length so row indices align
+  // with unknowns up to the preceding timestamp so row indices align
   // with the other chartHistory series.
   function ensureBatteryDriver(name) {
     if (chartBatteries[name]) return chartBatteries[name];
-    var pad = chartHistory.timestamps.length;
-    var slot = { bat: new Array(pad).fill(0), target: new Array(pad).fill(0) };
+    var pad = Math.max(0, chartHistory.timestamps.length - 1);
+    var slot = { bat: new Array(pad).fill(null), target: new Array(pad).fill(null) };
     chartBatteries[name] = slot;
     syncBatteryLegend();
     return slot;
@@ -212,8 +215,8 @@
   }
   function ensureEVDriver(name) {
     if (chartEVs[name]) return chartEVs[name];
-    var pad = chartHistory.timestamps.length;
-    var slot = { ev: new Array(pad).fill(0) };
+    var pad = Math.max(0, chartHistory.timestamps.length - 1);
+    var slot = { ev: new Array(pad).fill(null) };
     chartEVs[name] = slot;
     syncEVLegend();
     return slot;
@@ -288,19 +291,10 @@
   // visual cue that there's work to commit. Cleared on successful POST.
   let peakLimitDirty = false;
   let gridTargetDirty = false;
-  // Last non-zero peak ceiling, remembered so unchecking + rechecking
-  // the enable toggle restores the previous value instead of resetting
-  // to the default. Keyed by localStorage so it survives reloads.
-  function readLastPeakLimitW() {
-    try {
-      const v = localStorage.getItem("ftw-peak-import-ceiling-w");
-      const n = v == null ? null : Number(v);
-      return Number.isFinite(n) && n > 0 ? n : 5000;
-    } catch (e) { return 5000; }
-  }
-  function writeLastPeakLimitW(w) {
-    try { localStorage.setItem("ftw-peak-import-ceiling-w", String(w)); } catch (e) {}
-  }
+  // The last peak ceiling that was on, as the box serves it: what switching
+  // the toggle back on applies. A copy kept in the browser once applied an
+  // old test value (#1674), so only the box keeps it.
+  let peakLimitLastW = null;
   const fuseUse = $("fuse-use");
   const fuseFill = $("fuse-fill");
   const fusePhases = $("fuse-phases");
@@ -374,12 +368,14 @@
   }
 
   function formatKwh(wh) {
-    var kwh = (wh || 0) / 1000;
+    if (wh == null) return "Unknown";
+    var kwh = wh / 1000;
     if (kwh >= 100) return kwh.toFixed(0) + " kWh";
     if (kwh >= 10) return kwh.toFixed(1) + " kWh";
     return kwh.toFixed(2) + " kWh";
   }
   function formatSignedWh(wh) {
+    if (wh == null) return "Unknown";
     var v = Number(wh) || 0;
     var abs = Math.abs(v);
     var sign = v > 0.5 ? "+" : v < -0.5 ? "-" : "±";
@@ -387,6 +383,7 @@
     return sign + Math.round(abs) + " Wh";
   }
   function formatWhMagnitude(wh) {
+    if (wh == null) return "Unknown";
     var abs = Math.abs(Number(wh) || 0);
     if (abs >= 1000) return (abs / 1000).toFixed(2) + " kWh";
     return Math.round(abs) + " Wh";
@@ -472,17 +469,18 @@
       drivers[name] = d;
     });
     out.drivers = drivers;
-    if (have.pv_w) out.pv_w = sums.pv_w;
-    if (have.bat_w) out.bat_w = sums.bat_w;
-    if (have.ev_w) {
+    if (have.pv_w && data.pv_w != null) out.pv_w = sums.pv_w;
+    if (have.bat_w && data.bat_w != null) out.bat_w = sums.bat_w;
+    if (have.ev_w && data.ev_w != null) {
       out.ev_w = sums.ev_w;
       out.ev_charging_w = sums.ev_w;
     }
-    if (out.grid_w != null) {
-      out.load_w = Math.max(0, (out.grid_w || 0) - (out.bat_w || 0) - (out.pv_w || 0) - (out.ev_w || 0));
+    if (out.grid_w != null && data.load_w != null) {
+      out.load_w = smoothDisplayNumber("load_w", data.load_w, now);
     } else {
       // No live meter: do not keep a previous load or treat JSON null as 0 W.
       out.load_w = null;
+      delete statusDisplayState.load_w;
     }
     return out;
   }
@@ -491,13 +489,14 @@
     if (!windowMs || windowMs <= 0 || values.length < 3) return values;
     var out = new Array(values.length);
     for (var i = 0; i < values.length; i++) {
+      if (values[i] == null) { out[i] = null; continue; }
       var t = timestamps[i];
       var sum = 0;
       var n = 0;
       for (var j = i; j >= 0; j--) {
         if (t - timestamps[j] > windowMs) break;
         var v = values[j];
-        if (v == null || !isFinite(v)) continue;
+        if (v == null || !isFinite(v)) break;
         sum += v;
         n++;
       }
@@ -682,8 +681,8 @@
         // SEPARATELY within the slot — the bill is import × import_price
         // plus export × export_price, never their net. Render both
         // directions so the operator sees the slot's true exposure.
-        var impWh = Number(slot.import_wh) || 0;
-        var expWh = Number(slot.export_wh) || 0;
+        var impWh = slot.import_wh;
+        var expWh = slot.export_wh;
         slotBadge.textContent = "15m ↑" + formatWhMagnitude(impWh) + " ↓" + formatWhMagnitude(expWh);
         slotBadge.className = "grid-slot-badge" +
           (impWh > expWh + 5 ? " slot-import" : expWh > impWh + 5 ? " slot-export" : "");
@@ -706,7 +705,7 @@
       return online && d.pv_w != null;
     });
     var pvConfigured = Object.keys(data.drivers || {}).some(function (name) {
-      return (data.drivers[name] || {}).pv_w != null;
+      return Object.prototype.hasOwnProperty.call(data.drivers[name] || {}, "pv_w");
     });
     var pvDir = document.getElementById("pv-dir");
     if (pvConfigured && !pvLive) {
@@ -733,10 +732,10 @@
     var cardEvWEl   = document.getElementById("card-ev-w");
     var cardEvSubEl = document.getElementById("card-ev-sub");
     if (cardEvWEl) {
-      var evWNow = data.ev_charging_w || 0;
+      var evWNow = data.ev_charging_w;
       cardEvWEl.textContent = formatW(evWNow);
       cardEvWEl.className = evWNow > 1 ? "card-value val-load" : "card-value val-neutral";
-      if (cardEvSubEl) cardEvSubEl.textContent = evWNow > 1 ? "charging" : "charger";
+      if (cardEvSubEl) cardEvSubEl.textContent = evWNow == null ? "no data" : evWNow > 1 ? "charging" : "charger";
     }
 
     // Battery — positive=charge, negative=discharge. Same honesty as solar:
@@ -749,7 +748,7 @@
       return online && d.bat_w != null;
     });
     var batConfigured = Object.keys(data.drivers || {}).some(function (name) {
-      return (data.drivers[name] || {}).bat_w != null;
+      return Object.prototype.hasOwnProperty.call(data.drivers[name] || {}, "bat_w");
     });
     if (batConfigured && !batLive) {
       batW.textContent = "—";
@@ -865,6 +864,7 @@
     const peakSrcW = data.peak_import_ceiling_w != null
       ? data.peak_import_ceiling_w
       : data.peak_limit_w;
+    peakLimitLastW = data.peak_import_ceiling_last_w > 0 ? data.peak_import_ceiling_last_w : null;
     if (peakLimitSlider && !peakLimitDirty && peakSrcW != null) {
       const enabled = peakSrcW > 0;
       if (peakLimitEnableToggle) {
@@ -872,16 +872,19 @@
         if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
       }
       peakLimitSlider.disabled = !enabled;
-      const display = enabled ? peakSrcW : readLastPeakLimitW();
+      // Off, the slider shows what switching on applies.
+      const display = enabled ? peakSrcW : peakLimitLastW || Number(peakLimitSlider.defaultValue);
       peakLimitSlider.value = display;
       // Don't decorate the value with " (off)" — the toggle is the
       // single source of truth for enabled/disabled, doubling that
       // signal is the kind of redundancy the shared design system warns about.
       peakLimitValue.textContent = formatW(display);
-      if (enabled) writeLastPeakLimitW(peakSrcW);
       if (peakLimitSend) peakLimitSend.disabled = true; // pristine
     }
     // Energy today
+    energyTodayUI.then(function (ui) {
+      if (ui) ui.updateEnergyToday(data.energy && data.energy.today);
+    });
     if (data.energy && data.energy.today) {
       var t = data.energy.today;
       if (eImport) eImport.textContent = formatKwh(t.import_wh);
@@ -1045,12 +1048,13 @@
     chartHistory.pv.push(data.pv_w);
     chartHistory.load.push(data.load_w);
     chartHistory.timestamps.push(now);
-    chartHistory.e_import.push(t.import_wh || 0);
-    chartHistory.e_export.push(t.export_wh || 0);
-    chartHistory.e_pv.push(t.pv_wh || 0);
-    chartHistory.e_charged.push(t.bat_charged_wh || 0);
-    chartHistory.e_discharged.push(t.bat_discharged_wh || 0);
-    chartHistory.e_load.push(t.load_wh || 0);
+    chartHistory.quality.push(data.history_quality || "complete");
+    chartHistory.e_import.push(t.import_wh == null ? null : t.import_wh);
+    chartHistory.e_export.push(t.export_wh == null ? null : t.export_wh);
+    chartHistory.e_pv.push(t.pv_wh == null ? null : t.pv_wh);
+    chartHistory.e_charged.push(t.bat_charged_wh == null ? null : t.bat_charged_wh);
+    chartHistory.e_discharged.push(t.bat_discharged_wh == null ? null : t.bat_discharged_wh);
+    chartHistory.e_load.push(t.load_wh == null ? null : t.load_wh);
 
     // Per-battery-driver push. Any driver in data.drivers that exposes
     // bat_w is considered battery-capable and gets its own chart series.
@@ -1059,31 +1063,28 @@
     var seenEVs = {};
     Object.keys(drivers).forEach(function (name) {
       var d = drivers[name] || {};
-      if (d.bat_w != null) {
+      if (Object.prototype.hasOwnProperty.call(d, "bat_w")) {
         seenBatteries[name] = true;
         var bslot = ensureBatteryDriver(name);
-        bslot.bat.push(d.bat_w || 0);
+        bslot.bat.push(d.status === "offline" || d.bat_w == null ? null : d.bat_w);
         bslot.target.push((targetsByDriver && targetsByDriver[name]) || 0);
       }
-      if (d.ev_w != null) {
+      if (Object.prototype.hasOwnProperty.call(d, "ev_w")) {
         seenEVs[name] = true;
         var eslot = ensureEVDriver(name);
-        eslot.ev.push(d.ev_w || 0);
+        eslot.ev.push(d.status === "offline" || d.ev_w == null ? null : d.ev_w);
       }
     });
-    // Drivers that have history but didn't report this cycle: push a
-    // 0 so index alignment with chartHistory.timestamps stays intact.
-    // (Keeps the line continuous; the driver offline/gap is already
-    // visible through the driver card's status indicator.)
+    // Preserve alignment while leaving a gap for an unavailable device.
     Object.keys(chartBatteries).forEach(function (name) {
       if (seenBatteries[name]) return;
       var slot = chartBatteries[name];
-      slot.bat.push(0);
-      slot.target.push(0);
+      slot.bat.push(null);
+      slot.target.push(null);
     });
     Object.keys(chartEVs).forEach(function (name) {
       if (seenEVs[name]) return;
-      chartEVs[name].ev.push(0);
+      chartEVs[name].ev.push(null);
     });
 
     if (chartHistory.grid.length > CHART_POINTS) {
@@ -1139,6 +1140,14 @@
     var windowMs = CHART_RANGE_MS[chartRange] || CHART_RANGE_MS["5m"];
     var now = Date.now();
     var windowStart = now - windowMs;
+    var qualityNote = document.getElementById("chart-history-quality");
+    if (qualityNote) {
+      var qualities = chartHistory.quality.filter(function (_,i) { return chartHistory.timestamps[i] >= windowStart; });
+      var mismatch = qualities.indexOf("balance_mismatch") >= 0;
+      var partial = mismatch || qualities.indexOf("incomplete") >= 0;
+      qualityNote.hidden = !partial;
+      qualityNote.textContent = mismatch ? "Measurements do not balance. Home use is unknown for those samples." : "Some measurements are missing. Working devices keep recording; gaps are unknown.";
+    }
     // Forward-looking forecast: at least 15 minutes so the transition
     // from actual→predicted is smooth. For longer ranges, use half the
     // past window. Keeps the live trace dominant on wide views while
@@ -1153,7 +1162,7 @@
     var smoothedPVSeries = null;
     var smoothedLoadSeries = null;
     if (chartView === "energy") {
-      function toKwh(arr) { return arr.map(function(x){ return x / 1000; }); }
+      function toKwh(arr) { return arr.map(function(x){ return x == null ? null : x / 1000; }); }
       series = [
         { data: toKwh(chartHistory.e_import),     color: "#ef4444", width: 2, dash: [], name: "Import",     fill: true },
         { data: toKwh(chartHistory.e_export),     color: "#22c55e", width: 2, dash: [], name: "Export",     fill: true },
@@ -1302,12 +1311,14 @@
     series.forEach(function (sr) {
       if (sr.data.length < 2 || chartHistory.timestamps.length < 2) return;
 
-      var pts = [];
+      var segments = [], pts = [];
       for (var j = 0; j < sr.data.length; j++) {
         var ts = chartHistory.timestamps[j];
-        if (sr.data[j] == null) continue;
+        if (sr.data[j] == null) { if (pts.length) segments.push(pts); pts = []; continue; }
         pts.push({ x: tsToX(ts), y: valToY(sr.data[j]) });
       }
+      if (pts.length) segments.push(pts);
+      segments.forEach(function (pts) {
       if (pts.length < 2) return;
 
       if (sr.fill) {
@@ -1336,8 +1347,9 @@
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Cache the right-most point for un-clipped pulse drawing
-      if (sr.width >= 2) {
+      });
+      // Only the current sample may pulse. Earlier segments remain still.
+      if (sr.width >= 2 && pts.length && sr.data.length === chartHistory.timestamps.length) {
         liveTips.push({ x: pts[pts.length - 1].x, y: pts[pts.length - 1].y, color: sr.color });
       }
     });
@@ -2144,6 +2156,36 @@
   // entries mean "no loadpoint for this driver" and the planet
   // falls back to legacy kW-only rendering.
   var loadpointsByDriver = null;
+  // The owner's cars (GET /api/cars), apart from the chargers: a car shows
+  // while unplugged too. carsFetchedAt dates the list, so a level's age stays
+  // true between reads and an old list says how old it is.
+  var lastCars = [];
+  var carsFetchedAt = 0;
+  // Where a car is comes from the chargers' read, which can fail while the
+  // cars' read answers: each list has its own time.
+  var loadpointsFetchedAt = 0;
+  var carsCard = null;
+  function openChargerOf(lp) {
+    if (energyFlowEl) energyFlowEl.dispatchEvent(new CustomEvent("ftw-planet-click", { detail: { role: "ev", name: lp.driver_name } }));
+  }
+  function tapCar(ui, lp, carId) {
+    return ui.tap(apiFetch, lp, carId).then(function (res) {
+      if (res.ok) fetchStatus();
+      return res;
+    });
+  }
+  function updateCars() {
+    carsUI.then(function (ui) {
+      var host = document.getElementById("overview-cars");
+      if (!ui || !host) return;
+      if (!carsCard) carsCard = ui.createCarsCard(document, host, { onOpenCharger: openChargerOf });
+      carsCard.update({
+        cars: lastCars, loadpoints: chargingNoticePoints, fetchedAt: carsFetchedAt, now: Date.now(),
+        fresh: !document.hidden && Date.now() - carsFetchedAt < 15000,
+        chargersFresh: !document.hidden && Date.now() - loadpointsFetchedAt < 15000,
+      });
+    }).catch(function (err) { console.error("cars:", err); });
+  }
   var chargingNoticePoints = [];
   var chargingNoticeRows = new Map();
   var chargingNoticeTimer = null;
@@ -2183,11 +2225,22 @@
         button.type = "button";
         section.append(title, status, button);
         host.appendChild(section);
-        row = { section: section, title: title, status: status, button: button };
+        row = { section: section, title: title, status: status, button: button, which: null };
         chargingNoticeRows.set(lp.id, row);
       }
       var available = fresh && (!lp.charger || lp.charger.available);
       row.title.textContent = available ? "Car connected" : "Car status is out of date";
+      // The car on this charger by name, and the one tap while the box
+      // cannot say which car it is.
+      carsUI.then(function (ui) {
+        if (!ui || !row.section.isConnected) return;
+        if (!row.which) {
+          row.which = ui.createWhichCar(document, { onTap: function (point, carId) { return tapCar(ui, point, carId); } });
+          row.section.appendChild(row.which.el);
+        }
+        if (available) row.title.textContent = ui.noticeTitle(lp, lastCars);
+        row.which.update(lp, lastCars, chargingNoticePoints, available);
+      }).catch(function (err) { console.error("cars:", err); });
       var message = available ? renderEvPlanStatus(lp, null) : null;
       row.status.textContent = message ? message.textContent : "Waiting for current charger status. The last reading cannot confirm charging.";
       row.button.textContent = "Check charging" + (lp.soc_source !== "vehicle" ? " and battery level" : "");
@@ -2199,6 +2252,7 @@
       if (!keep.has(id)) { row.section.remove(); chargingNoticeRows.delete(id); }
     });
     host.hidden = keep.size === 0;
+    updateCars();
   }
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) updateChargingNotice(null);
@@ -2223,6 +2277,8 @@
       }),
       boundedApiRead("/api/loadpoints", function (r) { return r.ok ? r.json() : null; })
         .catch(function () { return null; }),
+      boundedApiRead("/api/cars", function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; }),
       boundedApiRead("/api/health", function (r) { return r.ok ? r.json() : null; })
         .catch(function () { return null; })
         .then(function (health) {
@@ -2233,18 +2289,24 @@
       .then(function (results) {
         var data = results[0];
         var lp = results[1];
-        var health = results[2];
+        var carList = results[2];
+        var health = results[3];
         lastStatusPayload = data;
         // Surface DB corruption-recovery events (boot-time, immutable per
         // process) as a top banner. Tolerant: health may be null.
         try { updateStorageBanner(health && health.storage); }
         catch (eSb) { /* silent */ }
         if (lp && Array.isArray(lp.loadpoints)) {
+          loadpointsFetchedAt = Date.now();
           var idx = {};
           lp.loadpoints.forEach(function (l) {
             if (l && l.driver_name) idx[l.driver_name] = l;
           });
           loadpointsByDriver = idx;
+        }
+        if (carList && Array.isArray(carList.cars)) {
+          lastCars = carList.cars;
+          carsFetchedAt = Date.now();
         }
         updateChargingNotice(lp);
         setConnected(true);
@@ -2647,9 +2709,9 @@
   }
 
   // Peak slider: same dirty pattern, plus an enable/disable checkbox.
-  // Off → POST 0 (backend reads 0 = disabled). On → POST slider value.
-  // The slider is disabled when the toggle is off so the operator can't
-  // accidentally drag a dead control.
+  // Off → POST 0 (backend reads 0 = disabled). On → POST the box's last
+  // ceiling. The slider is disabled when the toggle is off so the operator
+  // can't accidentally drag a dead control.
   if (peakLimitSlider) {
     peakLimitSlider.addEventListener("input", function () {
       const w = Number(peakLimitSlider.value);
@@ -2663,15 +2725,20 @@
       const enabled = peakLimitEnableToggle.checked;
       if (peakLimitEnableLabel) peakLimitEnableLabel.textContent = enabled ? "On" : "Off";
       if (peakLimitSlider) peakLimitSlider.disabled = !enabled;
-      // Show the value the toggle is about to enable (last known)
-      // without committing — the operator still has to press Save
-      // unless the toggle is being switched OFF, which is a destructive
-      // change worth one extra click confirmation. Wait — the spec
-      // calls for the toggle itself to be the on/off control, so flip
-      // straight through: post immediately on toggle change.
-      const w = enabled ? Number(peakLimitSlider.value) || readLastPeakLimitW() : 0;
-      if (enabled && peakLimitSlider) peakLimitSlider.value = w;
-      if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      if (enabled && !peakLimitLastW) {
+        // The box has never had a ceiling on, so there is none to restore:
+        // the owner picks one and Save applies it.
+        peakLimitDirty = true;
+        if (peakLimitSend) peakLimitSend.disabled = false;
+        return;
+      }
+      // On applies the ceiling the box last had on, shown as it applies;
+      // off applies 0. The toggle is the switch, so neither waits for Save.
+      const w = enabled ? peakLimitLastW : 0;
+      if (enabled) {
+        if (peakLimitSlider) peakLimitSlider.value = w;
+        if (peakLimitValue) peakLimitValue.textContent = formatW(w);
+      }
       peakLimitEnableToggle.disabled = true;
       setPeakImportCeiling(w)
         .then(function () { peakLimitDirty = false; if (peakLimitSend) peakLimitSend.disabled = true; })
@@ -2682,7 +2749,6 @@
   if (peakLimitSend) {
     peakLimitSend.addEventListener("click", function () {
       const w = Number(peakLimitSlider.value);
-      writeLastPeakLimitW(w);
       peakLimitSend.disabled = true;
       setPeakImportCeiling(w)
         .then(function () { peakLimitDirty = false; })
@@ -2848,12 +2914,12 @@
       case "limited":
         if (m.limit_reason === "charger_limit") return "The charger limits this request to " + cmdA + " (" + reqA + " requested).";
         if (m.limit_reason === "fuse_cooldown") {
-          return "Paused: main-fuse protection — " + reqA + " requested; charging resumes on its own." + sinceP;
+          return "Paused by site power limits — " + reqA + " requested; charging resumes on its own." + sinceP;
         }
         if (m.limit_reason === "site_meter_stale") {
           return "Paused for safety: site-meter data is stale — " + reqA + " requested; charging resumes when telemetry recovers.";
         }
-        return "Main fuse limits this charge to " + cmdA + " right now (" + reqA + " requested)." + sinceP;
+        return "Site power limits cap this charge at " + cmdA + " right now (" + reqA + " requested)." + sinceP;
     }
     return "FTW received " + reqA + ". Waiting for charger status." + end;
   }
@@ -2901,7 +2967,7 @@
         ? "Charging on plan until " + evFmtClock(lp.plan_next_end_ms) + "." + kwPlanned
         : "Charging.";
       if (lp.commanded_reason === "fuse_limit") {
-        text += " Rate is limited by the main fuse right now.";
+        text += " Rate is limited by site power limits right now.";
       }
     } else if (lp.goal_complete === true) {
       text = "The car confirmed this charging goal is complete.";
@@ -2926,7 +2992,7 @@
       // The specific pauses beat the generic branches — this is the
       // line that stops an operator debugging cable and charger while
       // the box is protecting the main fuse (#1009).
-      text = "Paused: main-fuse protection — the house is using the headroom; charging resumes on its own." + kwPlanned;
+      text = "Paused by site power limits — the house is using the headroom; charging resumes on its own." + kwPlanned;
       tone = "var(--text)";
     } else if (lp.commanded_known && !lp.commanded_w && lp.commanded_reason === "site_meter_stale") {
       text = "Paused for safety: site-meter data is stale — charging resumes when telemetry recovers.";
@@ -3958,7 +4024,7 @@
       levels.hidden = !lpNow.plugged_in;
       levelsNote.hidden = !lpNow.plugged_in;
       var plugged = !!(lpNow && lpNow.plugged_in);
-      socWrap.hidden = !plugged || !!(info && info.fromCar);
+      socWrap.hidden = !plugged || !!(info && info.fromCar && !lpNow.vehicle_stale && lpNow.soc_source === "vehicle");
       slider.disabled = !!lpNow.read_unavailable;
       if (!plugged) return;
       var cur = (lpNow.current_soc != null) ? Math.max(0, Math.min(100, Math.round(lpNow.current_soc * 100))) : null;
@@ -4104,13 +4170,12 @@
   // threshold (5 pp release hysteresis).
   function buildScheduleSection(lp, hasPV, supportsVehicleLimit) {
     var sched = (lp && lp.schedule) || {};
-    // Convert "minutes-of-day-UTC" to a "HH:MM" string in the browser's
-    // local zone. The UI shows local time everywhere; we marshal back to
-    // UTC minutes on save.
+    // The ready time is on the household clock, the box's zone, wherever
+    // the browser is.
     supportsVehicleLimit = supportsVehicleLimit === true;
     var useVehicleLimit = sched.finish_at_vehicle_limit === true;
     var hasSched = !!(useVehicleLimit || sched.soc || sched.recurring || sched.surplus_unlock_bat_soc);
-    var initLocalHHMM = hasSched ? utcMinsToLocalHHMM(typeof sched.time_of_day_min_utc === "number" ? sched.time_of_day_min_utc : 360) : "07:00";
+    var initHHMM = hasSched ? readyHHMM(sched) : "07:00";
     var initSoC = typeof sched.soc === "number" && sched.soc > 0 ? sched.soc * 100 : 80;
     var percentSoC = useVehicleLimit && typeof sched.soc === "number" ? sched.soc : initSoC / 100;
     var initRec = !!sched.recurring;
@@ -4219,7 +4284,7 @@
 
     var timeInp = document.createElement("input");
     timeInp.type = "time";
-    timeInp.value = initLocalHHMM;
+    timeInp.value = initHHMM;
     timeInp.style.padding = "0.25rem 0.4rem";
     timeInp.style.background = "var(--ink-raised)";
     timeInp.style.color = "var(--fg)";
@@ -4476,8 +4541,7 @@
     }
     function doSave() {
       var seq = saveSeq;
-      var localHHMM = timeInp.value || initLocalHHMM;
-      var minUTC = localHHMMToUtcMins(localHHMM);
+      var hhmm = timeInp.value || initHHMM;
       // Surplus checkbox gates the threshold: when off (or hidden on
       // PV-less sites), the threshold is sent as 0 — the backend
       // interprets 0 as "feature disabled".
@@ -4490,7 +4554,10 @@
       var body = {
         schedule: {
           soc: percentSoC,
-          time_of_day_min_utc: minUTC,
+          // The household clock. A Core without time_of_day_min reads
+          // the UTC minute instead, worked out in this browser's zone.
+          time_of_day_min: hhmmToMins(hhmm),
+          time_of_day_min_utc: localHHMMToUtcMins(hhmm),
           recurring: !!recCb.checked,
           // All seven days is the wire's zero.
           days: days === 0x7f ? 0 : days,
@@ -4626,7 +4693,7 @@
       var hasGoal = !!(s && (s.finish_at_vehicle_limit === true || s.soc > 0));
       summary.textContent = hasGoal
         ? (s.finish_at_vehicle_limit === true ? "Car's charge limit" : Math.round(s.soc * 100) + " %") +
-          " by " + utcMinsToLocalHHMM(s.time_of_day_min_utc) +
+          " by " + readyHHMM(s) +
           (nextLp.goal_complete === true ? " · completed" : s.recurring ? " · repeats" : " · once")
         : "No ready time set.";
       editLabel.textContent = hasGoal ? "Change goal" : "Set a ready time";
@@ -4642,18 +4709,29 @@
     return container;
   }
 
+  // The ready time as "HH:MM" on the household clock. A Core without
+  // time_of_day_min sends only the UTC minute, read in this browser's zone.
+  function readyHHMM(s) {
+    if (typeof s.time_of_day_min === "number") {
+      return String(Math.floor(s.time_of_day_min / 60)).padStart(2, "0") + ":" + String(s.time_of_day_min % 60).padStart(2, "0");
+    }
+    return utcMinsToLocalHHMM(typeof s.time_of_day_min_utc === "number" ? s.time_of_day_min_utc : 360);
+  }
   function utcMinsToLocalHHMM(min) {
     var d = new Date();
     d.setUTCHours(Math.floor(min / 60), min % 60, 0, 0);
     return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
   }
-  function localHHMMToUtcMins(hhmm) {
+  // "HH:MM" as minutes after midnight; 06:00 when it does not parse.
+  function hhmmToMins(hhmm) {
     var parts = String(hhmm).split(":");
-    if (parts.length !== 2) return 360;
     var h = parseInt(parts[0], 10), m = parseInt(parts[1], 10);
-    if (isNaN(h) || isNaN(m)) return 360;
+    return parts.length === 2 && !isNaN(h) && !isNaN(m) ? h * 60 + m : 360;
+  }
+  function localHHMMToUtcMins(hhmm) {
+    var min = hhmmToMins(hhmm);
     var d = new Date();
-    d.setHours(h, m, 0, 0);
+    d.setHours(Math.floor(min / 60), min % 60, 0, 0);
     return d.getUTCHours() * 60 + d.getUTCMinutes();
   }
 
@@ -4897,16 +4975,17 @@
         chartEVs = {};
         data.items.forEach(function (it) {
           var et = it.energy_today || {};
-          chartHistory.grid.push(it.grid_w || 0);
-          chartHistory.pv.push(it.pv_w || 0);
-          chartHistory.load.push(it.load_w || 0);
+          chartHistory.grid.push(it.grid_w == null ? null : it.grid_w);
+          chartHistory.pv.push(it.pv_w == null ? null : it.pv_w);
+          chartHistory.load.push(it.load_w == null ? null : it.load_w);
           chartHistory.timestamps.push(it.ts || 0);
-          chartHistory.e_import.push(et.import_wh || 0);
-          chartHistory.e_export.push(et.export_wh || 0);
-          chartHistory.e_pv.push(et.pv_wh || 0);
-          chartHistory.e_charged.push(et.bat_charged_wh || 0);
-          chartHistory.e_discharged.push(et.bat_discharged_wh || 0);
-          chartHistory.e_load.push(et.load_wh || 0);
+          chartHistory.quality.push(it.history_quality || "complete");
+          chartHistory.e_import.push(et.import_wh == null ? null : et.import_wh);
+          chartHistory.e_export.push(et.export_wh == null ? null : et.export_wh);
+          chartHistory.e_pv.push(et.pv_wh == null ? null : et.pv_wh);
+          chartHistory.e_charged.push(et.bat_charged_wh == null ? null : et.bat_charged_wh);
+          chartHistory.e_discharged.push(et.bat_discharged_wh == null ? null : et.bat_discharged_wh);
+          chartHistory.e_load.push(et.load_wh == null ? null : et.load_wh);
 
           // Per-driver discovery from this item's drivers + targets maps.
           // A driver can expose bat_w, ev_w, or both.
@@ -4915,26 +4994,26 @@
           var seenBat = {}, seenEV = {};
           Object.keys(itDrivers).forEach(function (name) {
             var d = itDrivers[name] || {};
-            if (d.bat_w != null) {
+            if (Object.prototype.hasOwnProperty.call(d, "bat_w")) {
               seenBat[name] = true;
               var bslot = ensureBatteryDriver(name);
-              bslot.bat.push(d.bat_w || 0);
-              bslot.target.push(itTargets[name] || 0);
+              bslot.bat.push(d.status === "offline" || d.bat_w == null ? null : d.bat_w);
+              bslot.target.push(itTargets[name] == null ? null : itTargets[name]);
             }
-            if (d.ev_w != null) {
+            if (Object.prototype.hasOwnProperty.call(d, "ev_w")) {
               seenEV[name] = true;
-              ensureEVDriver(name).ev.push(d.ev_w || 0);
+              ensureEVDriver(name).ev.push(d.ev_w == null ? null : d.ev_w);
             }
           });
           Object.keys(chartBatteries).forEach(function (name) {
             if (seenBat[name]) return;
             var slot = chartBatteries[name];
-            slot.bat.push(0);
-            slot.target.push(0);
+            slot.bat.push(null);
+            slot.target.push(null);
           });
           Object.keys(chartEVs).forEach(function (name) {
             if (seenEV[name]) return;
-            chartEVs[name].ev.push(0);
+            chartEVs[name].ev.push(null);
           });
         });
         syncBatteryLegend();
@@ -5017,6 +5096,7 @@
           totals.export_wh += arr[i].export_wh || 0;
           totals.pv_wh     += arr[i].pv_wh     || 0;
         }
+        if (arr.some(function (day) { return ["import_wh", "load_wh", "export_wh", "pv_wh"].some(function (key) { return day[key] == null; }); })) { totals.incomplete = true; }
         historyCakeEl.setTotals(totals);
       })
       .catch(function () { /* network blip — leave the previous render */ })
@@ -5079,11 +5159,10 @@
     // the row blob. Skip rows with no battery sample so the chart
     // doesn't draw spurious zero bars.
     var points = items
-      .filter(function (it) { return it.bat_w != null || it.bat_soc != null; })
       .map(function (it) {
         return {
           ts_ms: it.ts || it.ts_ms,
-          bat_w: it.bat_w || 0,
+          bat_w: it.bat_w == null ? null : it.bat_w,
           soc_pct: (it.bat_soc != null) ? it.bat_soc * 100 : null,
         };
       });
@@ -5102,6 +5181,7 @@
     ctx.clearRect(0, 0, cssW, cssH);
 
     var C = chartColors();
+    if (!points.some(function(p) { return p.bat_w != null || p.soc_pct != null; })) { ctx.fillStyle = C.muted; ctx.font = "13px system-ui"; ctx.fillText("Battery measurements unknown", 16, 28); return; }
     var pad = { left: 36, right: 36, top: 8, bottom: 18 };
     var plotW = cssW - pad.left - pad.right;
     var plotH = cssH - pad.top - pad.bottom;
@@ -5164,7 +5244,7 @@
     var started = false;
     for (var k = 0; k < points.length; k++) {
       var sp = points[k];
-      if (sp.soc_pct == null) continue;
+      if (sp.soc_pct == null) { started = false; continue; }
       var sx = xOf(sp.ts_ms);
       var sy = socOf(sp.soc_pct);
       if (!started) { ctx.moveTo(sx, sy); started = true; }

@@ -296,12 +296,13 @@ type Store struct {
 	health              map[string]*DriverHealth
 	commands            map[string]CommandEvidence
 	controlObservations map[string][]ControlObservation
+	homeObservations    map[string][]ControlObservation // display estimates only
+	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
+	homeIdleState       map[string]time.Time            // disconnected state time; zero means unqualified
+	homeEnergy          map[string]*homeEnergySeries    // timestamped session counters, display only
 
 	processNoise     float64
 	measurementNoise float64
-
-	// Separate slow filter for computed load (see UpdateLoad below).
-	loadFilter *KalmanFilter1D
 
 	// Per-cycle metric buffer. Drivers push via EmitMetric, the control loop
 	// drains via FlushSamples once per tick. Decouples the hot path from
@@ -314,6 +315,10 @@ type Store struct {
 	// waiting for the control loop to flush it to the TS DB.
 	latestMu     sync.RWMutex
 	latestMetric map[string]metricSnap
+
+	// arrivals hear of each finished poll (see Arrived).
+	arrivalsMu sync.Mutex
+	arrivals   map[chan struct{}]struct{}
 }
 
 type metricSnap struct {
@@ -333,8 +338,6 @@ func NewStore() *Store {
 		latestMetric:     make(map[string]metricSnap),
 		processNoise:     100, // W of expected change between samples
 		measurementNoise: 50,  // W of sensor noise
-		// Load: slow filter (process 20 — load changes slowly, measurement 500 — noisy)
-		loadFilter: NewKalman(20, 500),
 	}
 }
 
@@ -475,6 +478,7 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 
 	s.observeCommand(driver, t, rawW, data, now)
 	s.recordControlObservation(driver, t, rawW, data, now)
+	s.recordHomeObservation(driver, t, rawW, data, now)
 	s.freezeStepWindows(now)
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground
@@ -668,6 +672,22 @@ func (s *Store) SumOnlineV2XW() float64 {
 	return sum
 }
 
+// OnlineMeterW returns a site meter's latest power and when it arrived,
+// while its driver is still reporting. A watchdog-offline meter returns
+// false, so its last value never counts as a new reading.
+func (s *Store) OnlineMeterW(driver string) (w float64, at time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, found := s.readings[key(driver, DerMeter)]
+	if !found || math.IsNaN(r.RawW) || math.IsInf(r.RawW, 0) {
+		return 0, time.Time{}, false
+	}
+	if h, known := s.health[driver]; !known || !h.TelemetryLive() {
+		return 0, time.Time{}, false
+	}
+	return r.RawW, r.UpdatedAt, true
+}
+
 // ReadingsByDriver returns all readings from one driver.
 func (s *Store) ReadingsByDriver(driver string) []*DerReading {
 	s.mu.RLock()
@@ -753,7 +773,8 @@ func (s *Store) RecordDriverError(name, err string) {
 // rendering the stale card. A replacement under the same name that no
 // longer emits a metric (e.g. site-meter phase currents) must not inherit
 // the old, ageing snapshot, which would read as stale and block dispatch.
-// Historical TS-DB samples are NOT touched; they stay queryable.
+// A battery's outstanding order bound survives until raw power confirms its
+// replacement. Historical TS-DB samples stay queryable.
 func (s *Store) Remove(driver string) {
 	s.mu.Lock()
 	for _, t := range allDerTypes {
@@ -764,16 +785,16 @@ func (s *Store) Remove(driver string) {
 	delete(s.health, driver)
 	for _, kind := range allDerTypes {
 		delete(s.controlObservations, key(driver, kind))
+		delete(s.homeObservations, key(driver, kind))
+		delete(s.homeSourceTime, key(driver, kind))
+		delete(s.homeIdleState, key(driver, kind))
+		delete(s.homeEnergy, key(driver, kind))
 	}
 	for k, c := range s.commands {
 		c.Baseline, c.StepAfter = nil, nil
 		s.commands[k] = c
 	}
-	for k, command := range s.commands {
-		if command.Driver == driver {
-			delete(s.commands, k)
-		}
-	}
+	s.clearCommandEvidenceLocked(driver, time.Now())
 	s.mu.Unlock()
 
 	prefix := driver + ":"
@@ -901,20 +922,4 @@ func (s *Store) SetDriverCommandFault(name string, faulted bool, reason string) 
 type WatchdogTransition struct {
 	Name   string
 	Online bool
-}
-
-// UpdateLoad applies the slow load filter. load = grid - pv - bat is noisy
-// because battery responds faster than the grid meter sees the change. This
-// filter gives a stable house-load estimate.
-//
-// Negative rawLoad is physically impossible for household consumption and
-// indicates a transient driver-startup or PV/meter sync-lag artifact.
-// Clamping to zero prevents the Kalman filter from tracking garbage.
-func (s *Store) UpdateLoad(rawLoad float64) float64 {
-	if rawLoad < 0 {
-		rawLoad = 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.loadFilter.Update(rawLoad)
 }

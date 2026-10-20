@@ -327,7 +327,7 @@ func TestUnchangedSourcesAreNotResent(t *testing.T) {
 
 // The bucket never grows and the frame never fragments, because both would
 // make frame size a function of what happened in the house.
-func TestAnOversizedDeltaTruncatesInsteadOfGrowing(t *testing.T) {
+func TestAnOversizedDeltaGoesAsASnapshotNotALargerFrame(t *testing.T) {
 	h, box, rec, clock := newRig(t)
 
 	// A site with many devices, so the source table alone overruns lane 0.
@@ -349,50 +349,16 @@ func TestAnOversizedDeltaTruncatesInsteadOfGrowing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f := rec.only(t, MsgDelta)
-	if f.size != 512 {
-		t.Fatalf("truncated delta is %d bytes, want the 512-byte bucket", f.size)
+	// Lane 0 keeps its bucket; the table and the reading go in a snapshot.
+	if got := rec.types(); got != "[snap tick]" {
+		t.Fatalf("got %s, want a snapshot and lane 0's tick", got)
 	}
-	if f.flags&FlagTrunc == 0 {
-		t.Fatal("a delta that did not fit was sent without TRUNC")
+	if f := rec.only(t, MsgTick); f.size != 512 {
+		t.Fatalf("lane 0's frame is %d bytes, want the 512-byte bucket", f.size)
 	}
-	d := body[Delta](t, f)
-	if d.Sources != nil {
-		t.Fatal("the source table survived truncation; readings should have won the space")
-	}
-	if d.Fields[fidKey(FidGridW)] != 4321 {
-		t.Fatalf("the reading that changed did not survive truncation: %v", d.Fields)
-	}
-}
-
-// A field dropped to fit the bucket was never sent, so it is still different
-// on the next tick and goes then.
-func TestTruncatedSourcesAreRetriedOnTheNextTick(t *testing.T) {
-	h, box, rec, clock := newRig(t)
-	box.snap.Sources = nil
-	for i := 0; i < 24; i++ {
-		box.snap.Sources = append(box.snap.Sources, Source{
-			ID:             "driver.long.identifier." + string(rune('a'+i)),
-			Kind:           "inverter",
-			Name:           "A device with a comfortably long display name",
-			LastOkUptimeMs: 60_000,
-			StaleAfterMs:   15_000,
-		})
-	}
-	subscribe(t, h, rec)
-
-	clock.uptimeMs += 60_000
-	if err := h.Tick(); err != nil {
-		t.Fatal(err)
-	}
-	rec.reset()
-
-	if err := h.Tick(); err != nil {
-		t.Fatal(err)
-	}
-	f := rec.last(t, MsgDelta)
-	if f.flags&FlagTrunc == 0 {
-		t.Fatal("the retry did not report itself truncated either")
+	snap := body[Snap](t, rec.only(t, MsgSnap))
+	if snap.Fields[fidKey(FidGridW)] != 4321 || len(snap.Sources) != 24 {
+		t.Fatalf("the snapshot carries grid_w %d and %d sources", snap.Fields[fidKey(FidGridW)], len(snap.Sources))
 	}
 }
 
@@ -519,5 +485,86 @@ func TestEvFieldIsSentOnlyWhenAChargerExists(t *testing.T) {
 	}
 	if def.Name != "ev_w" || def.SrcID != nil {
 		t.Fatalf("field 10 = %+v, want name ev_w and no source", def)
+	}
+}
+
+func TestLoadFieldRequiresCoreQualification(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		snap  Snapshot
+		known bool
+		want  int64
+	}{
+		{name: "unknown zero"},
+		{name: "unknown previous value", snap: Snapshot{LoadW: 3700}},
+		{name: "known zero", snap: Snapshot{LoadWKnown: true}, known: true},
+		{name: "known positive", snap: Snapshot{LoadW: 3700.6, LoadWKnown: true}, known: true, want: 3701},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud, _ := LiveView(tc.snap, 60_000)
+			for name, fields := range map[string]map[string]int64{
+				"session": fieldValues(tc.snap, nil), "cloud": cloud,
+			} {
+				got, present := fields[fidKey(FidLoadW)]
+				if present != tc.known || present && got != tc.want {
+					t.Errorf("%s load = %d, present=%v; want %d, present=%v", name, got, present, tc.want, tc.known)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadUnknownAtSubscription(t *testing.T) {
+	h, box, rec, _ := newRig(t)
+	box.snap.LoadWKnown = false
+	deliver(t, h, MsgHello, nil, Hello{Proto: ProtoRange{Min: 0, Max: ProtoMax}})
+	deliver(t, h, MsgSub, nil, Sub{Bucket: 512, Hz: 1})
+	snap := body[Snap](t, rec.only(t, MsgSnap))
+	if _, present := snap.Fields[fidKey(FidLoadW)]; present {
+		t.Fatal("initial snapshot turned unknown load into a reading")
+	}
+	if _, present := snap.Dict[fidKey(FidLoadW)]; !present {
+		t.Fatal("unknown load removed the existing field 6 dictionary entry")
+	}
+}
+
+func TestLoadLossAndReturnResyncTheStream(t *testing.T) {
+	h, box, rec, _ := newRig(t)
+	subscribe(t, h, rec)
+
+	box.snap.LoadWKnown = false
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	snap := body[Snap](t, rec.only(t, MsgSnap))
+	if _, present := snap.Fields[fidKey(FidLoadW)]; present {
+		t.Fatal("replacement snapshot retained the previous load reading")
+	}
+	if got := snap.Fields[fidKey(FidGridW)]; got != 1200 {
+		t.Fatalf("load loss changed the grid reading: %d", got)
+	}
+	if got := rec.types(); got != "[snap tick]" {
+		t.Fatalf("load loss sent %s; want one replacement snapshot and the lane 0 beat", got)
+	}
+
+	rec.reset()
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.types(); got != "[tick]" {
+		t.Fatalf("unchanged unknown load sent %s; want only the lane 0 beat", got)
+	}
+
+	box.snap.LoadW, box.snap.LoadWKnown = 0, true
+	rec.reset()
+	if err := h.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	delta := body[Delta](t, rec.only(t, MsgDelta))
+	if got, present := delta.Fields[fidKey(FidLoadW)]; !present || got != 0 {
+		t.Fatalf("returning known zero load = %d, present=%v", got, present)
+	}
+	if len(delta.Fields) != 1 || rec.has(MsgSnap) {
+		t.Fatal("returning load changed unrelated fields or forced another snapshot")
 	}
 }
