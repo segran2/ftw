@@ -157,15 +157,9 @@ func realizedEVForBatteryW(store *telemetry.Store, state *State, meter *telemetr
 	}
 	var total float64
 	for _, demand := range state.evFuseDemands {
-		rd := store.Get(demand.driverName, telemetry.DerEV)
-		health := store.DriverHealth(demand.driverName)
-		if rd == nil || health == nil || !health.TelemetryLive() || health.DeviceFault || rd.UpdatedAt.After(now) || now.Sub(rd.UpdatedAt) > maxAge {
-			continue
-		}
-		observation, known := telemetry.ControlPowerObservation(rd.RawW, rd.Data, rd.UpdatedAt)
-		at := observation.Seen()
-		age, skew := now.Sub(at), meter.UpdatedAt.Sub(at)
-		if !known || age < 0 || age > maxAge || age > telemetry.ControlPowerMaxAge(rd.Data) || skew < -maxSkew || skew > maxSkew || !finiteFuseValue(observation.PowerW) {
+		observation, known := store.OnlineEVControlPower(demand.driverName, now, maxAge)
+		skew := meter.UpdatedAt.Sub(observation.Seen())
+		if !known || skew < -maxSkew || skew > maxSkew {
 			continue
 		}
 		total += math.Min(demand.powerW, math.Max(0, observation.PowerW))
