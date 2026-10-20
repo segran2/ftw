@@ -32,6 +32,7 @@ type ControlFeedback struct {
 	SiteConfirmation string             `json:"site_confirmation"`
 	SiteMeter        string             `json:"site_meter,omitempty"`
 	SiteEvidence     *ControlComparison `json:"site_evidence,omitempty"`
+	SiteHeadroom     *EVSiteHeadroom    `json:"site_headroom,omitempty"`
 	ToleranceW       *float64           `json:"tolerance_w"`
 	// Internal steps of the verdict; the API exposes their result above.
 	State            string   `json:"-"`
@@ -280,6 +281,7 @@ func (s *Server) controlFeedback(now time.Time) []ControlFeedback {
 				f.Reason = "readings_lost"
 			}
 			f.ReadingsFresh = fresh
+			f.SiteHeadroom = s.evSiteHeadroom(f, lps[rd.Driver], meter, now)
 			out = append(out, f)
 		}
 	}

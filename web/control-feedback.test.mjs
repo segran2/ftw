@@ -148,3 +148,19 @@ test('the summary answers the question for the whole site', () => {
   assert.equal(controlSummary([row({status: 'not_controlled', reason: 'observe_only'})]).tone, 'neutral');
   assert.equal(controlSummary([row()], false).tone, 'stale');
 });
+
+test('calculated site headroom explains an EV shortfall without claiming a vendor cause', () => {
+  const ev = row({kind: 'ev', status: 'not_following', reason: 'power_below_target', severity: 'warning', sent_w: 10350, actual_w: 4155,
+    site_headroom: {evidence: 'calculated', fuse_a: 25, margin_a: 0.5, projected_max_a: 29.5, battery_charge_w: 9383}});
+  const words = controlStatus(ev);
+  assert.equal(words.title, 'Insufficient site headroom');
+  assert.match(words.text, /home battery is charging at 9.4 kW/);
+  assert.match(words.next, /other loads unchanged/);
+  assert.match(words.next, /25 A/);
+  assert.match(words.proof, /Calculated.*has not reported/);
+  assert.equal(controlStatus(ev, false).title, 'Status not current');
+  assert.equal(controlStatus({...ev, reason: 'command_failed'}).title, 'Commands failing');
+  assert.equal(controlStatus({...ev, readings_fresh: false}).title, 'Not following');
+  assert.doesNotMatch(controlStatus({...ev, site_headroom: {...ev.site_headroom, battery_charge_w: 0}}).text, /battery/);
+  assert.equal(controlStatus({...ev, site_headroom: {...ev.site_headroom, projected_max_a: NaN}}).title, 'Not following');
+});

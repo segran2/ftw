@@ -153,6 +153,13 @@ function proofLine(row) {
 // can act, the next step. Tone follows Core's severity and status.
 export function controlStatus(row, live = true) {
   if (!live) return {title: 'Status not current', text: 'FTW has not reported for a while.', proof: '', next: 'Waiting for a fresh report.', tone: 'stale'};
+  const headroom = row.kind === 'ev' && row.reason === 'power_below_target' && row.readings_fresh && row.site_headroom?.evidence === 'calculated' ? row.site_headroom : null;
+  if (headroom && [headroom.fuse_a, headroom.margin_a, headroom.projected_max_a, headroom.battery_charge_w].every(num)) {
+    const battery = headroom.battery_charge_w > 100 ? ` The home battery is charging at ${controlPower(headroom.battery_charge_w)}.` : '';
+    return {title: 'Insufficient site headroom', text: sentence(row) + battery,
+      next: `With other loads unchanged, the requested EV power would raise the busiest phase to about ${Math.round(headroom.projected_max_a)} A, above the ${headroom.fuse_a} A fuse budget (${headroom.margin_a} A safety margin).`,
+      proof: 'Calculated from site measurements. The charger has not reported a limiting reason.', tone: 'warning'};
+  }
   const title = REASON_TITLES[row.reason] || STATUS_TITLES[row.status] || 'Checking';
   const tone = row.severity === 'alarm' ? 'alarm' : row.severity === 'warning' ? 'warning' : row.status === 'following' ? 'ok' : 'neutral';
   return {title, text: sentence(row), proof: proofLine(row), next: nextStep(row), tone};
