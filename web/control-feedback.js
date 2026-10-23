@@ -156,9 +156,10 @@ export function controlStatus(row, live = true) {
   const headroom = row.kind === 'ev' && row.reason === 'power_below_target' && row.readings_fresh && row.site_headroom?.evidence === 'calculated' ? row.site_headroom : null;
   if (headroom && [headroom.fuse_a, headroom.margin_a, headroom.projected_max_a, headroom.battery_charge_w].every(num)) {
     const battery = headroom.battery_charge_w > 100 ? ` The home battery is charging at ${controlPower(headroom.battery_charge_w)}.` : '';
+    const current = value => `${Number(value.toFixed(1))} A`;
     return {title: 'Insufficient site headroom', text: sentence(row) + battery,
-      next: `With other loads unchanged, the requested EV power would raise the busiest phase to about ${Math.round(headroom.projected_max_a)} A, above the ${headroom.fuse_a} A fuse budget (${headroom.margin_a} A safety margin).`,
-      proof: 'Calculated from site measurements. The charger has not reported a limiting reason.', tone: 'warning'};
+      next: `With other loads unchanged, the requested EV power would raise the busiest phase to about ${current(headroom.projected_max_a)}, above the ${current(headroom.fuse_a - headroom.margin_a)} working limit (${current(headroom.fuse_a)} fuse, ${current(headroom.margin_a)} safety margin).`,
+      proof: 'Calculated from site measurements. This is a projection, not a charger-reported cause.', tone: 'warning'};
   }
   const title = REASON_TITLES[row.reason] || STATUS_TITLES[row.status] || 'Checking';
   const tone = row.severity === 'alarm' ? 'alarm' : row.severity === 'warning' ? 'warning' : row.status === 'following' ? 'ok' : 'neutral';

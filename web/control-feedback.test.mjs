@@ -157,7 +157,7 @@ test('calculated site headroom explains an EV shortfall without claiming a vendo
   assert.match(words.text, /home battery is charging at 9.4 kW/);
   assert.match(words.next, /other loads unchanged/);
   assert.match(words.next, /25 A/);
-  assert.match(words.proof, /Calculated.*has not reported/);
+  assert.match(words.proof, /Calculated.*projection/);
   assert.equal(controlStatus(ev, false).title, 'Status not current');
   assert.equal(controlStatus({...ev, reason: 'command_failed'}).title, 'Commands failing');
   assert.equal(controlStatus({...ev, readings_fresh: false}).title, 'Not following');
@@ -173,4 +173,23 @@ test('limited positive EV offer does not explain prolonged zero delivery', () =>
  const capped=controlStatus(row({kind:'ev',status:'limited',reason:'fuse_limit',sent_w:6900,actual_w:6800}));
  assert.equal(capped.title,'Limited by site power limits');
  assert.match(capped.text,/fuse and import limits/);
+});
+
+test('a projected shortfall names the working limit rather than claiming the fuse rating is exceeded', () => {
+  const words = controlStatus(row({kind: 'ev', status: 'not_following', reason: 'power_below_target', severity: 'warning',
+    sent_w: 10350, actual_w: 8300,
+    site_headroom: {evidence: 'calculated', fuse_a: 25, margin_a: 1, projected_max_a: 24.8, battery_charge_w: 0}}));
+  assert.match(words.next, /24\.8 A/);
+  assert.match(words.next, /24 A working limit/);
+  assert.match(words.next, /25 A fuse/);
+  assert.doesNotMatch(words.next, /above the 25 A/);
+});
+
+test('a calculated projection does not deny raw charger reason evidence', () => {
+  const words = controlStatus(row({kind: 'ev', status: 'not_following', reason: 'power_below_target', severity: 'warning',
+    sent_w: 10350, actual_w: 4155, device_reason: 'limited by charger max current',
+    site_headroom: {evidence: 'calculated', fuse_a: 25, margin_a: .5, projected_max_a: 29.5, battery_charge_w: 9383}}));
+  assert.match(words.proof, /projection/);
+  assert.match(words.proof, /not a charger-reported cause/);
+  assert.doesNotMatch(words.proof, /has not reported|has not said/);
 });
