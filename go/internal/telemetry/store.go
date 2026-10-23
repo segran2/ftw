@@ -217,11 +217,13 @@ func (h *DriverHealth) RecordTick() {
 }
 
 // RecordError bumps the error counter and degrades the status after 3 in a row.
+// An offline driver stays offline: only fresh data brings it back. Lifting it
+// to degraded made its held readings live again until the next watchdog scan.
 func (h *DriverHealth) RecordError(err string) {
 	h.ConsecutiveErrors++
 	h.LastError = err
 	h.TickCount++
-	if h.ConsecutiveErrors >= 3 {
+	if h.ConsecutiveErrors >= 3 && h.Status != StatusOffline {
 		h.Status = StatusDegraded
 	}
 }
@@ -274,6 +276,13 @@ func (h *DriverHealth) TelemetryLive() bool {
 	return h != nil && h.Status != StatusOffline
 }
 
+// LastReadFailed reports whether the driver's latest poll failed, so its
+// readings are held from an earlier one. Only failed reads count: a refused
+// command sets DeviceFault and leaves this alone.
+func (h *DriverHealth) LastReadFailed() bool {
+	return h != nil && h.ConsecutiveErrors > 0
+}
+
 // MetricSample is one (driver, metric, ts, value) tuple buffered for the
 // long-format TS database. State.Store consumes these via FlushSamples.
 type MetricSample struct {
@@ -296,10 +305,6 @@ type Store struct {
 	health              map[string]*DriverHealth
 	commands            map[string]CommandEvidence
 	controlObservations map[string][]ControlObservation
-	homeObservations    map[string][]ControlObservation // display estimates only
-	homeSourceTime      map[string]bool                 // reported source time, otherwise receipt time
-	homeIdleState       map[string]time.Time            // disconnected state time; zero means unqualified
-	homeEnergy          map[string]*homeEnergySeries    // timestamped session counters, display only
 
 	processNoise     float64
 	measurementNoise float64
@@ -478,7 +483,6 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 
 	s.observeCommand(driver, t, rawW, data, now)
 	s.recordControlObservation(driver, t, rawW, data, now)
-	s.recordHomeObservation(driver, t, rawW, data, now)
 	s.freezeStepWindows(now)
 
 	// Auto-buffer the standard fields (raw, not smoothed — we store ground
@@ -785,10 +789,6 @@ func (s *Store) Remove(driver string) {
 	delete(s.health, driver)
 	for _, kind := range allDerTypes {
 		delete(s.controlObservations, key(driver, kind))
-		delete(s.homeObservations, key(driver, kind))
-		delete(s.homeSourceTime, key(driver, kind))
-		delete(s.homeIdleState, key(driver, kind))
-		delete(s.homeEnergy, key(driver, kind))
 	}
 	for k, c := range s.commands {
 		c.Baseline, c.StepAfter = nil, nil
