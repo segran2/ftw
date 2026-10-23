@@ -94,16 +94,12 @@ func (s *Server) evSiteHeadroom(f ControlFeedback, lp loadpoint.State, meter str
 	if result == nil {
 		return nil
 	}
-	for _, b := range s.deps.Tel.ReadingsByType(telemetry.DerBattery) {
-		bh := s.deps.Tel.DriverHealth(b.Driver)
-		if bh == nil || !bh.TelemetryLive() || bh.DeviceFault {
-			continue
-		}
-		obs, known := telemetry.ControlPowerObservation(b.RawW, b.Data, b.UpdatedAt)
-		age, skew := now.Sub(obs.Seen()), rd.UpdatedAt.Sub(obs.Seen())
-		if known && age >= 0 && age <= 15*time.Second && skew >= -10*time.Second && skew <= 10*time.Second && obs.PowerW > 100 {
+	for _, obs := range s.deps.Tel.OnlineBatteryControlPowers(now, 15*time.Second) {
+		skew := rd.UpdatedAt.Sub(obs.Seen())
+		if skew >= -10*time.Second && skew <= 10*time.Second && obs.PowerW > 100 {
 			result.BatteryChargeW += obs.PowerW
 		}
 	}
+
 	return result
 }
