@@ -306,11 +306,11 @@ func capBatteryCharge(targets []DispatchTarget, latest map[string]float64, pendi
 	}
 	out := append([]DispatchTarget(nil), targets...)
 	holds, lost := make([]float64, len(out)), make([]float64, len(out))
-	var holdW, increaseW, lostW float64
+	var holdW, increaseW float64
 	for i, target := range out {
 		last := latest[target.Driver]
 		lost[i] = math.Max(0, math.Min(0, target.TargetW)-math.Min(0, last))
-		lostW, spare = lostW+lost[i], spare-lost[i]
+		spare -= lost[i]
 		if target.TargetW > 0 {
 			holds[i] = math.Min(target.TargetW, math.Max(0, last))
 			holdW += holds[i]
@@ -336,10 +336,18 @@ func capBatteryCharge(targets []DispatchTarget, latest map[string]float64, pendi
 	// Pending rises consume room when ending relief too, not only when
 	// adding positive charge. Otherwise two successive reductions of
 	// discharge (or charge on the export pass) can spend the same room.
-	if short := pendingW - spare - holdW; short > 0 && lostW > 0 {
-		k := math.Min(1, short/lostW)
+	// Divide the shortfall over supply that can actually remain. A share
+	// assigned to a blocked or floor-bounded battery cannot protect the fuse.
+	// Never retain more than the previous order would otherwise release.
+	var availableW float64
+	for i := range out {
+		lost[i] = math.Min(lost[i], math.Max(0, keepW[out[i].Driver]))
+		availableW += lost[i]
+	}
+	if short := pendingW - spare - holdW; short > 0 && availableW > 0 {
+		k := math.Min(1, short/availableW)
 		for i := range out {
-			if keep := math.Min(lost[i]*k, keepW[out[i].Driver]); keep > 0 {
+			if keep := lost[i] * k; keep > 0 {
 				out[i].TargetW, out[i].Clamped = math.Min(0, out[i].TargetW)-keep, true
 			}
 		}
