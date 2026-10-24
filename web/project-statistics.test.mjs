@@ -39,21 +39,20 @@ function page(cloud=false,authorised=true,options={}) {
   return {window,writes,main,all,buttons:()=>all().filter(e=>e.tag==='button')};
 }
 
-test('local question sends nothing before a real Yes or No',async()=>{
+test('a box without Cloud is not asked, and Settings offers Cloud only',async()=>{
   const p=page();await p.window.FTWStatistics.refresh();
   assert.equal(p.writes.length,0);
-  assert.deepEqual(p.buttons().map(e=>e.textContent),['Yes, contribute','No, keep it local']);
-  assert.equal(p.buttons()[0].className,'btn-send');
-  p.buttons()[1].events.click();await setImmediate();
-  assert.equal(p.writes.length,1);assert.equal(p.writes[0].method,'DELETE');
-  assert.equal(p.writes[0].path,'/api/cloud/stats');
-  assert.match(p.main.textContent,/sharing is off/);
-});
-
-test('local Yes grants only statistics, not Cloud access',async()=>{
-  const p=page();await p.window.FTWStatistics.refresh();p.buttons()[0].events.click();await setImmediate();
-  assert.equal(p.writes.length,1);assert.equal(p.writes[0].path,'/api/cloud/stats');
-  assert.deepEqual(JSON.parse(p.writes[0].body),{policy:'stats-current'});
+  assert.equal(p.buttons().length,0);
+  const prompt=p.all().find(e=>e.id==='project-statistics-prompt');
+  assert.equal(prompt.hidden,true);
+  const settings={tag:'div',children:[],events:{},style:{},attributes:{},ownText:'',appendChild(e){this.children.push(e);return e;},set textContent(v){this.children=[];},get textContent(){return this.children.map(e=>e.textContent).join(' ');}};
+  p.window.FTWStatistics.mount(settings);
+  const labels=[];const visit=e=>{if(e.tag==='button')labels.push(e.textContent);(e.children||[]).forEach(visit);};visit(settings);
+  assert.deepEqual(labels,['Accept Cloud terms and turn it on']);
+  assert.match(settings.textContent,/FTW Cloud is off/);
+  assert.match(settings.textContent,/Anonymous statistics below/);
+  assert.doesNotMatch(settings.textContent,/Yes, contribute|keep it local/);
+  assert.equal(p.writes.length,0);
 });
 
 test('Cloud has bundled terms and a whole-service off action',async()=>{

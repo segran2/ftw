@@ -4,27 +4,51 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"github.com/srcfl/device-simulator/fuse"
 )
 
 var t0 = time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 
-func TestFuseBlowsOnTheGGCurve(t *testing.T) {
-	for _, tc := range []struct{ multiple, wantS float64 }{{1, math.Inf(1)}, {2, 600}, {5, 20}, {10, 3}} {
-		f := Fuse{RatingA: 25}
-		blewAt := math.Inf(1)
-		for s := 1; s <= 4000 && math.IsInf(blewAt, 1); s++ {
-			f.step([3]float64{-tc.multiple * 25, 0, 0}, 1) // Export heats it too.
+// The plant's fuse is the fuse package's gG at its default 25 °C, stepped a
+// second at a time: it blows in the second the model melts, export heats it
+// as import does, a warm fuse blows sooner and the other phases stay whole.
+func TestFuseFollowsTheFuseModel(t *testing.T) {
+	gG, _ := fuse.Lookup(fuse.IecGg)
+	blowAfter := func(f Fuse, a float64) float64 {
+		for s := 1; s <= 7200; s++ {
+			f.step([3]float64{-a, 0, 0}, 1)
 			if f.Blown[0] {
-				blewAt = float64(s)
+				if f.Blown[1] || f.Blown[2] {
+					t.Fatalf("%.0f A on L1 blew another phase", a)
+				}
+				return float64(s)
 			}
 		}
-		if blewAt != tc.wantS || f.Blown[1] {
-			t.Errorf("%.0f× rating: blew after %v s, want %v s", tc.multiple, blewAt, tc.wantS)
+		return math.Inf(1)
+	}
+	for _, tc := range []struct{ ratingA, multiple float64 }{{16, 2}, {20, 2}, {25, 2}, {25, 3}, {25, 1.6}} {
+		want := math.Ceil(gG.MeltSeconds(tc.multiple, tc.ratingA, fuse.DefaultAmbientC))
+		if got := blowAfter(Fuse{RatingA: tc.ratingA}, tc.multiple*tc.ratingA); got != want {
+			t.Errorf("%.1f× %.0f A: blew after %v s, want %v s", tc.multiple, tc.ratingA, got, want)
 		}
 	}
-	if got := ggTripSeconds(1.4); got <= 1800 || got >= 3600 {
-		t.Errorf("1.4×: %.0f s, want between the 1.25× and 1.6× points", got)
+	if got := blowAfter(Fuse{RatingA: 25}, 1.25*25); !math.IsInf(got, 1) {
+		t.Errorf("1.25× 25 A blew after %v s, want never", got)
 	}
+	warm := Fuse{RatingA: 25}
+	if err := warm.Preheat([3]float64{23, 23, 23}); err != nil {
+		t.Fatal(err)
+	}
+	if cold, hot := blowAfter(Fuse{RatingA: 25}, 50), blowAfter(warm, 50); hot >= cold {
+		t.Errorf("2× 25 A: warm blew after %v s, cold after %v s", hot, cold)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Error("a 10 A gG fuse, which the model does not cover, stepped without a panic")
+		}
+	}()
+	(&Fuse{RatingA: 10}).step([3]float64{5, 5, 5}, 1)
 }
 
 // PV export shows as negative phase currents, or as magnitudes on an

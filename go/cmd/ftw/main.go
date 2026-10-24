@@ -2473,11 +2473,13 @@ func main() {
 	// signed, readable copy of the house, off until an owner turns it on.
 	// Both use the one FTW Cloud connection.
 	var appTunnel *appuplink.Tunnel
+	var appExchange *appuplink.Exchange
 	if appUplink != nil {
 		appTunnel = appUplink.Tunnel()
+		appExchange = appUplink.Exchange()
 	}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
-		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, liveMeasurementOptions, priceSvc, appAPI, cloudNotify, appTunnel, carsRT, webPush)
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, liveMeasurementOptions, priceSvc, appAPI, cloudNotify, appTunnel, appExchange, carsRT, webPush)
 	appCloud.bind(cloudLink)
 	if cloudLink != nil {
 		agents.home = cloudLink.Home
@@ -2490,12 +2492,17 @@ func main() {
 	// The bundled drivers dir is deliberately not passed: which drivers this
 	// build ships with is compiled in, not discovered on disk. See
 	// fleetCatalogue for what that buys.
+	migrateStatistics(cfg, cfgMu, st, cloudLink)
+	answer := statsAnswer{st: st, link: cloudLink}
 	fleetPinger, fleetPingErr := startFleetPing(
-		ctx, cfg, cfgMu, st, Version, config.ManagedDriversDirOverride,
+		ctx, cfg, cfgMu, st, answer, tel, selfUpdater, Version, config.ManagedDriversDirOverride,
 	)
 	if fleetPingErr != nil {
 		slog.Warn("fleet ping unavailable", "err", fleetPingErr)
 	}
+	// The anonymous daily energy report, under the same answer, through an
+	// independent relay so that FTW Cloud never learns which box sent it.
+	energyReport := startEnergyReport(ctx, cfg, cfgMu, st, answer)
 
 	mutationPolicy := apiMutationPolicy()
 	mutationPolicy.LANAuthEnabled = func() bool {
@@ -2518,6 +2525,7 @@ func main() {
 		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled, agents),
 		Agents:          agentsForAPI(agents),
 		FleetPing:       fleetPinger,
+		EnergyReport:    energyReport,
 		Cloud:           cloudForAPI(cloudLink),
 		CfgMu:           cfgMu, Cfg: cfg, ConfigPath: *configPath,
 		ConfigApplier:       applyConfigChange,

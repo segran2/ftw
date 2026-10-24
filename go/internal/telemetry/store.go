@@ -324,6 +324,17 @@ type Store struct {
 	// arrivals hear of each finished poll (see Arrived).
 	arrivalsMu sync.Mutex
 	arrivals   map[chan struct{}]struct{}
+
+	// pollHours counts driver polls and their errors, all drivers together,
+	// one slot per clock hour of the last day, since born. Guarded by mu.
+	pollHours [24]pollHour
+	born      time.Time
+}
+
+// pollHour is one clock hour's driver polls, all drivers together.
+type pollHour struct {
+	hour          int64 // Unix hours
+	polls, errors uint64
 }
 
 type metricSnap struct {
@@ -341,6 +352,7 @@ func NewStore() *Store {
 		filters:          make(map[string]*KalmanFilter1D),
 		health:           make(map[string]*DriverHealth),
 		latestMetric:     make(map[string]metricSnap),
+		born:             time.Now(),
 		processNoise:     100, // W of expected change between samples
 		measurementNoise: 50,  // W of sensor noise
 	}
@@ -768,6 +780,48 @@ func (s *Store) RecordDriverError(name, err string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.driverHealthLocked(name).RecordError(err)
+}
+
+// CountPoll counts one finished driver poll, failed or not. The driver
+// registry's poll loop is the one caller: an OCPP charger's messages are not
+// polls and are counted neither way.
+func (s *Store) CountPoll(failed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.countPollLocked(time.Now(), failed)
+}
+
+// countPollLocked counts one poll in its clock hour, reusing the slot of the
+// same hour a day before.
+func (s *Store) countPollLocked(now time.Time, failed bool) {
+	hour := now.Unix() / 3600
+	slot := &s.pollHours[hour%int64(len(s.pollHours))]
+	if slot.hour != hour {
+		*slot = pollHour{hour: hour}
+	}
+	slot.polls++
+	if failed {
+		slot.errors++
+	}
+}
+
+// PollsLastDay is how many driver polls ran in the 24 clock hours up to now,
+// all drivers together, how many of them failed, and how much of the day the
+// count covers: the counts live in memory, so after a restart they cover
+// only the time since. The anonymous fleet report coarsens the share into a
+// bucket; no driver's name is counted.
+func (s *Store) PollsLastDay(now time.Time) (polls, errors uint64, covered time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	covered = min(24*time.Hour, max(0, now.Sub(s.born)))
+	hour := now.Unix() / 3600
+	for _, slot := range s.pollHours {
+		if slot.hour > hour-int64(len(s.pollHours)) && slot.hour <= hour {
+			polls += slot.polls
+			errors += slot.errors
+		}
+	}
+	return polls, errors, covered
 }
 
 // Remove drops all in-memory state for a driver: readings, Kalman

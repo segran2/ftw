@@ -6,6 +6,15 @@ import (
 	"time"
 )
 
+// fuseRoom is what one charger may use this tick, whatever it wants. What no
+// charger took goes to the first charger with a share, so two chargers are
+// never given the same room. capAmpsPerPhase reports it to the driver.
+type fuseRoom struct {
+	w          float64 // share of the EV cap, in watts
+	phaseA     float64 // room on the busiest phase above its last command; with phaseKnown
+	phaseKnown bool    // the site meter reports phase currents
+}
+
 type fuseRequest struct {
 	cfg      Config
 	deadline time.Time
@@ -19,7 +28,7 @@ type fuseRequest struct {
 // limit here: control.EVFuseBudget reads the site meter for the phases that
 // FuseConfigs names.
 func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample) {
-	c.tickFuseCaps, c.tickFuseReason = nil, ""
+	c.tickFuseCaps, c.tickFuseRooms, c.tickFuseReason = nil, nil, ""
 	if c.fuseEVMax == nil {
 		return
 	}
@@ -77,6 +86,7 @@ func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample
 		perPhase = perPhase && finite(roomA)
 	}
 	c.tickFuseCaps = make(map[string]float64, len(requests))
+	c.tickFuseRooms = make(map[string]fuseRoom, len(requests))
 	remaining := total
 	for _, request := range requests {
 		want := math.Min(request.wantW, remaining)
@@ -88,11 +98,57 @@ func (c *Controller) freezeFuseBudget(now time.Time, samples map[string]EVSample
 		cap := floorChargeW(want, request.cfg.MinChargeW, request.cfg.MaxChargeW, request.cfg.AllowedStepsW)
 		c.tickFuseCaps[request.cfg.ID] = cap
 		remaining -= cap
+		room := fuseRoom{w: cap, phaseKnown: perPhase}
 		if perPhase {
 			// A cut frees room only once the meter shows it.
-			roomA -= math.Max(0, c.phaseRiseA(request.cfg.ID, mode, cap, split))
+			room.phaseA = math.Max(0, c.phaseRiseA(request.cfg.ID, mode, cap, split))
+			roomA -= room.phaseA
 		}
+		c.tickFuseRooms[request.cfg.ID] = room
 	}
+	for _, request := range requests {
+		room := c.tickFuseRooms[request.cfg.ID]
+		if room.w <= 0 {
+			continue
+		}
+		room.w += math.Max(0, remaining)
+		room.phaseA += math.Max(0, roomA)
+		c.tickFuseRooms[request.cfg.ID] = room
+		break
+	}
+}
+
+// capAmpsPerPhase is the most current per phase Core allows this charger on
+// the phases its positive order names: its fuse room after the split between
+// chargers, the import limit, max_amps_per_phase and the charger's maximum.
+// It is not limited by what the plan or a hold wants, so it may exceed the
+// order. Unknown without a frozen budget or a voltage.
+func (c *Controller) capAmpsPerPhase(cfg Config, cmd map[string]any) (float64, bool) {
+	room, ok := c.tickFuseRooms[cfg.ID]
+	w, _ := cmd["power_w"].(float64)
+	v, _ := cmd["voltage"].(float64)
+	if !ok || !finite(room.w) || !finite(w) || w <= 0 || !finite(v) || v <= 0 {
+		return 0, false
+	}
+	mode, _ := cmd["phase_mode"].(string)
+	split, _ := cmd["phase_split_w"].(float64)
+	phases := c.commandPhases(mode, w, split)
+	capA := room.w / (v * float64(phases))
+	if room.phaseKnown {
+		capA = math.Min(capA, c.creditA(cfg.ID, phases)+room.phaseA)
+	}
+	if cfg.MaxChargeW > 0 {
+		capA = math.Min(capA, cfg.MaxChargeW/(v*float64(phases)))
+	}
+	if !finite(capA) {
+		return 0, false
+	}
+	// Two decimals, rounded down; the nudge absorbs float error at a step.
+	capA = math.Floor(math.Max(0, capA)*100+1e-6) / 100
+	if limit, known := cmd["max_amps_per_phase"].(float64); known && finite(limit) && limit > 0 {
+		capA = math.Min(capA, limit)
+	}
+	return capA, true
 }
 
 // commandPhases is where a command of w lands: 1 or 3 phases, as the

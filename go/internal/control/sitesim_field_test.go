@@ -79,6 +79,7 @@ type fieldCase struct {
 	goal      bool          // surplus-only with a ready-by goal
 	exportW   []float64     // surplus: export each quarter hour
 	houseStep time.Duration // > 0: L1 +8 A for 10 min from this time into the run
+	warm      bool          // the fuse starts warm: the house has carried its load all evening
 }
 
 func (c fieldCase) key() string {
@@ -275,7 +276,7 @@ func probeCases() []fieldCase {
 	for _, tm := range []fieldTiming{timingFast, timingEasee, timingSlowCloud} {
 		// A held 1p order raised to 3p beside a phase at 20 A.
 		out = append(out, fieldCase{report: "probe", fuseA: 25, mode: "auto", steps: "mixed", timing: tm, carPhases: 3, use: usePhaseUp,
-			house: [3]float64{2, 20, 2}, houseName: "2-20-2"})
+			house: [3]float64{2, 20, 2}, houseName: "2-20-2", warm: true})
 	}
 	for _, tm := range fieldTimings {
 		for _, use := range []fieldUse{usePlanned, useNow} {
@@ -705,6 +706,11 @@ func runFieldCase(c fieldCase, trace func(string, ...any)) (*simSite, *fieldRun)
 		c.car(p.Car)
 	}
 	p.HouseW = houseA(c.house[0], c.house[1], c.house[2])
+	if c.warm {
+		if err := p.Fuse.Preheat(c.house); err != nil {
+			panic(err)
+		}
+	}
 	if c.battery {
 		p.Battery = &sitesim.Battery{Phases: 3, MaxChargeW: 10000, MaxDischargeW: 10000, CapacityWh: 20000, SoC: .3, Latency: 3 * time.Second}
 	}
