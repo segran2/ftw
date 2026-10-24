@@ -42,6 +42,10 @@ func TestEVSiteHeadroomProjection(t *testing.T) {
 		{"device reason precedence", func(f *ControlFeedback, c *config.Fuse, a *[]float64, p *int, at *time.Time) {
 			f.Reason = "load_balancer_limit"
 		}, false},
+		{"one phase reason precedence", func(f *ControlFeedback, c *config.Fuse, a *[]float64, p *int, at *time.Time) { f.Reason = "one_phase" }, false},
+		{"hourly import reason precedence", func(f *ControlFeedback, c *config.Fuse, a *[]float64, p *int, at *time.Time) {
+			f.Reason = "import_limit"
+		}, false},
 		{"zero delivery not explained", func(f *ControlFeedback, c *config.Fuse, a *[]float64, p *int, at *time.Time) { f.ActualW = watts(0) }, false},
 		{"invalid safety margin", func(f *ControlFeedback, c *config.Fuse, a *[]float64, p *int, at *time.Time) {
 			c.SafetyMarginA = watts(26)
