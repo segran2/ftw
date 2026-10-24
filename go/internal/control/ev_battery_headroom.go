@@ -231,6 +231,14 @@ func retainEVBatteryRelief(targets []DispatchTarget, latest map[string]float64, 
 func pendingEVBatteryImportW(store *telemetry.Store, state *State, meter *telemetry.DerReading, latest map[string]float64) float64 {
 	now := state.now()
 	pending := state.pendingBatteryCommandsW(now)
+	// Proof from current targets cannot clear a pending rise on a battery
+	// that has no target in this dispatch.
+	for driver, log := range state.batteryCommands {
+		low, _, last, sent := log.span(now)
+		if _, present := latest[driver]; sent && last > low && !present {
+			return pending
+		}
+	}
 	observedPending := 0.0
 	for driver, last := range latest {
 		observation, known := store.OnlineBatteryControlPower(driver, now, 15*time.Second)
