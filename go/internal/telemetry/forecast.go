@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -34,13 +35,42 @@ type ForecastOptions struct {
 	HouseholdInvalidReason string
 	PVInvalidReason        string
 	ExpectedFlows          []ForecastFlow
-	MaxAge                 time.Duration
-	MaxSkew                time.Duration
-	UseWatchdogTimeout     bool `json:",omitempty"`
+	// OptionalFlows are flows History does not require but a training label
+	// does, such as PV on a hybrid inverter that may have no panels. Omitted
+	// when empty, so forecast revisions keep their stored identity.
+	OptionalFlows      []ForecastFlow `json:",omitempty"`
+	MaxAge             time.Duration
+	MaxSkew            time.Duration
+	UseWatchdogTimeout bool `json:",omitempty"`
 	// Live display may use the driver's measured site-side control power
 	// (for example Pixii AC instead of battery DC). Raw history stays separate.
 	UseControlPower bool `json:",omitempty"`
+	// PVDark says how dark it is at the site at a time. Live Home use counts
+	// an unknown PV source as 0 W after sunset. Nil, or no site position,
+	// infers nothing. Not part of a forecast revision's identity.
+	PVDark func(time.Time) Darkness `json:"-"`
 }
+
+// Darkness is the sun's state at the site, for unknown PV.
+type Darkness int
+
+const (
+	// DarknessUnknown: daylight, or no site position.
+	DarknessUnknown Darkness = iota
+	// DarknessTwilight: after sunset, before civil dusk. Diffuse light only.
+	DarknessTwilight
+	// DarknessNight: past civil dusk. PV produces nothing.
+	DarknessNight
+)
+
+// Live Home use quality. Measured: every flow read, each by its driver's latest
+// poll. Estimated: the site meter is read and a flow is left out, assumed or
+// held after a failed read. Unknown: no usable site meter.
+const (
+	LoadMeasured  = "measured"
+	LoadEstimated = "estimated"
+	LoadUnknown   = "unknown"
+)
 
 // ForecastReading is one coherent snapshot, in site signs and raw watts.
 // Valid describes the household balance. PVValid only describes the PV sources.
@@ -49,6 +79,8 @@ type ForecastSource struct {
 	Flow   ForecastFlow
 	PowerW *float64
 	SoC    *float64
+	// Dark: an unread PV source after sunset, shown as 0 W. Not a reading.
+	Dark bool
 }
 
 type ForecastReading struct {
@@ -58,6 +90,13 @@ type ForecastReading struct {
 	GridW, PVW, BatteryW, EVW, V2XW, HouseholdW float64
 	Valid, PVValid                              bool
 	Reason, PVReason                            string
+	// Live Home use, separate from history and forecast qualification
+	// (Valid/Reason). Known whenever the site meter is read; flows that cannot
+	// be read are left out and LoadQuality says so. PVLiveKnown: every PV
+	// source is read, or dark.
+	LoadW                   float64
+	LoadKnown, PVLiveKnown  bool
+	LoadQuality, LoadReason string
 }
 
 // ForecastMeasurement reads power and health under one lock. A command fault
@@ -96,6 +135,19 @@ func (s *Store) LiveMeasurementNow(siteMeter string, opts ForecastOptions) Forec
 	return s.measurementLocked(time.Now(), siteMeter, opts, false)
 }
 
+// SourceFailure reports whether a reading's Reason names one failed source.
+// That source is already unknown in Known; the balance of the others still
+// holds. Configuration and duplicate-flow reasons are not source failures.
+// Keep in step with the reasons measurementLocked gives.
+func SourceFailure(reason string) bool {
+	for _, prefix := range []string{"missing:", "offline:", "unknown_power:", "nonfinite:", "stale:", "future:", "invalid_sign:"} {
+		if strings.HasPrefix(reason, prefix) {
+			return true
+		}
+	}
+	return reason == "nonfinite_pv_sum"
+}
+
 func (s *Store) forecastMeasurementLocked(now time.Time, siteMeter string, opts ForecastOptions) ForecastReading {
 	return s.measurementLocked(now, siteMeter, opts, true)
 }
@@ -110,6 +162,7 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 		out.PVValid = false
 		out.Reason = "no_telemetry"
 		out.PVReason = out.Reason
+		out.LoadQuality, out.LoadReason = LoadUnknown, out.Reason
 		return out
 	}
 	if opts.MaxAge <= 0 {
@@ -118,9 +171,20 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 	if opts.MaxSkew <= 0 {
 		opts.MaxSkew = 30 * time.Second
 	}
+	liveIssue := ""
+	note := func(reason string) {
+		if liveIssue == "" {
+			liveIssue = reason
+		}
+	}
+	pvLiveKnown := true
+	darkness := DarknessUnknown
+	if opts.PVDark != nil && !alignSources {
+		darkness = opts.PVDark(now)
+	}
 	flows := map[string]ForecastFlow{}
 	key := func(f ForecastFlow) string { return f.Driver + ":" + f.DerType.String() }
-	fail := func(reason string, pv bool) {
+	failQuiet := func(reason string, pv bool) {
 		if out.Valid {
 			out.Valid = false
 			out.Reason = reason
@@ -129,6 +193,10 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			out.PVValid = false
 			out.PVReason = reason
 		}
+	}
+	fail := func(reason string, pv bool) {
+		note(reason)
+		failQuiet(reason, pv)
 	}
 	if opts.PVInvalidReason != "" {
 		out.PVValid = false
@@ -147,6 +215,9 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			flows[key(f)] = f
 		}
 	}
+	// Kinds configured twice: live Home use leaves them out, never subtracts twice.
+	duplicate := map[DerType]bool{}
+	var duplicateW float64
 	ids := map[string]ForecastFlow{}
 	for _, f := range opts.ExpectedFlows {
 		if f.DerType == DerVehicle || (f.DerType == DerMeter && f.Driver != siteMeter) {
@@ -156,6 +227,7 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			if old, ok := ids[f.FlowID]; ok {
 				fail("duplicate_flow:"+f.FlowID, f.DerType == DerPV || old.DerType == DerPV)
 				out.Known[f.DerType], out.Known[old.DerType] = false, false
+				duplicate[f.DerType], duplicate[old.DerType] = true, true
 			}
 			ids[f.FlowID] = f
 		}
@@ -167,9 +239,15 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			if _, ok := flows[f.Driver+":"+DerV2X.String()]; ok {
 				fail("duplicate_charger:"+f.Driver, false)
 				out.Known[DerEV], out.Known[DerV2X] = false, false
+				duplicate[DerEV], duplicate[DerV2X] = true, true
 			}
 		}
 	}
+	// Configuration and duplicate flows leave PV unknown for live use too.
+	if !out.Known[DerPV] {
+		pvLiveKnown = false
+	}
+	meterIssue := ""
 	keys := make([]string, 0, len(flows))
 	for k := range flows {
 		keys = append(keys, k)
@@ -228,9 +306,33 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			reason = "invalid_sign:"
 		}
 		if reason != "" {
+			switch {
+			case pv && darkness != DarknessUnknown && pvUnread(reason):
+				// Asleep after sunset: 0 W for live use. In twilight Home
+				// use is an estimate. History and forecasts keep their own
+				// evidence through Valid/Known.
+				if darkness == DarknessTwilight {
+					note("pv_twilight:" + k)
+				}
+				failQuiet(reason+k, pv)
+				out.Known[f.DerType] = false
+				zero := 0.0
+				source.PowerW, source.Dark = &zero, true
+				out.Sources[k] = source
+				continue
+			case pv:
+				pvLiveKnown = false
+			case f.DerType == DerMeter:
+				meterIssue = reason + k
+			}
 			fail(reason+k, pv)
 			out.Known[f.DerType] = false
 			continue
+		}
+		if s.health[f.Driver].LastReadFailed() {
+			// Held from an earlier read until the age limit: shown, not
+			// measured. History and forecasts keep their own policy.
+			note("read_failed:" + k)
 		}
 		source.PowerW = &powerW
 		if r.SoC != nil && !math.IsNaN(*r.SoC) && !math.IsInf(*r.SoC, 0) && *r.SoC >= 0 && *r.SoC <= 1 {
@@ -251,6 +353,9 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 			if powerAt.After(pvLast) {
 				pvLast = powerAt
 			}
+		}
+		if duplicate[f.DerType] {
+			duplicateW += powerW
 		}
 		switch f.DerType {
 		case DerMeter:
@@ -288,6 +393,8 @@ func (s *Store) measurementLocked(now time.Time, siteMeter string, opts Forecast
 	if math.IsNaN(out.HouseholdW) || math.IsInf(out.HouseholdW, 0) || out.HouseholdW < 0 {
 		fail("invalid_balance", false)
 	}
+	out.PVLiveKnown = pvLiveKnown && pvCount > 0 && !math.IsNaN(out.PVW) && !math.IsInf(out.PVW, 0)
+	out.setLiveLoad(out.HouseholdW+duplicateW, liveIssue, meterIssue)
 	return out
 }
 
@@ -390,4 +497,43 @@ func (r ForecastReading) Error() error {
 		return nil
 	}
 	return fmt.Errorf("forecast measurement: %s", r.Reason)
+}
+
+// setLiveLoad derives live Home use from the site meter and every flow that
+// was read. A missing battery, EV, V2X or daytime PV is left out, as Core did
+// before history qualification, and the result is an estimate. It is unknown
+// only without a usable site meter. Quality is a hint and never hides it.
+func (out *ForecastReading) setLiveLoad(w float64, issue, meterIssue string) {
+	if !out.Known[DerMeter] || meterIssue != "" {
+		if meterIssue == "" {
+			meterIssue = "site_meter_unknown"
+		}
+		out.LoadKnown, out.LoadQuality, out.LoadReason = false, LoadUnknown, meterIssue
+		return
+	}
+	if math.IsNaN(w) || math.IsInf(w, 0) {
+		out.LoadKnown, out.LoadQuality, out.LoadReason = false, LoadUnknown, "nonfinite_balance"
+		return
+	}
+	// Shown as is. A negative balance is a hint of production Core cannot
+	// see; zero or blank would hide it.
+	out.LoadKnown, out.LoadW = true, w
+	if w < 0 && issue == "" {
+		issue = "invalid_balance"
+	}
+	if issue == "" {
+		out.LoadQuality = LoadMeasured
+		return
+	}
+	out.LoadQuality, out.LoadReason = LoadEstimated, issue
+}
+
+// pvUnread: the PV source gave no usable reading. Only then can darkness stand
+// in for it. A malformed reading (wrong sign, non-finite, future) stays a fault.
+func pvUnread(reason string) bool {
+	switch reason {
+	case "missing:", "offline:", "stale:", "unknown_power:":
+		return true
+	}
+	return false
 }

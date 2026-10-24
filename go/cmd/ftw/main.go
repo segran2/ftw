@@ -41,6 +41,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/api"
 	"github.com/srcfl/ftw/go/internal/appuplink"
 	"github.com/srcfl/ftw/go/internal/arp"
+	"github.com/srcfl/ftw/go/internal/backup"
 	"github.com/srcfl/ftw/go/internal/battery"
 	"github.com/srcfl/ftw/go/internal/cars"
 	"github.com/srcfl/ftw/go/internal/components"
@@ -448,6 +449,9 @@ func main() {
 			backupDir = filepath.Join(dataDir, backupDir)
 		}
 	}
+	// A backup stopped with Core leaves its scratch; a large one in /dev/shm
+	// sends the next backup's copy to the data disk.
+	backup.RemoveStaleScratch(backupDir)
 	if abs, err := filepath.Abs(coldDir); err == nil {
 		coldDir = abs
 	}
@@ -858,7 +862,10 @@ func main() {
 	}
 	forecastSettings := newForecastSiteConfig(st)
 	liveMeasurementOptions := func() telemetry.ForecastOptions {
-		return forecastSettings.Snapshot().HistoryOptions
+		site := forecastSettings.Snapshot()
+		opts := site.HistoryOptions
+		opts.PVDark = site.HistorySun.darkness
+		return opts
 	}
 	forecastSettings.identity = func(name string) (string, bool) {
 		if id, ok := runningDeviceID(reg, name); ok {
@@ -1782,7 +1789,7 @@ func main() {
 				noBatteryToEV := !(ctrl.BatteryCoversEV || boostActive)
 				ctrlMu.Unlock()
 				charging, chargeDuration := lpMgr.ChargingPeriod(st.ID)
-				minW, maxW, steps := loadpoint.LimitPower(st, planningStepsForLoadpoint(st, cfg))
+				minW, maxW, steps := planningLimitsForLoadpoint(st, cfg)
 				specs = append(specs, &mpc.LoadpointSpec{
 					ID:               st.ID,
 					CapacityWh:       capWh,
@@ -1995,7 +2002,23 @@ func main() {
 		lpController.SetFuseEVMax(func() (float64, bool) {
 			ctrlMu.Lock()
 			defer ctrlMu.Unlock()
-			return control.EVFuseBudget(tel, ctrl, lpMgr.States(), lpMgr.Configs(), ctrl.SiteFuseAmps*ctrl.SiteFuseVoltage*float64(ctrl.SiteFusePhases))
+			// The cap is measured for the phases this tick's commands name.
+			return control.EVFuseBudget(tel, ctrl, lpMgr.States(), lpController.FuseConfigs(), ctrl.SiteFuseAmps*ctrl.SiteFuseVoltage*float64(ctrl.SiteFusePhases))
+		})
+		lpController.SetFusePhaseRoomA(func() (float64, bool) {
+			ctrlMu.Lock()
+			defer ctrlMu.Unlock()
+			return control.EVFusePhaseRoomA(ctrl)
+		})
+		lpController.SetFuseLimitReason(func() string {
+			ctrlMu.Lock()
+			defer ctrlMu.Unlock()
+			return control.EVLimitReason(ctrl)
+		})
+		lpController.SetSitePhases(func() (loadpoint.SitePhases, bool) {
+			ctrlMu.Lock()
+			defer ctrlMu.Unlock()
+			return control.SitePhases(tel, ctrl)
 		})
 		// Every lease is preflighted and re-evaluated on each loadpoint tick.
 		// This closure owns site/battery health because those concepts belong
@@ -2003,7 +2026,7 @@ func main() {
 		lpController.SetBatteryBoostSafety(func(id string, lease loadpoint.BatteryBoostLease) loadpoint.BatteryBoostStopReason {
 			ctrlMu.Lock()
 			mode := ctrl.Mode
-			fuseBlocked := ctrl.FuseSaturated
+			fuseBlocked, importBlocked := ctrl.FuseSaturated, ctrl.FuseSaturatedByImport
 			_, batteryHeld := ctrl.GetBatteryManualHold(time.Now())
 			siteMeter := ctrl.SiteMeterDriver
 			ctrlMu.Unlock()
@@ -2012,6 +2035,9 @@ func main() {
 			}
 			if batteryHeld {
 				return loadpoint.BatteryBoostStoppedBatteryHold
+			}
+			if fuseBlocked && importBlocked {
+				return loadpoint.BatteryBoostStoppedImportLimit
 			}
 			if fuseBlocked {
 				return loadpoint.BatteryBoostStoppedFuseSafety
@@ -2122,31 +2148,6 @@ func main() {
 			}
 			go mpcSvc.ReplanWithReason(context.Background(), "loadpoint_battery_boost_stopped")
 			slog.Info("battery boost stopped — replan requested", "lp", id, "reason", reason)
-		})
-		// Wire the live per-phase site-meter current reader. The EV hard
-		// limit (control.EVFuseBudget) cuts a worst-phase overage; this
-		// reader lets the loadpoint gate an increase on the phase a
-		// runtime 1p or auto charger may land on. Reads the same
-		// meter_lN_a metrics the fuse_over_limit notifier uses.
-		lpController.SetPerPhaseMeterAmps(func() (float64, float64, float64, bool) {
-			cfgMu.RLock()
-			siteMeter := cfg.SiteMeterDriver()
-			phaseCount := cfg.Fuse.Phases
-			watchdogTimeout := time.Duration(cfg.Site.WatchdogTimeoutS) * time.Second
-			cfgMu.RUnlock()
-			if siteMeter == "" {
-				return 0, 0, 0, false
-			}
-			if watchdogTimeout <= 0 {
-				watchdogTimeout = 60 * time.Second
-			}
-			amps, available, fresh := sitePhaseCurrentsAt(
-				tel, siteMeter, phaseCount, watchdogTimeout, time.Now(),
-			)
-			if !available || !fresh {
-				return 0, 0, 0, false
-			}
-			return amps[0], amps[1], amps[2], true
 		})
 		// Wire the matched-vehicle reader for auto-wake. When the
 		// loadpoint is commanding power but the matched Tesla
@@ -2472,11 +2473,13 @@ func main() {
 	// signed, readable copy of the house, off until an owner turns it on.
 	// Both use the one FTW Cloud connection.
 	var appTunnel *appuplink.Tunnel
+	var appExchange *appuplink.Exchange
 	if appUplink != nil {
 		appTunnel = appUplink.Tunnel()
+		appExchange = appUplink.Exchange()
 	}
 	cloudLink := startCloudLink(ctx, statePath, Version, st, appEnroll,
-		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, liveMeasurementOptions, priceSvc, appAPI, cloudNotify, appTunnel, carsRT, webPush)
+		tel, ctrl, ctrlMu, controlRev, appLinkWatchdog, liveMeasurementOptions, priceSvc, appAPI, cloudNotify, appTunnel, appExchange, carsRT, webPush)
 	appCloud.bind(cloudLink)
 	if cloudLink != nil {
 		agents.home = cloudLink.Home
@@ -2489,12 +2492,17 @@ func main() {
 	// The bundled drivers dir is deliberately not passed: which drivers this
 	// build ships with is compiled in, not discovered on disk. See
 	// fleetCatalogue for what that buys.
+	migrateStatistics(cfg, cfgMu, st, cloudLink)
+	answer := statsAnswer{st: st, link: cloudLink}
 	fleetPinger, fleetPingErr := startFleetPing(
-		ctx, cfg, cfgMu, st, Version, config.ManagedDriversDirOverride,
+		ctx, cfg, cfgMu, st, answer, tel, selfUpdater, Version, config.ManagedDriversDirOverride,
 	)
 	if fleetPingErr != nil {
 		slog.Warn("fleet ping unavailable", "err", fleetPingErr)
 	}
+	// The anonymous daily energy report, under the same answer, through an
+	// independent relay so that FTW Cloud never learns which box sent it.
+	energyReport := startEnergyReport(ctx, cfg, cfgMu, st, answer)
 
 	mutationPolicy := apiMutationPolicy()
 	mutationPolicy.LANAuthEnabled = func() bool {
@@ -2517,6 +2525,7 @@ func main() {
 		AppEnroll:       appEnrollForAPI(appEnroll, appUplink, st, appLinkEnabled, agents),
 		Agents:          agentsForAPI(agents),
 		FleetPing:       fleetPinger,
+		EnergyReport:    energyReport,
 		Cloud:           cloudForAPI(cloudLink),
 		CfgMu:           cfgMu, Cfg: cfg, ConfigPath: *configPath,
 		ConfigApplier:       applyConfigChange,
@@ -2951,7 +2960,7 @@ func main() {
 				// charger standdowns, self-tuning or normal physical dispatch.
 				lpMgr.RollSchedules(tickNow.UTC())
 				carsRT.Tick()
-				if _, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot().HistoryOptions); err != nil {
+				if _, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot()); err != nil {
 					slog.Warn("setup measurement persistence failed", "err", err)
 				}
 				continue
@@ -3051,7 +3060,7 @@ func main() {
 				// ctrl, so the stored tick has to show the hold already
 				// released rather than one the blocked tick never executed.
 				clearBatteryManualHoldForDispatchBlock(ctrl, ctrlMu)
-				sampleCount, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot().HistoryOptions)
+				sampleCount, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot())
 				if err != nil {
 					slog.Warn("tick persistence failed", "samples", sampleCount, "err", err)
 				}
@@ -3169,6 +3178,8 @@ func main() {
 					"ev_w", evW,
 					"v2x_w", v2xW,
 					"load_valid", live.Valid,
+					"load_quality", live.LoadQuality,
+					"load_reason", live.LoadReason,
 					"self_tune_active", selfTuneActive,
 					"self_tune_driver", selfTuneName,
 					"self_tune_command_w", selfTuneCmd,
@@ -3308,7 +3319,7 @@ func main() {
 			// ---- Persist the tick: history snapshot + flushed metrics ----
 			// One transaction for both — separate commits doubled the WAL
 			// commit rate for no isolation benefit (SD-card wear).
-			sampleCount, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot().HistoryOptions)
+			sampleCount, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot())
 			if err != nil {
 				slog.Warn("tick persistence failed", "samples", sampleCount, "err", err)
 			}
@@ -4000,8 +4011,15 @@ func snapshotTickPersistControl(ctrl *control.State, ctrlMu *sync.Mutex) tickPer
 	}
 }
 
-func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersistControl, nowMs int64, historyMaxAge time.Duration, identity energyIdentityLookup, options ...telemetry.ForecastOptions) (int, error) {
-	hp, historyAvailable := buildHistoryPoint(tel, ctrl, nowMs, historyMaxAge, options...)
+func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersistControl, nowMs int64, historyMaxAge time.Duration, identity energyIdentityLookup, site ...forecastSite) (int, error) {
+	var options telemetry.ForecastOptions
+	var sun historySun
+	if len(site) > 0 {
+		options, sun = site[0].HistoryOptions, site[0].HistorySun
+	}
+	hp, historyAvailable := buildHistoryPoint(tel, ctrl, nowMs, historyMaxAge, options)
+	dark := darkPV(hp.Sources, sun)
+	optionalPVUnread(hp.Sources, tel, options.OptionalFlows, sun)
 	if hp.Sources != nil {
 		// Live Load is not an energy observation. The source interval writer
 		// owns historical Load; the chart placeholder stays explicitly unknown.
@@ -4024,16 +4042,15 @@ func persistTelemetryTick(st *state.Store, tel *telemetry.Store, ctrl tickPersis
 			Value: sm.Value, Unit: sm.Unit,
 		}
 	}
+	// Display load: the live balance exactly as clients show it. A record of
+	// what was on screen, never a training label; models read the household
+	// energy intervals the source writer closes (HouseholdIntervals).
+	if display, ok := displayLoadSample(tel, ctrl.SiteMeterDriver, nowMs, options, sun); ok {
+		stSamples = append(stSamples, display)
+	}
 	energyObservations := buildEnergyObservations(st, tel, ctrl, hp, identity)
 	if hp.Sources != nil {
-		var devices []string
-		for _, o := range energyObservations {
-			if o.DeviceID != "" {
-				devices = append(devices, string(o.AssetKind)+":"+o.DeviceID)
-			}
-		}
-		sort.Strings(devices)
-		hp.Sources.Topology += "\ndevices:" + strings.Join(devices, "\n")
+		hp.Sources.Topology += historyDevices(st, tel, identity, energyObservations, dark)
 	}
 	filtered := energyObservations[:0]
 	for _, observation := range energyObservations {
@@ -4161,8 +4178,9 @@ func historySources(reading telemetry.ForecastReading) *state.HistorySources {
 		}
 	}
 	// A negative instantaneous residual does not invalidate its independent
-	// sources. Missing configuration and duplicate electrical flows do.
-	if reading.Reason != "" && reading.Reason != "invalid_balance" {
+	// sources. Missing configuration and duplicate electrical flows do. A
+	// failed source is unknown on its own flag, so history may hold it.
+	if reading.Reason != "" && reading.Reason != "invalid_balance" && !telemetry.SourceFailure(reading.Reason) {
 		p.Missing |= state.MissingLoad
 	}
 	for flag, w := range map[state.HistoryMissing]*float64{state.MissingGrid: &p.GridW, state.MissingPV: &p.PVW, state.MissingBattery: &p.BatteryW, state.MissingEV: &p.EVW, state.MissingV2X: &p.V2XW} {

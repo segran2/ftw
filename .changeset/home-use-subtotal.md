@@ -9,3 +9,5 @@ Add an offline historical repair tool that snapshots the original databases, pre
 Keep the native launcher and update API available when a local patch identifies the installed release with SemVer build metadata. Match the current slot and clean-exit marker using the base release while keeping published trial identity checks exact.
 
 Support audited endpoint-mean repairs for both historical Home use and Solar. Prepare while Core collects data, review the exact hash, and publish additive correction metadata atomically without replacing a live database. Show per-flow estimate labels and completed-through timestamps, preserving source observations and update support.
+
+For complete daily totals with estimated Solar, explain the estimate without incorrectly reporting missing current totals.

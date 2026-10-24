@@ -127,9 +127,15 @@ func TestSourceLoadKeepsUnknownDistinctFromZero(t *testing.T) {
 			if err != nil || len(b) != 1 {
 				t.Fatal(err)
 			}
+			// A brief unknown between known receipts is bridged, but only as a
+			// marked estimate. Other missing evidence stays unknown.
+			bridged := kind == "missing EV" || kind == "write gap" || kind == "topology"
 			known := b[0].missing&MissingLoad == 0
-			if known != (kind == "zero" || kind == "duplicate") {
+			if known != (kind == "zero" || kind == "duplicate" || bridged) {
 				t.Fatal("missing evidence classified as measured zero", kind)
+			}
+			if (b[0].missing&EstimatedLoad != 0) != bridged {
+				t.Fatal("bridge marker wrong", kind)
 			}
 			if known {
 				near(t, "zero Wh", b[0].wh, 0)
@@ -138,7 +144,32 @@ func TestSourceLoadKeepsUnknownDistinctFromZero(t *testing.T) {
 	}
 }
 
-func TestSourceLoadUsesSnapshotTimeAndDoesNotBridgeRestart(t *testing.T) {
+// A snapshot holding an inferred value, such as PV read as 0 W in twilight,
+// marks every interval it bounds and no other, so storage keeps it apart from
+// measurement.
+func TestSourceLoadMarksIntervalsOfAnEstimatedSnapshot(t *testing.T) {
+	s := sourceStore(t)
+	base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	for at := base; at <= base+180000; at += 5000 {
+		v := HistorySources{GridW: 1000}
+		if at > base+60000 && at <= base+120000 {
+			v.Missing = EstimatedLoad
+		}
+		sourceTick(t, s, at, v)
+	}
+	b, err := s.sourceLoadBuckets(context.Background(), base, base+180000, 60000)
+	if err != nil || len(b) != 3 {
+		t.Fatal(err, len(b))
+	}
+	for i, estimated := range []bool{false, true, true} {
+		if b[i].missing&MissingPower != 0 || (b[i].missing&EstimatedLoad != 0) != estimated {
+			t.Fatalf("minute %d missing %b, want estimated=%v", i, b[i].missing, estimated)
+		}
+		near(t, "minute Wh", b[i].wh, 1000.0/60)
+	}
+}
+
+func TestSourceLoadUsesSnapshotTimeAndMarksRestartBridge(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := Open(path)
 	if err != nil {
@@ -159,23 +190,22 @@ func TestSourceLoadUsesSnapshotTimeAndDoesNotBridgeRestart(t *testing.T) {
 	if first != base+20000 || covered != 20000 {
 		t.Fatal("source power assigned before observation")
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	s, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	if err := s.EnableHistoryAggregation(); err != nil {
-		t.Fatal(err)
-	}
+	s = reopenSourceStore(t, s)
 	sourceTick(t, s, base+50000, HistorySources{Topology: "grid", GridW: 1000})
+	var missing HistoryMissing
+	if err := s.history.QueryRow(`SELECT SUM(covered_ms),(SELECT missing FROM history_quality WHERE kind='source_energy') FROM history_source_energy`).Scan(&covered, &missing); err != nil {
+		t.Fatal(err)
+	}
+	if covered != 30000 || missing != EstimatedLoad {
+		t.Fatal("brief stop not bridged as a marked estimate", covered, missing)
+	}
+	s = reopenSourceStore(t, s)
+	sourceTick(t, s, base+50000+maxSourceBridgeMS+1, HistorySources{Topology: "grid", GridW: 1000})
 	if err := s.history.QueryRow(`SELECT SUM(covered_ms) FROM history_source_energy`).Scan(&covered); err != nil {
 		t.Fatal(err)
 	}
-	if covered != 20000 {
-		t.Fatal("integrated across stopped process")
+	if covered != 30000 {
+		t.Fatal("integrated across a long stop")
 	}
 }
 

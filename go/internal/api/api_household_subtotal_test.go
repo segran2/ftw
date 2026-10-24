@@ -33,8 +33,9 @@ func TestHouseholdSubtotalStatusAndDailyKeepIncompleteTotalSeparate(t *testing.T
 		for i := int64(0); i <= 90; i++ {
 			at := day.Add(time.Duration(i) * 10 * time.Second).UnixMilli()
 			v := &state.HistorySources{AtMS: at, Topology: "site", GridW: 1000}
-			if i == 42 {
-				v.Missing = state.MissingPV
+			if i >= 42 && i <= 54 {
+				// Invalid household configuration cannot be bridged as a source hold.
+				v.Missing = state.MissingLoad
 			}
 			p := &state.HistoryPoint{TsMs: at, GridW: 1000, LoadW: 1000, JSON: `{}`, Sources: v}
 			if err := st.EnqueueTelemetryTick(p, nil, nil); err != nil {

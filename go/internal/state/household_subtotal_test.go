@@ -9,12 +9,12 @@ import (
 )
 
 func TestHouseholdSubtotalKeepsAcceptedIntervalsAcrossSourceAndWriterGaps(t *testing.T) {
-	for _, kind := range []string{"PV missing", "EV missing", "writer gap", "topology"} {
+	for _, kind := range []string{"PV missing", "EV missing", "writer gap", "topology", "invalid configuration", "long writer gap"} {
 		t.Run(kind, func(t *testing.T) {
 			s := sourceStore(t)
 			base := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
 			for i := int64(0); i <= 90; i++ {
-				if kind == "writer gap" && i == 42 {
+				if kind == "writer gap" && i == 42 || kind == "long writer gap" && i >= 42 && i <= 55 {
 					continue
 				}
 				v := HistorySources{GridW: 1200, EVW: 200}
@@ -27,11 +27,15 @@ func TestHouseholdSubtotalKeepsAcceptedIntervalsAcrossSourceAndWriterGaps(t *tes
 				if i == 42 && kind == "EV missing" {
 					v.Missing = MissingEV
 				}
+				if kind == "invalid configuration" && i >= 42 && i <= 54 {
+					v.Missing = MissingLoad
+				}
 				sourceTick(t, s, base+i*10000, v)
 			}
 			before, err := s.DailyEnergy(base, base+900000)
-			if err != nil || before.Missing&MissingLoad == 0 {
-				t.Fatal("fixture must have an incomplete full total", before, err)
+			incomplete := kind == "invalid configuration" || kind == "long writer gap"
+			if err != nil || (before.Missing&MissingLoad != 0) != incomplete {
+				t.Fatal("unexpected completeness under the current source-hold policy", before, err)
 			}
 			check := func(s *Store) {
 				t.Helper()
@@ -39,8 +43,12 @@ func TestHouseholdSubtotalKeepsAcceptedIntervalsAcrossSourceAndWriterGaps(t *tes
 				if err != nil || got == nil {
 					t.Fatal("accepted intervals hidden", got, err)
 				}
-				near(t, "accepted Wh", got.Wh, 1000.0/6)
-				if got.CoverageMS != 600000 || got.PeriodMS != 900000 || got.Quality != "estimated" {
+				wantWh, wantCoverage := 250.0, int64(900000)
+				if incomplete {
+					wantWh, wantCoverage = 1000.0/6, 600000
+				}
+				near(t, "accepted Wh", got.Wh, wantWh)
+				if got.CoverageMS != wantCoverage || got.PeriodMS != 900000 || got.Quality != "estimated" {
 					t.Fatal("gap became full coverage or measured energy", got)
 				}
 				after, err := s.DailyEnergy(base, base+900000)

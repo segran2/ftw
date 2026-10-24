@@ -63,10 +63,10 @@ export function updateEnergyToday(today, root = document) {
   const estimated = today?.history_quality === "estimated" || today?.load_quality === "estimated";
   note.hidden = !incomplete && !estimated;
   note.textContent = today
-    ? "Gaps in today's readings. ≥ shows recorded energy only."
+    ? (incomplete ? "Gaps in today's readings. ≥ shows recorded energy only." : "")
     : "Today's energy is not available yet.";
   if (estimated) note.textContent = (incomplete ? note.textContent + " " : "") + "Home use includes estimates from source energy.";
-  if (today?.pv_quality === "estimated") {note.hidden = false; note.textContent += " Solar includes estimated energy across historical gaps.";}
+  if (today?.pv_quality === "estimated") {note.hidden = false; note.textContent += (note.textContent ? " " : "") + "Solar includes estimated energy across historical gaps.";}
   const home = energyTodayReading(today, "load_wh");
   if (home.estimated && home.partial) {
     note.hidden = false;

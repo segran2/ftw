@@ -24,6 +24,15 @@ func historicalRepairFixture(t *testing.T, powerGap bool) (string, HistoryRepair
 		} // retained scalar series can repair a writer gap too.
 		sourceTick(t, s, base+i*10000, v)
 	}
+	// Retained pre-source-hold history has rejected PV minutes. Current
+	// collection can bridge this short outage as an estimate; preserve that
+	// policy and explicitly model the older stored evidence being repaired.
+	for _, minute := range []int64{420000, 480000, 660000} {
+		if _, err := s.history.Exec(`INSERT INTO history_quality(kind,start_ms,resolution_ms,missing) VALUES('source_energy',?,60000,?)
+ ON CONFLICT(kind,start_ms,resolution_ms) DO UPDATE SET missing=missing|excluded.missing`, base+minute, MissingPV|MissingLoad); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var samples []Sample
 	for at := base - 30000; at <= base+930000; at += 5000 {
 		for metric, w := range map[string]float64{"meter_w": 2000, "pv_w": -500, "battery_ac_w": 100, "ev_w": 400} {
