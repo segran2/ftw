@@ -102,6 +102,13 @@ func New(relay string, key ohttp.KeyConfig, client *http.Client) *Client {
 	return &Client{relay: relay, key: key, http: client, now: time.Now}
 }
 
+// WithClock makes c stamp reports with the day now reads. Tests pin it to
+// the fake gateway's clock, so a fixed test date stays fresh.
+func (c *Client) WithClock(now func() time.Time) *Client {
+	c.now = now
+	return c
+}
+
 // Relay is the relay's URL, for Settings.
 func (c *Client) Relay() string { return c.relay }
 

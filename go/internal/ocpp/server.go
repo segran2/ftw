@@ -252,6 +252,10 @@ func (g *guardedServer) SetCheckClientHandler(handler func(id string, r *http.Re
 	})
 }
 
+// handshakeDrainWait bounds how long Stop waits for a handshake that has
+// passed the connection check. Only the 101 response is left to write.
+const handshakeDrainWait = 2 * time.Second
+
 // Stop closes the WebSocket server and waits for the listener goroutine to exit.
 // A 5-second timeout prevents deadlock if the listener goroutine is stuck.
 func (s *Server) Stop() {
@@ -260,6 +264,11 @@ func (s *Server) Stop() {
 	}
 	s.stopOnce.Do(func() {
 		s.handler.stopIdentityProbes()
+		// Let handshakes already past the connection check reach the
+		// library's table first, so the stop below closes them too.
+		if !s.sockets.refuseHandshakes(handshakeDrainWait) {
+			slog.Warn("ocpp: a charger handshake did not finish before shutdown; its socket may stay open")
+		}
 		s.cs.Stop()
 		if s.csms != nil {
 			s.csms.Stop()

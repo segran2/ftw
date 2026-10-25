@@ -459,11 +459,39 @@ func TestAQUICSessionThatEndsBeforeHelloOKDemotesQUIC(t *testing.T) {
 				return
 			}
 			refused.Add(1)
-			_ = qc.CloseWithError(0x110, "")
+			// Close once the box has opened its control stream: its dial
+			// has then succeeded, and the session ends before hello_ok. A
+			// close straight after the handshake can beat the end of the
+			// dial, which then fails as on a path that blocks UDP and
+			// demotes nothing.
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_, _ = qc.AcceptStream(ctx)
+				_ = qc.CloseWithError(0x110, "")
+			}()
 		}
 	}()
 
+	// Under load the QUIC handshake can outlast cloudwire.RaceDelay, and the
+	// WebSocket would then win before QUIC was tried. Hold the WebSocket
+	// until QUIC has failed here, which puts it first on this network.
+	network := localNetwork(addr)
+	var link atomic.Pointer[Link]
+	svc.mu.Lock()
+	svc.beforeWebSocket = func() {
+		deadline := time.Now().Add(20 * time.Second)
+		for time.Now().Before(deadline) {
+			if l := link.Load(); l != nil && l.preferred(network) == cloudwire.TransportWebSocket {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	svc.mu.Unlock()
+
 	h := newQUICHarness(t, svc)
+	link.Store(h.link)
 	h.grant(t, protocol.ScopeLiveRead)
 	waitWithin(t, 20*time.Second, "the uplink up", func() bool { return h.link.Status().Connected })
 	if got := h.link.Status().Transport; got != cloudwire.TransportWebSocket {
@@ -472,7 +500,6 @@ func TestAQUICSessionThatEndsBeforeHelloOKDemotesQUIC(t *testing.T) {
 	if refused.Load() == 0 {
 		t.Fatal("QUIC was never tried")
 	}
-	network := localNetwork(addr)
 	if got := h.link.preferred(network); got != cloudwire.TransportWebSocket {
 		t.Fatalf("after QUIC failed, %q goes first", got)
 	}

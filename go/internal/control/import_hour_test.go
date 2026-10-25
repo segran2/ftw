@@ -414,24 +414,78 @@ func TestImportCeilingSetMidHourCountsFromThen(t *testing.T) {
 	}
 }
 
-// A car that could run only on the hour's slack does not start: with 5 kW
-// of house load under a 7.5 kW ceiling, its 4.14 kW minimum fits only late
-// in each hour and would stop when the next one starts.
-func TestImportCeilingNoStartOnSlackAlone(t *testing.T) {
-	h := newHourSite(t, 7500, 5000, clock(16, 21, 0))
-	h.run(3 * time.Hour)
-	h.logChanges()
-	for _, o := range h.offers {
-		if o.w > 0 {
-			t.Fatalf("the car started at %s on slack alone", o.at.In(hourTestZone).Format("15:04:05"))
+// Help report, 25 Oct 2026: a 4.5 kW hourly ceiling, 0.85–1.3 kW of house
+// load and a car whose minimum is 4,140 W. House and minimum sit above the
+// ceiling, so the car can run only on the hour's slack. The ceiling held it
+// at 0 W for a whole hour with over 3 kWh of room left. It now starts in
+// every hour, stops when the next hour starts again at the ceiling, and each
+// hour's mean holds the ceiling. A 5 kW house under a 7.5 kW ceiling is the
+// same case. The phases stay low, and every tick says import_limit.
+func TestImportCeilingStartsOnHoursSlack(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		ceilingW, houseW float64
+	}{
+		{"help report", 4500, 850},
+		{"help report, 1.3 kW house", 4500, 1300},
+		{"5 kW house, 7.5 kW ceiling", 7500, 5000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			from := clock(25, 9, 0)
+			h := newHourSite(t, tc.ceilingW, tc.houseW, from)
+			for h.now.Before(from.Add(3 * time.Hour)) {
+				h.step()
+				if st, _ := h.mgr.State("garage"); st.CommandedReason != "import_limit" {
+					h.logChanges()
+					t.Fatalf("%s says %q under the hour's ceiling, want import_limit", h.now.In(hourTestZone).Format("15:04:05"), st.CommandedReason)
+				}
+			}
+			h.logChanges()
+			h.startsEveryHour(from, 3)
+		})
+	}
+}
+
+// startsEveryHour checks whole clock hours from `from`: the car starts in
+// each, stops at most once in each and never within 15 minutes of a start,
+// and each hour's mean import holds the ceiling.
+func (h *hourSite) startsEveryHour(from time.Time, hours int) {
+	h.t.Helper()
+	starts, stops := map[time.Time]int{}, map[time.Time]int{}
+	var startedAt time.Time
+	last := 0.0
+	for _, o := range h.offersSince(from) {
+		hour := importHourStart(o.at, hourTestZone)
+		switch {
+		case o.w > 0 && last == 0:
+			starts[hour]++
+			startedAt = o.at
+		case o.w == 0 && last > 0:
+			stops[hour]++
+			if o.at.Sub(startedAt) < 15*time.Minute {
+				h.t.Errorf("the car stopped at %s, %v after it started", o.at.In(hourTestZone).Format("15:04:05"), o.at.Sub(startedAt))
+			}
+		}
+		last = o.w
+	}
+	for i := range hours {
+		hour := from.Add(time.Duration(i) * time.Hour)
+		if starts[hour] == 0 || stops[hour] > 1 {
+			h.t.Errorf("hour %s: %d starts and %d stops, want a start and at most one stop", hour.Format("15:04"), starts[hour], stops[hour])
+		}
+		if mean := h.meanW(hour); mean > h.ceilingW {
+			h.t.Errorf("hour %s mean import %.0f W over the %.0f W ceiling", hour.Format("15:04"), mean, h.ceilingW)
 		}
 	}
 }
 
 // The field case from the review of #1783: a 7.5 kW hourly ceiling, a 25 A
-// fuse, a light first half hour, and a car plugged in at 22:40 beside 6 kW
-// (and 8 kW) of house load. The ceiling keeps it idle to the end of the
-// hour, and not one tick of that says fuse_limit.
+// fuse, a light first 40 minutes, and a car plugged in at 22:40 beside 6 kW
+// (and 8 kW) of house load. The hour's slack lets the car run to 23:00, as
+// near the fuse as its margin allows, and the hour's mean holds the ceiling.
+// The next hour starts at the ceiling and stops it. Once the fuse has cooled
+// from that run, the phases sit low, and not one tick to midnight says
+// fuse_limit.
 func TestImportCeilingNightNeverSaysFuse(t *testing.T) {
 	for _, houseW := range []float64{6000, 8000} {
 		h := newHourSite(t, 7500, 500, clock(16, 22, 0))
@@ -439,34 +493,54 @@ func TestImportCeilingNightNeverSaysFuse(t *testing.T) {
 		h.run(40 * time.Minute)
 		h.setHouse(houseW)
 		h.plugIn()
+		started := false
 		for h.now.Before(clock(16, 23, 0)) {
+			h.step()
+			started = started || h.offer() > 0
+		}
+		if !started {
+			t.Fatalf("house %.0f W: the car never started on the hour's slack", houseW)
+		}
+		if h.offer() != 0 {
+			t.Fatalf("house %.0f W: offer %.0f W at 23:00, want the new hour to stop the car", houseW, h.offer())
+		}
+		if mean := h.meanW(clock(16, 22, 0)); mean > 7500 {
+			t.Fatalf("house %.0f W: hour 22:00 mean import %.0f W over the 7,500 W ceiling", houseW, mean)
+		}
+		h.run(time.Minute) // the fuse's heat from the run
+		for h.now.Before(clock(17, 0, 0)) {
 			h.step()
 			if st, _ := h.mgr.State("garage"); st.CommandedReason == "fuse_limit" {
 				t.Fatalf("house %.0f W: %s says fuse_limit with the phases low under a 7.5 kW hourly ceiling",
 					houseW, h.now.In(hourTestZone).Format("15:04:05"))
 			}
 		}
-		if h.offer() != 0 {
-			t.Fatalf("house %.0f W: the car started at %.0f W under the ceiling", houseW, h.offer())
-		}
+		h.logChanges()
 	}
 }
 
-// A quiet first 40 minutes leave the hour so much slack that its limits sit
-// above what the 25 A fuse allows. An 8 kW house still keeps an idle car from
-// starting, by the ceiling's own start test, and the car says import_limit.
+// A quiet first 46 minutes leave the hour so much slack that its limits sit
+// above what the 25 A fuse allows. In the hour's last quarter an idle car
+// may not start on that slack: the next hour starts again at the ceiling
+// and would stop it. An 8 kW house keeps the car idle, by the ceiling's own
+// start test, and every tick says import_limit.
 func TestImportCeilingStartTestSaysImportLimit(t *testing.T) {
 	h := newHourSite(t, 7500, 0, clock(16, 21, 0))
 	h.unplugged = true
-	h.run(40 * time.Minute)
+	h.run(46 * time.Minute)
+	if _, rise, _ := h.state.importHourLimitsW(); rise <= 17250 {
+		t.Fatalf("setup: rise level %.0f W, want it above the fuse", rise)
+	}
 	h.setHouse(8000)
 	h.plugIn()
-	h.run(5 * time.Minute)
-	if h.offer() != 0 {
-		t.Fatalf("the car started at %.0f W beside 8 kW under a 7.5 kW ceiling", h.offer())
-	}
-	if st, _ := h.mgr.State("garage"); st.CommandedReason != "import_limit" {
-		t.Fatalf("idle under the ceiling says %q, want import_limit", st.CommandedReason)
+	for h.now.Before(clock(16, 22, 0)) {
+		h.step()
+		if h.offer() != 0 {
+			t.Fatalf("the car started at %.0f W at %s, in the hour's last quarter", h.offer(), h.now.In(hourTestZone).Format("15:04:05"))
+		}
+		if st, _ := h.mgr.State("garage"); st.CommandedReason != "import_limit" {
+			t.Fatalf("idle under the ceiling says %q at %s, want import_limit", st.CommandedReason, h.now.In(hourTestZone).Format("15:04:05"))
+		}
 	}
 }
 

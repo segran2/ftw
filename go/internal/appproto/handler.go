@@ -1316,20 +1316,38 @@ func (h *Handler) onPlanGet(id *uint32) error {
 
 func (h *Handler) sendPlan(id *uint32) error { return h.writePlan(id, false) }
 
+// readPlan reads the plan, its rev and each charger's share as one plan. The
+// three are separate reads, and a replan that lands between them would mix
+// two plans in one message, under either one's rev. A plan that moved while
+// it was read is read again. A replan moves it once, and once more when the
+// planner swaps in the copy that carries its shadow result, so the third
+// read is sent as it is.
+func (h *Handler) readPlan() Plan {
+	for attempt := 1; ; attempt++ {
+		plan := h.cfg.Plans.Latest()
+		body := planFrom(
+			plan,
+			h.cfg.Plans.Rev(),
+			h.cfg.Plans.CeilingW(),
+			h.cfg.Clock.UptimeMs(),
+			h.cfg.Clock.Now(),
+		)
+		if h.cfg.PlanChargers != nil {
+			body.Chargers = h.cfg.PlanChargers.PlanChargers(h.cfg.Clock.Now())
+		}
+		if attempt == 3 || h.cfg.Plans.Latest() == plan {
+			return body
+		}
+	}
+}
+
 // writePlan reads the plan and sends it. With skipSame it sends nothing when
 // this session already has this plan.
 func (h *Handler) writePlan(id *uint32, skipSame bool) error {
 	h.planMu.Lock()
 	defer h.planMu.Unlock()
-	body := planFrom(
-		h.cfg.Plans.Latest(),
-		h.cfg.Plans.Rev(),
-		h.cfg.Plans.CeilingW(),
-		h.cfg.Clock.UptimeMs(),
-		h.cfg.Clock.Now(),
-	)
+	body := h.readPlan()
 	if h.cfg.PlanChargers != nil {
-		body.Chargers = h.cfg.PlanChargers.PlanChargers(h.cfg.Clock.Now())
 		if h.isAgent() {
 			// An agent knows chargers and cars by the ids loadpoints.get
 			// and cars.get gave it, never by the box's names. A copy: the

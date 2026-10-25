@@ -266,13 +266,13 @@ func copyVerifiedTable(ctx context.Context, source historyQueryer, dest *sql.DB,
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("copy %s: %w", table, err)
+		return fmt.Errorf("copy %s: %w", table, withContextErr(ctx, err))
 	}
 	if tx != nil {
 		stmt.Close()
 		stmt = nil
 		if err := tx.Commit(); err != nil {
-			return err
+			return fmt.Errorf("copy %s: %w", table, withContextErr(ctx, err))
 		}
 		tx = nil
 	}
@@ -292,6 +292,17 @@ func copyVerifiedTable(ctx context.Context, source historyQueryer, dest *sql.DB,
 		return fmt.Errorf("history verification failed for %s", table)
 	}
 	return nil
+}
+
+// withContextErr puts the context's error in front of err once the context
+// has ended. database/sql rolls back a cancelled transaction and closes its
+// statements, so the copy can fail with "statement is closed" or "transaction
+// has already been committed or rolled back", which hides the deadline.
+func withContextErr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		return fmt.Errorf("%w: %w", ctxErr, err)
+	}
+	return err
 }
 
 func appendHistoryRows(conn *sql.Conn, points []HistoryPoint) error {

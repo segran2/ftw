@@ -52,8 +52,10 @@ available battery energy and hardware power capability.
 The EV hard limit treats the main fuse as heat, not as one reading. It
 low-passes each phase's I² from the site meter with a 60 s time constant.
 A phase over the fuse less 1 A cuts the EVs once that filtered current
-passes the same limit, and at once above 1.2 × the fuse. A rise or start
-reads the higher of the reading and that filtered current. Where the meter
+passes the same limit, and at once above 1.2 × the fuse. A running car's
+rise reads the higher of the reading and that filtered current. An idle
+car's start reads each phase as it is, plus its new current; the filtered
+current holds it back only while it is over the limit. Where the meter
 reports phase currents, they replace total import as the EVs' fuse check; a
 tariff import ceiling still applies.
 

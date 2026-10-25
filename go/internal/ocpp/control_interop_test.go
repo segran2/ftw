@@ -36,7 +36,6 @@ func setCurrent11kW(t *testing.T) []byte {
 // active, and answers Accepted while charging on at full rate.
 func TestChargingProfileIsRelativeSoItCannotBeReadAsNotYetStarted(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "garage")
-	t.Cleanup(srv.Stop)
 	_, fake, _ := connectCharger(t, srv, port, "garage")
 
 	if err := srv.Command(context.Background(), "garage", setCurrent11kW(t)); err != nil {
@@ -64,7 +63,6 @@ func TestChargingProfileIsRelativeSoItCannotBeReadAsNotYetStarted(t *testing.T) 
 // FTW retries on the first connector rather than leaving the charger unsteered.
 func TestChargerRefusingConnectorZeroIsRetriedOnConnectorOne(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "garage")
-	t.Cleanup(srv.Stop)
 	_, fake, _ := connectCharger(t, srv, port, "garage")
 
 	fake.mu.Lock()
@@ -97,7 +95,6 @@ func TestChargerRefusingConnectorZeroIsRetriedOnConnectorOne(t *testing.T) {
 // surface as an error rather than a silent success.
 func TestChargerRefusingEveryConnectorFails(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "garage")
-	t.Cleanup(srv.Stop)
 	_, fake, _ := connectCharger(t, srv, port, "garage")
 
 	fake.setStatus(smartcharging.ChargingProfileStatusRejected)

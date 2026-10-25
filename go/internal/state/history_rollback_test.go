@@ -199,7 +199,7 @@ func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
 			if err := s.history.Close(); err != nil {
 				t.Fatal(err)
 			}
-			d := &slowHistoryRollbackDriver{started: make(chan struct{}), release: make(chan struct{})}
+			d := &slowHistoryRollbackDriver{blocked: make(chan struct{}), started: make(chan struct{}), release: make(chan struct{})}
 			name := fmt.Sprintf("maintenance-rollback-%s-%d", kind, time.Now().UnixNano())
 			sql.Register(name, d)
 			var err error
@@ -223,11 +223,22 @@ func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
 					return s.ensureSeriesHours(ctx)
 				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			d.armed.Store(true)
 			done := make(chan error, 1)
 			go func() { done <- run(ctx) }()
+			// Cancel once the maintenance write is under way, so the rollback
+			// held below is that write's. A deadline could land earlier, in a
+			// read that holds no writer mutex yet.
+			select {
+			case <-d.blocked:
+			case err := <-done:
+				t.Fatalf("maintenance ended before its write: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("maintenance did not reach its write")
+			}
+			cancel()
 			select {
 			case <-d.started:
 			case err := <-done:
@@ -250,7 +261,9 @@ func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
 			if lockErr == nil {
 				t.Fatal("maintenance released the writer mutex before SQLite rollback finished")
 			}
-			if !errors.Is(err, context.DeadlineExceeded) {
+			// The archive write also has its own 1 s limit, which a stalled
+			// test goroutine can let expire before it cancels.
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("cancelled maintenance: %v", err)
 			}
 			if err := run(context.Background()); err != nil {

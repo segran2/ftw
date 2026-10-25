@@ -2,7 +2,6 @@ package ocpp
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -106,9 +105,10 @@ func TestOldSocketAcceptedCommandCannotAcknowledgeReplacement(t *testing.T) {
 
 func TestReconnectProbesCapabilitiesAgain(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "garage")
-	first := ocpp16.NewChargePoint("garage", nil, nil)
-	first.SetCoreHandler(&capabilityCP{profiles: "Core,SmartCharging"})
-	if err := first.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	first, stopFirst, err := dialChargePoint16(t, wsURL(port), "garage", nil, func(cp ocpp16.ChargePoint) {
+		cp.SetCoreHandler(&capabilityCP{profiles: "Core,SmartCharging"})
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := first.BootNotification("Home", "Easee"); err != nil {
@@ -117,7 +117,7 @@ func TestReconnectProbesCapabilitiesAgain(t *testing.T) {
 	if view := waitSteerable(t, srv, "garage"); view.Steerable == nil || !*view.Steerable {
 		t.Fatal("first capabilities missing")
 	}
-	first.Stop()
+	stopFirst()
 	awaitIdentityCondition(t, func() bool { return !srv.Handler().IsOnline("garage") })
 	next := &capabilityCP{profiles: "Core"}
 	connectCapabilityCP(t, port, "garage", next)

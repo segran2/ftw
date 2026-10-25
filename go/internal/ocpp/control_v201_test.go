@@ -3,8 +3,6 @@ package ocpp
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -73,39 +71,8 @@ func (f *fakeStationV201) lastLimit(t *testing.T) float64 {
 // startDualServer brings up both listeners on free ports.
 func startDualServer(t *testing.T, tel *telemetry.Store) (portV16, portV201 int, srv *Server) {
 	t.Helper()
-	portV16 = freePort(t)
-	portV201 = freePort(t)
-	cfg := &Config{
-		Enabled:            true,
-		Bind:               "127.0.0.1",
-		Port:               portV16,
-		PortV201:           portV201,
-		HeartbeatIntervalS: 60,
-	}
-	srv, err := Start(context.Background(), cfg, tel)
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(srv.Stop)
-
-	// Both listeners must be reachable before a client tries to connect.
-	for _, port := range []int{portV16, portV201} {
-		deadline := time.Now().Add(2 * time.Second)
-		bound := false
-		for time.Now().Before(deadline) {
-			c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
-			if err == nil {
-				c.Close()
-				bound = true
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		if !bound {
-			t.Fatalf("listener never bound on port %d", port)
-		}
-	}
-	return portV16, portV201, srv
+	srv = startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", HeartbeatIntervalS: 60}, tel, true)
+	return srv.cfg.Port, srv.cfg.PortV201, srv
 }
 
 // connectStationV201 brings up a 2.0.1 charging station and waits for the
@@ -113,15 +80,10 @@ func startDualServer(t *testing.T, tel *telemetry.Store) (portV16, portV201 int,
 func connectStationV201(t *testing.T, srv *Server, port int, id string) (*fakeStationV201, func()) {
 	t.Helper()
 	fake := newFakeStationV201()
-	cs := ocpp201.NewChargingStation(id, nil, nil)
-	cs.SetSmartChargingHandler(fake)
-
-	if err := cs.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	cs, stop, err := dialChargingStation201(t, wsURL(port), id, func(cs ocpp201.ChargingStation) { cs.SetSmartChargingHandler(fake) })
+	if err != nil {
 		t.Fatalf("charging station connect: %v", err)
 	}
-	var once sync.Once
-	stop := func() { once.Do(cs.Stop) }
-	stopAfterServer(t, srv, stop, cs.IsConnected)
 
 	station := provisioning.ChargingStationType{Model: "Dawn", VendorName: "Charge Amps"}
 	if _, err := cs.BootNotification(provisioning.BootReasonPowerUp, station.Model, station.VendorName); err != nil {

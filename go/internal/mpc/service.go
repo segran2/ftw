@@ -1305,7 +1305,9 @@ func (s *Service) checkTwinDrift(ctx context.Context) {
 }
 
 // Replan recomputes the plan once using current prices + forecast + SoC.
-// Exposed for tests and API triggers.
+// It labels the plan "manual", the operator's request, so only tests and
+// POST /api/mpc/replan use it. Core's own triggers call ReplanWithReason
+// with their cause.
 func (s *Service) Replan(ctx context.Context) *Plan { return s.replan(ctx, "manual") }
 
 // ReplanWithReason is Replan with an explicit reason string that lands

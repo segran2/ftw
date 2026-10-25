@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"os"
@@ -39,6 +40,42 @@ func TestLiveBackupPastItsLimitNamesTheLimitAndTable(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("reason %q does not say %q", err, want)
 		}
+	}
+}
+
+// A deadline that lands inside a batch rolls back the copy's transaction and
+// closes its statement; the next row then fails with "statement is closed".
+// The reason must still carry the context's error (CI run 39759536215).
+func TestBackupCopyCancelledInsideABatchKeepsTheContextError(t *testing.T) {
+	dest, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "dest.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+	if _, err := dest.Exec(`CREATE TABLE t(a INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scan := func(_ context.Context, _ historyQueryer, _ string, visit func([]any) error) (int64, error) {
+		if err := visit([]any{int64(1)}); err != nil {
+			return 0, err
+		}
+		cancel()
+		// database/sql rolls the transaction back on its own goroutine and
+		// then returns the connection.
+		deadline := time.Now().Add(5 * time.Second)
+		for dest.Stats().InUse > 0 {
+			if time.Now().After(deadline) {
+				return 0, errors.New("the cancelled transaction kept its connection")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return 2, visit([]any{int64(2)})
+	}
+	err = copyVerifiedTable(ctx, nil, dest, "t", scan, nil)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "copy t") {
+		t.Fatalf("copy cancelled inside a batch = %v", err)
 	}
 }
 

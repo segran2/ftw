@@ -110,8 +110,10 @@ not establish the greatest reachable energy or the cheapest plan.
 - `flex_max_power_w` is the allowed on-step; zero means off. Mean power must
   lie between zero and that step.
 - Stored EV energy increases by `mean_W * hours * charge_efficiency`.
-- Core applies the on-step until the energy budget is spent, then pauses.
-  Validation must cover joint on/off pulse states, grid limits, surplus-only
+- Core applies the on-step from the start of the executable part for its
+  on-time, the energy budget at the on-step, and on until the metered energy
+  is spent if that comes later, then pauses. An off-time under 20 s at the
+  slot's end is not sent. Validation must cover joint on/off pulse states, grid limits, surplus-only
   charging, battery-to-EV rules and the corresponding costs.
 
 For example, 1,000 Wh at efficiency 1 over a remaining 15 minutes requires

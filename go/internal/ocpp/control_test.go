@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -101,20 +100,14 @@ func (f *fakeCharger) count() int {
 // connectCharger brings up a charge point against the server and waits until
 // the server has registered the session.
 //
-// The returned stop is idempotent: ocpp-go panics on a second Stop, and the
-// cleanup below would otherwise fire after a test that disconnects on purpose.
+// The returned stop is idempotent, so a test may disconnect on purpose.
 func connectCharger(t *testing.T, srv *Server, port int, id string) (ocpp16.ChargePoint, *fakeCharger, func()) {
 	t.Helper()
 	fake := newFakeCharger()
-	cp := ocpp16.NewChargePoint(id, nil, nil)
-	cp.SetSmartChargingHandler(fake)
-
-	if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	cp, stop, err := dialChargePoint16(t, wsURL(port), id, nil, func(cp ocpp16.ChargePoint) { cp.SetSmartChargingHandler(fake) })
+	if err != nil {
 		t.Fatalf("charge point connect: %v", err)
 	}
-	var once sync.Once
-	stop := func() { once.Do(cp.Stop) }
-	stopAfterServer(t, srv, stop, cp.IsConnected)
 
 	if _, err := cp.BootNotification("Dawn", "Charge Amps"); err != nil {
 		t.Fatalf("boot: %v", err)
@@ -145,7 +138,6 @@ func mustPayload(t *testing.T, m map[string]any) []byte {
 // remote stop.
 func TestPauseSendsZeroAmpLimit(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	err := srv.Command(context.Background(), "garage-left", mustPayload(t, map[string]any{
@@ -161,7 +153,6 @@ func TestPauseSendsZeroAmpLimit(t *testing.T) {
 
 func TestSetCurrentConvertsPowerToAmps(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	// 11040 W over 3 phases at 230 V = 16 A per phase.
@@ -183,7 +174,6 @@ func TestSetCurrentConvertsPowerToAmps(t *testing.T) {
 // 6 A the site fuse was not asked to carry.
 func TestBelowMinimumBecomesZero(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	// 2000 W over 3 phases at 230 V ≈ 2.9 A per phase — under the minimum.
@@ -203,7 +193,6 @@ func TestBelowMinimumBecomesZero(t *testing.T) {
 
 func TestMaxAmpsPerPhaseIsRespected(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	// 22 kW would be 32 A per phase, but the loadpoint allows only 16 A.
@@ -225,7 +214,6 @@ func TestMaxAmpsPerPhaseIsRespected(t *testing.T) {
 // A pause must not lose the previous rate: resuming without one restores it.
 func TestResumeRestoresLastLimit(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	ctx := context.Background()
@@ -258,7 +246,6 @@ func TestResumeRestoresLastLimit(t *testing.T) {
 
 func TestRejectedProfileIsAnError(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 	fake.setStatus(smartcharging.ChargingProfileStatusRejected)
 
@@ -272,7 +259,6 @@ func TestRejectedProfileIsAnError(t *testing.T) {
 
 func TestUnknownChargerIsNotConnected(t *testing.T) {
 	_, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 
 	err := srv.Command(context.Background(), "nobody-home", mustPayload(t, map[string]any{
 		"action": "ev_pause",
@@ -286,7 +272,6 @@ func TestUnknownChargerIsNotConnected(t *testing.T) {
 // the error so it can fall back.
 func TestDisconnectedChargerRejectsCommands(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, _, stop := connectCharger(t, srv, port, "garage-left")
 
 	stop()
@@ -307,7 +292,6 @@ func TestDisconnectedChargerRejectsCommands(t *testing.T) {
 // rather than reaching the charger or erroring.
 func TestLifecycleActionsAreNoOps(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	for _, action := range []string{"init", "deinit"} {
@@ -324,7 +308,6 @@ func TestLifecycleActionsAreNoOps(t *testing.T) {
 
 func TestUnknownActionIsAnError(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	err := srv.Command(context.Background(), "garage-left", mustPayload(t, map[string]any{
@@ -341,7 +324,6 @@ func TestUnknownActionIsAnError(t *testing.T) {
 // Single-phase mode changes the conversion: the same watts land on one phase.
 func TestSinglePhaseModeUsesOnePhase(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	// 3680 W on one phase at 230 V = 16 A.
@@ -367,7 +349,6 @@ func TestSinglePhaseModeUsesOnePhase(t *testing.T) {
 // can switch phases keeps deciding for itself.
 func TestThreePhaseLeavesPhaseCountUnset(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	_, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	err := srv.Command(context.Background(), "garage-left", mustPayload(t, map[string]any{
@@ -388,7 +369,6 @@ func TestThreePhaseLeavesPhaseCountUnset(t *testing.T) {
 // commandable, which is what lets a paused session be resumed.
 func TestSuspendedChargerStillAcceptsCommands(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore())
-	defer srv.Stop()
 	cp, fake, _ := connectCharger(t, srv, port, "garage-left")
 
 	if _, err := cp.StatusNotification(1, core.NoError, core.ChargePointStatusSuspendedEV); err != nil {

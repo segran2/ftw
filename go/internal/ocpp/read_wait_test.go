@@ -1,7 +1,6 @@
 package ocpp
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -17,14 +16,8 @@ import (
 // interval: with a 1 s heartbeat a silent charger is closed after about 5 s,
 // not after 60 s.
 func TestSilentChargerSocketFollowsHeartbeat(t *testing.T) {
-	port := freePort(t)
-	cfg := &Config{Enabled: true, Bind: "127.0.0.1", Port: port, HeartbeatIntervalS: 1, ApprovedIDs: []string{"garage"}}
-	srv, err := Start(context.Background(), cfg, telemetry.NewStore())
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(srv.Stop)
-	waitForListener(t, port)
+	srv := startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", HeartbeatIntervalS: 1, ApprovedIDs: []string{"garage"}}, telemetry.NewStore(), false)
+	port := srv.cfg.Port
 
 	dialer := websocket.Dialer{Subprotocols: []string{"ocpp1.6"}, HandshakeTimeout: 2 * time.Second}
 	conn, _, err := dialer.Dial(fmt.Sprintf("ws://127.0.0.1:%d%sgarage", port, srv.Path()), nil)

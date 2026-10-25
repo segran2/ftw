@@ -7,18 +7,16 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/srcfl/ftw/go/internal/sitesim"
 )
 
 // randomHouseKnown names the seeds that break an invariant on master, by
 // kind, and the finding. A listed kind that passes fails the test until its
-// line goes. The fuse's own kind is never listed.
-var randomHouseKnown = map[uint64]map[string]string{
-	// 25 A, 40 s charger, no declared response time (Core assumes 180 s). L2
-	// steps to 30.8 A with the car at 8 A; a cut of 5 A a phase that landed
-	// 94 s earlier, in the same run over the limit, still counts as on its
-	// way, so Core cuts to 6 A, not 0, and L2 holds 28.8 A for another 40 s.
-	2: {failLimit: "netting: a landed cut still covers the next overage, ev_fuse_budget.go:436"},
-}
+// line goes. The fuse's own kind is never listed. Seed 2 no longer reaches
+// the case where a landed cut still covers the next overage; that cost is
+// pinned in TestEVFuseLandedCutCoversOnlyItsRun.
+var randomHouseKnown = map[uint64]map[string]string{}
 
 // Core keeps a random house under the fuse. For each fixed seed the house
 // load on each phase steps at random to anywhere up to the fuse less 2 A,
@@ -64,8 +62,11 @@ func TestSiteSimRandomHouse(t *testing.T) {
 				}
 				damage = max(damage, p.Fuse.Damage[0], p.Fuse.Damage[1], p.Fuse.Damage[2])
 				if !p.Now.Before(at) {
+					// Set after this second's control tick, the load flows from
+					// the next plant second: a start Core sent this second came
+					// first.
 					a, at = house(), next()
-					p.HouseW, s.outsideAt = houseA(a[0], a[1], a[2]), p.Now
+					p.HouseW, s.outsideAt = houseA(a[0], a[1], a[2]), p.Now.Add(sitesim.Step)
 					steps++
 				}
 			}

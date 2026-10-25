@@ -1,7 +1,6 @@
 package ocpp
 
 import (
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -100,13 +99,10 @@ func waitSteerable(t *testing.T, srv *Server, id string) ChargerView {
 
 func connectCapabilityCP(t *testing.T, port int, id string, cp *capabilityCP) ocpp16.ChargePoint {
 	t.Helper()
-	client := ocpp16.NewChargePoint(id, nil, nil)
-	client.SetCoreHandler(cp)
-	if err := client.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	client, _, err := dialChargePoint16(t, wsURL(port), id, nil, func(c ocpp16.ChargePoint) { c.SetCoreHandler(cp) })
+	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	var once sync.Once
-	t.Cleanup(func() { once.Do(client.Stop) })
 	if _, err := client.BootNotification("Dawn", "Charge Amps"); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -117,7 +113,6 @@ func connectCapabilityCP(t *testing.T, port int, id string, cp *capabilityCP) oc
 // stops asking once it has an answer.
 func TestCapabilityProbeRecordsSmartCharging(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "steerable-cp")
-	defer srv.Stop()
 
 	cp := &capabilityCP{profiles: "Core,FirmwareManagement,SmartCharging"}
 	connectCapabilityCP(t, port, "steerable-cp", cp)
@@ -146,7 +141,6 @@ func TestCapabilityProbeRecordsSmartCharging(t *testing.T) {
 // the reconnect is exactly when the charger should be asked again.
 func TestCapabilityProbeMarkerClearedOnDisconnect(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "flappy")
-	defer srv.Stop()
 
 	h := srv.Handler()
 	// Simulate "probe fired, no answer yet" without a live charge point.
@@ -169,7 +163,6 @@ func TestCapabilityProbeMarkerClearedOnDisconnect(t *testing.T) {
 // warns rather than the code blocking, so control is still attempted.
 func TestCapabilityProbeRecordsTelemetryOnly(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "meter-only")
-	defer srv.Stop()
 
 	connectCapabilityCP(t, port, "meter-only", &capabilityCP{profiles: "Core,FirmwareManagement"})
 
@@ -187,7 +180,6 @@ func TestCapabilityProbeRecordsTelemetryOnly(t *testing.T) {
 // claiming the charger cannot be steered.
 func TestCapabilityProbeUnknownWhenKeyMissing(t *testing.T) {
 	port, srv := startServer(t, telemetry.NewStore(), "quiet-cp")
-	defer srv.Stop()
 
 	cp := &capabilityCP{omitKey: true}
 	connectCapabilityCP(t, port, "quiet-cp", cp)

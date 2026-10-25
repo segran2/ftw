@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ws"
 
 	"github.com/srcfl/ftw/go/internal/telemetry"
@@ -263,33 +262,21 @@ func TestSchemeFollowsTLS(t *testing.T) {
 // End to end over a real connection: the library must actually consult both
 // gates, in the order that makes the identity binding effective.
 func TestPerChargerCredentialOverTheWire(t *testing.T) {
-	port := freePort(t)
-	cfg := &Config{
+	srv := startOCPP(t, Config{
 		Enabled:            true,
 		Bind:               "127.0.0.1",
-		Port:               port,
 		HeartbeatIntervalS: 60,
 		Username:           "ftw",
 		Password:           "shared-secret",
 		ChargerSecrets:     map[string]string{"garage": "garage-only-secret"},
 		ApprovedIDs:        []string{"garage"},
-	}
-	srv, err := Start(context.Background(), cfg, telemetry.NewStore())
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(srv.Stop)
-	waitForListener(t, port)
+	}, telemetry.NewStore(), false)
 
 	connect := func(t *testing.T, id, user, pass string) error {
 		t.Helper()
 		client := ws.NewClient()
 		client.SetBasicAuth(user, pass)
-		cp := ocpp16.NewChargePoint(id, nil, client)
-		err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port))
-		if err == nil {
-			stopAfterServer(t, srv, cp.Stop, cp.IsConnected)
-		}
+		_, _, err := dialChargePoint16(t, wsURL(srv.cfg.Port), id, client, nil)
 		return err
 	}
 
@@ -313,11 +300,9 @@ func TestPerChargerCredentialOverTheWire(t *testing.T) {
 // bind in checkClient is what stops the swap.
 func TestClientCertCannotClaimAnotherIdentity(t *testing.T) {
 	bundle := issueMTLSBundle(t)
-	port := freePort(t)
-	cfg := &Config{
+	srv := startOCPP(t, Config{
 		Enabled:            true,
 		Bind:               "127.0.0.1",
-		Port:               port,
 		HeartbeatIntervalS: 60,
 		Username:           "ftw",
 		Password:           "shared-secret",
@@ -326,13 +311,7 @@ func TestClientCertCannotClaimAnotherIdentity(t *testing.T) {
 			KeyFile:      bundle.serverKeyFile,
 			ClientCAFile: bundle.clientCAFile,
 		},
-	}
-	srv, err := Start(context.Background(), cfg, telemetry.NewStore())
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(srv.Stop)
-	waitForListener(t, port)
+	}, telemetry.NewStore(), false)
 
 	connect := func(t *testing.T, id string, clientCert tls.Certificate) error {
 		t.Helper()
@@ -344,13 +323,10 @@ func TestClientCertCannotClaimAnotherIdentity(t *testing.T) {
 		}
 		client := ws.NewTLSClient(tlsCfg)
 		client.SetBasicAuth("ftw", "shared-secret")
-		cp := ocpp16.NewChargePoint(id, nil, client)
-		err := cp.Start(fmt.Sprintf("wss://127.0.0.1:%d", port))
-		if err == nil {
-			// Drop the socket before the next attempt so a refused swap
-			// cannot be mistaken for the library's duplicate-id reject.
-			cp.Stop()
-		}
+		_, stop, err := dialChargePoint16(t, fmt.Sprintf("wss://127.0.0.1:%d", srv.cfg.Port), id, client, nil)
+		// Drop the socket before the next attempt so a refused swap cannot
+		// be mistaken for the library's duplicate-id reject.
+		stop()
 		return err
 	}
 
@@ -514,20 +490,4 @@ func tlsCert(issued issuedCert) tls.Certificate {
 		PrivateKey:  issued.key,
 		Leaf:        issued.cert,
 	}
-}
-
-// waitForListener blocks until the port accepts, so a client never races the
-// listener goroutine.
-func waitForListener(t *testing.T, port int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
-		if err == nil {
-			c.Close()
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("server did not bind on port %d within deadline", port)
 }

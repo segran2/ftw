@@ -470,3 +470,33 @@ func TestEVHardLimitHoldsWhenTotalImportDisagreesWithPhases(t *testing.T) {
 		t.Fatalf("without phase currents 19,174 W gave %.1f W, want 10,350 - 2,269 = 8,081 W", capW)
 	}
 }
+
+// An idle start reads each phase as it is, plus our orders the reading may
+// not show; a phase's heat counts only while it is over the working limit.
+func TestStartLevelReadsHeatOnlyOverTheLimit(t *testing.T) {
+	const limitA = 24
+	for _, tc := range []struct {
+		name    string
+		heatA   [3]float64
+		amps    []float64
+		pending [3]float64
+		want    float64
+	}{
+		{"heat under the limit", [3]float64{23.9, 2, 2}, []float64{8, 2, 2}, [3]float64{}, 8},
+		{"heat under the limit, an order on its way", [3]float64{23.9, 2, 2}, []float64{8, 2, 2}, [3]float64{3, 3, 3}, 11},
+		{"heat over the limit", [3]float64{24.5, 2, 2}, []float64{8, 2, 2}, [3]float64{}, 24.5},
+		{"heat over the limit, an order on its way", [3]float64{24.5, 2, 2}, []float64{8, 2, 2}, [3]float64{1, 1, 1}, 25.5},
+		{"heat over on L2, the reading highest on L1", [3]float64{10, 24.2, 2}, []float64{12, 3, 2}, [3]float64{}, 24.2},
+		{"one phase", [3]float64{23, 0, 0}, []float64{9}, [3]float64{}, 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := fuseHeat{set: true}
+			for i, a := range tc.heatA {
+				h.sq[i] = a * a
+			}
+			if got := h.startLevelA(tc.amps, tc.pending, limitA); math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("start level %.3f A, want %.3f A", got, tc.want)
+			}
+		})
+	}
+}

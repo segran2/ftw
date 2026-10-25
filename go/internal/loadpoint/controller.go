@@ -2517,14 +2517,30 @@ func (c *Controller) computeCommandForBudget(now time.Time, lpCfg Config, curren
 	}
 	maxW := lpCfg.MaxChargeW
 	if ceiling, ok := d.LoadpointMaxPowerW[lpCfg.ID]; ok {
+		// A duty plan commands its legal on-power for its on-time, the slot's
+		// energy at that power, and on until the energy is spent. A car that
+		// draws more than its step, as on a mains above 230 V, spends the
+		// energy early but keeps running for the on-time; a car stopped by
+		// then stays stopped. An off-time shorter than CommandSettle would
+		// reach the charger only in the next slot, so the car runs to the
+		// slot's end. The energy and the ceiling are both the plan's watts,
+		// before a one-phase car's order is scaled.
+		onUntil := now
+		if ceiling > 0 && budgetWh > 0 && !now.Before(d.SlotStart) && !d.LoadpointFallback[lpCfg.ID] {
+			onUntil = d.SlotStart.Add(time.Duration(budgetWh / ceiling * float64(time.Hour)))
+			if d.SlotEnd.Sub(onUntil) < CommandSettle {
+				onUntil = d.SlotEnd
+			}
+		}
+		st, _ := c.manager.State(lpCfg.ID)
+		running := st.CommandedKnown && st.CommandedW > 0
 		if onePhaseCar {
 			ceiling *= 3
 		}
 		maxW = min(maxW, ceiling)
-		if maxW <= 0 || remainingWh <= 1e-6 || remainingS <= 0 {
+		if maxW <= 0 || remainingS <= 0 || (remainingWh <= 1e-6 && (!running || !now.Before(onUntil))) {
 			return 0, true, false
 		}
-		// A duty plan commands its legal on-power until the Wh budget is spent.
 		wantW = maxW
 	}
 	// Joint fuse allocator (dispatch.go) caps EV demand when battery + EV

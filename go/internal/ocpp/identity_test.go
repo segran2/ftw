@@ -1,11 +1,9 @@
 package ocpp
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
 
 	"github.com/srcfl/ftw/go/internal/telemetry"
@@ -115,13 +113,11 @@ func TestBootNotificationTakesEitherSerialField(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			id := "boot-" + tc.name
 			port, srv := startServer(t, telemetry.NewStore(), id)
-			t.Cleanup(srv.Stop)
 
-			cp := ocpp16.NewChargePoint(id, nil, nil)
-			if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+			cp, _, err := dialChargePoint16(t, wsURL(port), id, nil, nil)
+			if err != nil {
 				t.Fatalf("connect: %v", err)
 			}
-			stopAfterServer(t, srv, cp.Stop, cp.IsConnected)
 
 			if _, err := cp.BootNotification("Halo", "Charge Amps", tc.props...); err != nil {
 				t.Fatalf("boot: %v", err)

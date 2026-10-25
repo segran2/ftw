@@ -73,12 +73,30 @@ func (h *fuseHeat) overA(amps []float64, limitA, instantA float64) float64 {
 
 // levelA is the highest phase current, taking each phase at the higher of
 // the reading and its heat, plus what we sent that it may not show yet.
-// Rises and starts read it, so a rise never spends heat the last minute has
-// already used, nor room an earlier rise will take.
+// A running pool's rises read it, so a rise never spends heat the last
+// minute has already used, nor room an earlier rise will take. An idle
+// start reads startLevelA.
 func (h *fuseHeat) levelA(amps []float64, pendingA [3]float64) float64 {
 	level := 0.0
 	for i, a := range amps {
 		level = math.Max(level, math.Max(a, math.Sqrt(h.sq[i]))+pendingA[i])
+	}
+	return level
+}
+
+// startLevelA is the highest phase current as an idle start reads it: the
+// reading plus what we sent that it may not show yet. A phase's heat counts
+// only while it is over limitA, so a car that just stopped is not counted
+// twice, in its heat and in the start it asks for, while a real overage
+// still blocks the start until the filter has cooled under the limit.
+func (h *fuseHeat) startLevelA(amps []float64, pendingA [3]float64, limitA float64) float64 {
+	level := 0.0
+	for i, a := range amps {
+		a += pendingA[i]
+		if h.sq[i] > limitA*limitA { // As overA reads it.
+			a = math.Max(a, math.Sqrt(h.sq[i])+pendingA[i])
+		}
+		level = math.Max(level, a)
 	}
 	return level
 }

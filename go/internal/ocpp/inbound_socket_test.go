@@ -5,12 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
-	ocpp201 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/provisioning"
 	types201 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
@@ -69,15 +68,15 @@ func TestOldSocketStatusCannotClearPauseAfterReconnect(t *testing.T) {
 			connect := func() (func(), func(bool) error) {
 				t.Helper()
 				if version == Version201 {
-					cp := ocpp201.NewChargingStation("garage", nil, nil)
-					if e := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", p201)); e != nil {
+					cp, stop, e := dialChargingStation201(t, wsURL(p201), "garage", nil)
+					if e != nil {
 						t.Fatal(e)
 					}
 					if _, e := cp.BootNotification(provisioning.BootReasonPowerUp, "Home", "Easee"); e != nil {
 						t.Fatal(e)
 					}
 					firstAvailable := true
-					return cp.Stop, func(connected bool) error {
+					return stop, func(connected bool) error {
 						s := availability.ConnectorStatusAvailable
 						if connected {
 							s = availability.ConnectorStatusOccupied
@@ -91,14 +90,14 @@ func TestOldSocketStatusCannotClearPauseAfterReconnect(t *testing.T) {
 						return e
 					}
 				}
-				cp := ocpp16.NewChargePoint("garage", nil, nil)
-				if e := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", p16)); e != nil {
+				cp, stop, e := dialChargePoint16(t, wsURL(p16), "garage", nil, nil)
+				if e != nil {
 					t.Fatal(e)
 				}
 				if _, e := cp.BootNotification("Home", "Easee"); e != nil {
 					t.Fatal(e)
 				}
-				return cp.Stop, func(connected bool) error {
+				return stop, func(connected bool) error {
 					s := core.ChargePointStatusAvailable
 					if connected {
 						s = core.ChargePointStatusSuspendedEVSE
@@ -288,9 +287,7 @@ func TestFailedAndDuplicateHandshakesPreserveCurrentSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other := ocpp201.NewChargingStation("garage", nil, nil)
-	if err := other.Start(fmt.Sprintf("ws://127.0.0.1:%d", p201)); err == nil {
-		other.Stop()
+	if _, _, err := dialChargingStation201(t, wsURL(p201), "garage", nil); err == nil {
 		t.Fatal("other protocol took an active public charger ID")
 	}
 	if current, err := srv.sockets.currentID("garage"); err != nil || current != oldID {
@@ -301,5 +298,54 @@ func TestFailedAndDuplicateHandshakesPreserveCurrentSocket(t *testing.T) {
 	}
 	if identity, ok := h.CurrentIdentity("garage"); !ok || identity.Serial != "A" {
 		t.Fatal("duplicate changed hardware")
+	}
+	// Neither the failed nor the refused handshake may hold up a stop.
+	if !srv.sockets.refuseHandshakes(5 * time.Second) {
+		t.Fatal("a finished handshake still counts as in flight")
+	}
+}
+
+// The library closes the sockets in its table when it stops, but a handshake
+// past the connection check joins that table only after its 101 is written.
+// Stop must wait for it and refuse any later one; otherwise the socket stays
+// open on a stopped server.
+func TestStopWaitsForAHandshakePastTheCheck(t *testing.T) {
+	s := newSocketSessions()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !s.reserveConnection("garage", httptest.NewRequest(http.MethodGet, "/garage", nil).WithContext(ctx)) {
+		t.Fatal("handshake refused before stop")
+	}
+	stopped := make(chan bool, 1)
+	go func() { stopped <- s.refuseHandshakes(time.Minute) }()
+	awaitIdentityCondition(t, func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.closed })
+	if s.reserveConnection("carport", httptest.NewRequest(http.MethodGet, "/carport", nil)) {
+		t.Fatal("a handshake was admitted after stop began")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("stop went ahead while a handshake was past the check")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel() // the handshake ends without joining the table
+	select {
+	case ok := <-stopped:
+		if !ok {
+			t.Fatal("stop reported a handshake still in flight")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop still waiting after the handshake ended")
+	}
+}
+
+// A charger that connected has joined the table, so a stop does not wait for it.
+func TestStopDoesNotWaitForAConnectedCharger(t *testing.T) {
+	port, srv := startServer(t, telemetry.NewStore(), "garage")
+	if _, _, err := dialChargePoint16(t, wsURL(port), "garage", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	awaitIdentityCondition(t, func() bool { return srv.Handler().IsOnline("garage") })
+	if !srv.sockets.refuseHandshakes(5 * time.Second) {
+		t.Fatal("a connected charger still counts as a handshake in flight")
 	}
 }

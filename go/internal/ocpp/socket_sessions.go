@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/lorenzodonini/ocpp-go/ws"
@@ -23,6 +24,13 @@ type socketSessions struct {
 	slots   map[string]*socketSlot
 	aliases map[string]*socketBinding
 	raw     map[ws.Channel]*socketBinding
+	// The library closes the sockets in its table when it stops, but a
+	// handshake that has passed the connection check joins that table
+	// later and would stay open on a stopped server. Once closed is set no
+	// handshake is admitted, and handshakes counts the admitted ones that
+	// have neither joined the table nor ended.
+	closed     bool
+	handshakes sync.WaitGroup
 }
 type socketSlot struct {
 	mu      sync.Mutex
@@ -79,7 +87,7 @@ func (s *socketSessions) reserveConnection(id string, r *http.Request) bool {
 	slot := s.slot(id)
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
-	if slot.current != nil || slot.pending != nil || r.Context().Err() != nil {
+	if slot.current != nil || slot.pending != nil || r.Context().Err() != nil || !s.admitHandshake() {
 		return false
 	}
 	pending := &socketHandshake{remote: r.RemoteAddr}
@@ -89,9 +97,45 @@ func (s *socketSessions) reserveConnection(id string, r *http.Request) bool {
 		defer slot.mu.Unlock()
 		if slot.pending == pending {
 			slot.pending = nil
+			s.handshakes.Done()
 		}
 	})
 	return true
+}
+
+// admitHandshake counts one more handshake past the connection check, unless
+// the server has begun to stop. Whoever clears that handshake's slot.pending
+// calls Done.
+func (s *socketSessions) admitHandshake() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.handshakes.Add(1)
+	return true
+}
+
+// refuseHandshakes refuses every later handshake and waits, at most wait,
+// until each admitted one has joined the library's table or ended. It reports
+// whether they all did.
+func (s *socketSessions) refuseHandshakes(wait time.Duration) bool {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.handshakes.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 func (g *guardedServer) binding(ch ws.Channel) *socketBinding {
 	s := g.sessions
@@ -126,6 +170,7 @@ func (g *guardedServer) SetNewClientHandler(fn func(ws.Channel)) {
 		}
 		b.slot.pending.stop()
 		b.slot.pending = nil
+		g.sessions.handshakes.Done()
 		b.slot.current = b
 		g.sessions.mu.Lock()
 		b.active = true
