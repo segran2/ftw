@@ -17,12 +17,9 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 		return targets
 	}
 	now := state.now()
-	// The lowest recent offer caps measured delivery credit; an offer alone
-	// does not establish load already in the site meter.
-	offeredW, _, _, ok := state.evOffers.span(now)
-	if !ok {
-		offeredW = 0
-	}
+	// The shared command log bounds delivery credit; an offer alone does
+	// not establish EV load already in the site meter.
+	offeredW := state.evShownW(now)
 	var demandW float64
 	phases := 3.0 // No phase placement promise for 1p or auto chargers.
 	for _, demand := range state.evFuseDemands {

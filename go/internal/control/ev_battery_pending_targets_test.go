@@ -46,7 +46,7 @@ func newEVBatteryTransitionTestState(t *testing.T, kind string) (*telemetry.Stor
 	st.SetEVCommanded([]loadpoint.State{{ID: "review_lp", DriverName: "review_ev", PluggedIn: true, CommandedKnown: true, CommandedW: 10350, CommandedPhases: 3}})
 	st.clock = func() time.Time { return now }
 	st.SetEVFuseDemands([]loadpoint.FuseDemand{{DriverName: "review_ev", PowerW: 10350, PhaseMode: "3p"}})
-	st.evOffers = commandLog{}.add(now.Add(-time.Hour), 10350)
+	st.evLimit.offers = map[string]chargerOffers{"review_lp": {log: commandLog{}.add(now.Add(-time.Hour), 10350), settle: evSettle}}
 	st.batteryCommands = map[string]commandLog{"review_a": commandLog{}.add(now.Add(-time.Hour), a)}
 	pending := 0.0
 	if kind == "pending_battery_without_target" {
