@@ -122,6 +122,9 @@ type Registry struct {
 	lifecycleHook    func(name string)
 	lifecycleMu      sync.Mutex
 	lifecycleGates   map[string]*lifecycleGate
+	spawnRetries     map[string]*spawnRetry
+	spawnInflight    map[string]struct{}
+	spawnRetryClosed bool
 }
 
 // lifecycleGate serializes every lifecycle transition for one driver name.
@@ -536,7 +539,7 @@ func legacyDriverRequiresDefaultMode(path string, hasCommand bool) (bool, error)
 // add is the shared driver construction path. The caller must hold the
 // lifecycle gate for cfg.Name. startupDefault is false only for connection
 // probes; operational drivers use the startup safety gate.
-func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) error {
+func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -546,6 +549,15 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		return fmt.Errorf("driver %q already registered", cfg.Name)
 	}
 	r.mu.Unlock()
+	if startupDefault {
+		prevDelay := r.takeSpawnRetry(cfg.Name)
+		retryCfg := cfg
+		defer func() {
+			if err != nil {
+				r.scheduleSpawnRetry(retryCfg, prevDelay, err)
+			}
+		}()
+	}
 
 	if cfg.Lua == "" {
 		return fmt.Errorf("driver %q: must specify `lua` path", cfg.Name)
@@ -1206,6 +1218,7 @@ func (r *Registry) remove(name string, skipDefault bool) {
 // lets Restart and Reload keep the old generation and its replacement in one
 // serialized transition instead of opening an Add/Remove gap.
 func (r *Registry) removeLocked(name string, skipDefault bool) {
+	r.takeSpawnRetry(name)
 	skipDefault = skipDefault || r.controlBlocked()
 	r.mu.Lock()
 	rd, ok := r.rec[name]
@@ -1441,6 +1454,11 @@ func (r *Registry) Names() []string {
 
 // ShutdownAll stops every driver. Blocks until all poll loops exit.
 func (r *Registry) ShutdownAll() {
+	// An attempt in flight holds its gate and tears its driver down itself
+	// once it sees the registry closed. Wait for it.
+	for _, n := range r.closeSpawnRetries() {
+		r.acquireLifecycle(n)()
+	}
 	r.mu.Lock()
 	names := make([]string, 0, len(r.rec))
 	for n := range r.rec {
@@ -1466,6 +1484,14 @@ func (r *Registry) Reload(ctx context.Context, newDrivers []config.Driver, troub
 			continue
 		}
 		active = append(active, d)
+	}
+	// Stop retrying a driver that failed to start and has left the config.
+	for _, n := range r.pendingSpawnRetries() {
+		if _, ok := findDriver(active, n); !ok {
+			release := r.acquireLifecycle(n)
+			r.removeLocked(n, false)
+			release()
+		}
 	}
 
 	r.mu.Lock()
