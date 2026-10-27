@@ -2674,10 +2674,6 @@ func main() {
 	// bound at startup stays; no port gap for healthcheck probes.
 	apiHandler.Swap(handler)
 	slog.Info("HTTP API ready", "addr", httpSrv.Addr)
-	if err := trial.complete(selfUpdater); err != nil {
-		slog.Error("native trial readiness commit failed", "err", err)
-		os.Exit(1)
-	}
 	if trial == nil {
 		reconcileNativeFallback(nativeRoot, Version, selfUpdater)
 	}
@@ -2884,6 +2880,32 @@ func main() {
 	const evStopReplanCooldown = 60 * time.Second
 	var staleDefaults staleSiteDefaultTracker
 	solarFeed := newSolarFeedSender()
+	// Every path out of a tick calls tickDone. The first one commits a native
+	// trial, so a release that cannot run its control loop is never committed.
+	// A tick blocked by a stale meter or by setup still counts.
+	tickSup := newTickSupervisor(time.Now(), controlInterval)
+	trialPending := true
+	tickDone := func() {
+		tickSup.beat(time.Now(), controlInterval)
+		if !trialPending {
+			return
+		}
+		trialPending = false
+		if err := trial.complete(selfUpdater); err != nil {
+			slog.Error("native trial readiness commit failed", "err", err)
+			os.Exit(1)
+		}
+	}
+	supCtx, stopSup := context.WithCancel(ctx)
+	defer stopSup()
+	go tickSup.run(supCtx, time.Second, time.Now, func() {
+		capMu.RLock()
+		observeOnlySnap := observeOnly
+		capMu.RUnlock()
+		sendDefaultsInParallel(reg.Names(), func(name string) {
+			sendDriverDefault(supCtx, srv, name, "control_tick_stalled", observeOnlySnap)
+		})
+	}, func() { os.Exit(1) })
 	for {
 		select {
 		case <-sigc:
@@ -2985,6 +3007,7 @@ func main() {
 				if _, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot()); err != nil {
 					slog.Warn("setup measurement persistence failed", "err", err)
 				}
+				tickDone()
 				continue
 			}
 			if watchdogTimeout <= 0 {
@@ -3086,6 +3109,7 @@ func main() {
 				if err != nil {
 					slog.Warn("tick persistence failed", "samples", sampleCount, "err", err)
 				}
+				tickDone()
 				continue
 			}
 
@@ -3158,19 +3182,23 @@ func main() {
 				evFuseDemands = lpController.FuseDemands()
 			}
 
-			ctrlMu.Lock()
-			ctrl.EVSurplusOnlyReserveW = evReserveW
-			ctrl.EVSurplusOnlyChargingW = evSurplusOnlyChargingW
-			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
-			ctrl.BatteryBoostEVChargingW = boostEVW
-			ctrl.BatteryBoostReserveSoC = boostReserveSoC
-			ctrl.SetEVCommanded(lpStatesSnapshot)
-			ctrl.SetEVFuseDemands(evFuseDemands)
-			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
-			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
-			planMissingNow := ctrl.Mode.IsPlannerMode() && ctrl.PlanStale
-			mode := ctrl.Mode
-			ctrlMu.Unlock()
+			var fuseMaxW float64
+			var targets []control.DispatchTarget
+			var planMissingNow bool
+			var mode control.Mode
+			withCtrlLock(ctrlMu, func() {
+				ctrl.EVSurplusOnlyReserveW = evReserveW
+				ctrl.EVSurplusOnlyChargingW = evSurplusOnlyChargingW
+				ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
+				ctrl.BatteryBoostEVChargingW = boostEVW
+				ctrl.BatteryBoostReserveSoC = boostReserveSoC
+				ctrl.SetEVCommanded(lpStatesSnapshot)
+				ctrl.SetEVFuseDemands(evFuseDemands)
+				fuseMaxW = ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
+				targets = control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
+				planMissingNow = ctrl.Mode.IsPlannerMode() && ctrl.PlanStale
+				mode = ctrl.Mode
+			})
 
 			// ---- Self-tune override: step one battery, hold its siblings at 0 ----
 			// Only the controllable battery pool is commanded, and the step
@@ -3178,9 +3206,9 @@ func main() {
 			finalTargets := targets
 			selfTuneName, selfTuneCmd, selfTuneActive := selfTune.CurrentCommand()
 			if selfTuneActive {
-				ctrlMu.Lock()
-				finalTargets = control.SelfTuneDispatch(tel, ctrl, capsSnap, fuseMaxW, selfTuneName, selfTuneCmd)
-				ctrlMu.Unlock()
+				withCtrlLock(ctrlMu, func() {
+					finalTargets = control.SelfTuneDispatch(tel, ctrl, capsSnap, fuseMaxW, selfTuneName, selfTuneCmd)
+				})
 			}
 			if troubleshootingMode {
 				gridW, haveGrid := troubleshootingGridW(tel, siteMeterDriver)
@@ -3347,6 +3375,7 @@ func main() {
 				}
 				modelsMu.Unlock()
 			}
+			tickDone()
 		}
 	}
 }
