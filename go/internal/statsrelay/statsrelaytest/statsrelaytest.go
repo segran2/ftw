@@ -86,7 +86,7 @@ func New(t testing.TB, now time.Time) (*statsrelay.Client, *Gateway, *Relay) {
 		_, _ = io.Copy(w, resp.Body)
 	}))
 	t.Cleanup(rl.Close)
-	return statsrelay.New(rl.URL, g.Key, nil), g, rl
+	return statsrelay.NewWithClock(rl.URL, g.Key, nil, func() time.Time { return now }), g, rl
 }
 
 func (g *Gateway) add(msg []byte) int {

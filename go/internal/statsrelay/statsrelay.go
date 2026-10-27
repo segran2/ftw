@@ -91,6 +91,15 @@ func pinned(relay, key string) (string, ohttp.KeyConfig, bool) {
 
 // New is a client for one relay and key. Tests point it at a fake relay.
 func New(relay string, key ohttp.KeyConfig, client *http.Client) *Client {
+	return NewWithClock(relay, key, client, time.Now)
+}
+
+// NewWithClock supplies one clock for a client and its test gateway. A nil
+// clock keeps the normal wall-clock behavior.
+func NewWithClock(relay string, key ohttp.KeyConfig, client *http.Client, now func() time.Time) *Client {
+	if now == nil {
+		now = time.Now
+	}
 	if client == nil {
 		client = &http.Client{Timeout: sendTimeout}
 	} else {
@@ -99,7 +108,7 @@ func New(relay string, key ohttp.KeyConfig, client *http.Client) *Client {
 	}
 	// A redirect would resend the sealed report to an address nobody chose.
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{relay: relay, key: key, http: client, now: time.Now}
+	return &Client{relay: relay, key: key, http: client, now: now}
 }
 
 // Relay is the relay's URL, for Settings.
