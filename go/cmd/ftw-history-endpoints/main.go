@@ -9,11 +9,12 @@ import (
 	"flag"
 	"fmt"
 	"github.com/srcfl/ftw/go/internal/state"
+	"io"
 	"os"
 	"time"
 )
 
-func run(ctx context.Context, args []string) error {
+func run(ctx context.Context, args []string, out io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("use prepare or apply")
 	}
@@ -60,7 +61,7 @@ func run(ctx context.Context, args []string) error {
 		if closeErr != nil {
 			return closeErr
 		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"plan_sha256": p.SHA256, "correction_minutes": len(p.Minutes), "skipped": p.Skipped})
+		return json.NewEncoder(out).Encode(map[string]any{"plan_sha256": p.SHA256, "correction_minutes": len(p.Minutes), "skipped": p.Skipped})
 	case "apply":
 		sha := f.String("sha256", "", "exact reviewed plan digest")
 		backup := f.String("backup", "", "independent verified history.db backup")
@@ -82,13 +83,13 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"plan_sha256": p.SHA256, "applied_minutes": n, "method": "endpoint_mean_v1"})
+		return json.NewEncoder(out).Encode(map[string]any{"plan_sha256": p.SHA256, "applied_minutes": n, "method": "endpoint_mean_v1"})
 	default:
 		return errors.New("unknown operation")
 	}
 }
 func main() {
-	if err := run(context.Background(), os.Args[1:]); err != nil {
+	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

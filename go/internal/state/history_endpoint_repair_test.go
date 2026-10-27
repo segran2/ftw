@@ -284,3 +284,46 @@ func TestEndpointRepairLiveTotalsStopAtCommittedMinute(t *testing.T) {
 		t.Fatal("extrapolated unfinished tail", d)
 	}
 }
+
+func TestEndpointRepairRejectsCorruptIndependentBackup(t *testing.T) {
+	ctx := context.Background()
+	s, r, backup := endpointFixture(t, false)
+	p, err := PrepareEndpointRepair(ctx, s.mainDBPath, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := openRaw(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`CREATE TABLE integrity_probe(payload BLOB); INSERT INTO integrity_probe VALUES(zeroblob(4096))`); err != nil {
+		t.Fatal(err)
+	}
+	var page, size int64
+	if err = db.QueryRow(`SELECT rootpage FROM sqlite_schema WHERE name='integrity_probe'`).Scan(&page); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(`PRAGMA page_size`).Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corruptAt(t, backup, (page-1)*size)
+	db, err = openRaw(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generation string
+	if err = db.QueryRow(`SELECT name FROM history_migrations WHERE name=?`, p.Generation).Scan(&generation); err != nil {
+		t.Fatal("generation must remain readable", err)
+	}
+	db.Close()
+	if _, err = ApplyEndpointRepair(ctx, s.mainDBPath, backup, p, p.SHA256); err == nil {
+		t.Fatal("structurally corrupt backup accepted")
+	}
+	var n int
+	if err = s.history.QueryRow(`SELECT count(*) FROM energy_ledger_meta WHERE key GLOB 'endpoint-repair-v1:*'`).Scan(&n); err != nil || n != 0 {
+		t.Fatal("repair published before backup check", n, err)
+	}
+}

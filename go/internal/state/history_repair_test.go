@@ -357,3 +357,93 @@ func TestHistoryRepairRefusesInsufficientCopySpace(t *testing.T) {
 		t.Fatal("repair started without room for backup and working copy")
 	}
 }
+
+func TestHistoryRepairRetryRejectsUnrelatedWorkingChanges(t *testing.T) {
+	for _, change := range []string{
+		`UPDATE history_quality SET missing=missing|1`,
+		`INSERT INTO history_load_estimates(start_ms,resolution_ms,covered_ms,load_wh,method) VALUES(0,60000,60000,10,'unrelated')`,
+		`CREATE TABLE unrelated_change(value TEXT)`,
+	} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			source, r := historicalRepairFixture(t, false)
+			work := filepath.Join(t.TempDir(), "repair")
+			p, err := PrepareHistoryRepair(ctx, source, work, r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = ApplyHistoryRepair(ctx, work, p.SHA256); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(filepath.Join(work, "corrected", "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = s.history.Exec(change); err != nil {
+				t.Fatal(err)
+			}
+			if err = s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = ApplyHistoryRepair(ctx, work, p.SHA256); err == nil {
+				t.Fatal("retry accepted unrelated working-history change")
+			}
+		})
+	}
+}
+
+func TestHistoryRepairLegacyPlanCannotAuthorizeUncheckedRetry(t *testing.T) {
+	ctx := context.Background()
+	source, r := historicalRepairFixture(t, false)
+	work := filepath.Join(t.TempDir(), "repair")
+	p, err := PrepareHistoryRepair(ctx, source, work, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.WorkingEvidenceSHA256 = ""
+	p.SHA256 = p.digest()
+	if err = writeRepairJSON(filepath.Join(work, "plan.json"), p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ApplyHistoryRepair(ctx, work, p.SHA256); err != nil {
+		t.Fatal("unchanged legacy working copy refused", err)
+	}
+	if _, err = ApplyHistoryRepair(ctx, work, p.SHA256); err == nil {
+		t.Fatal("legacy plan authorized retry without evidence")
+	}
+}
+
+func TestHistoryRepairRetryRebuildsUntrustedDailyCaches(t *testing.T) {
+	ctx := context.Background()
+	source, r := historicalRepairFixture(t, false)
+	work := filepath.Join(t.TempDir(), "repair")
+	p, err := PrepareHistoryRepair(ctx, source, work, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := ApplyHistoryRepair(ctx, work, p.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(work, "corrected", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveDailyEnergy("tampered-cache", DayEnergy{LoadWh: 999999, Intervals: 1}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	again, err := ApplyHistoryRepair(ctx, work, p.SHA256)
+	if err != nil || !reflect.DeepEqual(first, again) {
+		t.Fatal("retry trusted altered cache", again, err)
+	}
+	s, err = Open(filepath.Join(work, "corrected", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var n int
+	if err = s.history.QueryRow(`SELECT count(*) FROM energy_daily WHERE day='tampered-cache'`).Scan(&n); err != nil || n != 0 {
+		t.Fatal("untrusted cache survived retry", n, err)
+	}
+}

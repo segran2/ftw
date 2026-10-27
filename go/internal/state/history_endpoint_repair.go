@@ -306,6 +306,14 @@ func ApplyEndpointRepair(ctx context.Context, statePath, backupPath string, p En
 	if err != nil {
 		return 0, err
 	}
+	ok, checkErr := quickCheckContext(ctx, backup)
+	if checkErr != nil || !ok {
+		backup.Close()
+		if checkErr != nil {
+			return 0, fmt.Errorf("backup integrity check: %w", checkErr)
+		}
+		return 0, errors.New("backup integrity check failed")
+	}
 	var generation string
 	err = backup.QueryRowContext(ctx, `SELECT name FROM history_migrations WHERE name=?`, p.Generation).Scan(&generation)
 	backup.Close()

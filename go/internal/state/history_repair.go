@@ -33,15 +33,16 @@ type HistoryRepairRequest struct {
 }
 
 type HistoryRepairPlan struct {
-	SHA256               string               `json:"sha256"`
-	Request              HistoryRepairRequest `json:"request"`
-	CreatedAt            string               `json:"created_at"`
-	BackupStateSHA256    string               `json:"backup_state_sha256"`
-	BackupHistorySHA256  string               `json:"backup_history_sha256"`
-	WorkingHistorySHA256 string               `json:"working_history_sha256"`
-	WorkingStateSHA256   string               `json:"working_state_sha256"`
-	Minutes              []repairMinute       `json:"minutes"`
-	Skipped              map[int64]string     `json:"skipped"`
+	SHA256                string               `json:"sha256"`
+	Request               HistoryRepairRequest `json:"request"`
+	CreatedAt             string               `json:"created_at"`
+	BackupStateSHA256     string               `json:"backup_state_sha256"`
+	BackupHistorySHA256   string               `json:"backup_history_sha256"`
+	WorkingEvidenceSHA256 string               `json:"working_evidence_sha256,omitempty"`
+	WorkingHistorySHA256  string               `json:"working_history_sha256"`
+	WorkingStateSHA256    string               `json:"working_state_sha256"`
+	Minutes               []repairMinute       `json:"minutes"`
+	Skipped               map[int64]string     `json:"skipped"`
 }
 
 func (p HistoryRepairPlan) digest() string {
@@ -336,6 +337,9 @@ func PrepareHistoryRepair(ctx context.Context, statePath, workdir string, r Hist
 	if err == nil {
 		plan.Minutes, plan.Skipped, err = c.planHistoryRepair(ctx, r)
 	}
+	if err == nil {
+		plan.WorkingEvidenceSHA256, err = repairHistoryEvidence(ctx, c.history, nil, "")
+	}
 	closeErr = c.Close()
 	if err != nil {
 		return plan, err
@@ -419,6 +423,15 @@ func ApplyHistoryRepair(ctx context.Context, workdir, approvedSHA string) (Histo
 			break
 		}
 	}
+	if allApplied {
+		evidence, err := repairHistoryEvidence(ctx, s.history, p.Minutes, method)
+		if err != nil {
+			return result, err
+		}
+		if len(p.WorkingEvidenceSHA256) != 64 || evidence != p.WorkingEvidenceSHA256 {
+			return result, errors.New("working history changed after the plan; prepare a new copy")
+		}
+	}
 	if hash != p.WorkingHistorySHA256 && !allApplied {
 		return result, errors.New("working history changed after the plan; prepare a new copy")
 	}
@@ -431,12 +444,12 @@ func ApplyHistoryRepair(ctx context.Context, workdir, approvedSHA string) (Histo
 	if err != nil {
 		return result, err
 	}
+	tx, err := s.history.BeginTx(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	defer tx.Rollback()
 	if !allApplied {
-		tx, err := s.history.BeginTx(ctx, nil)
-		if err != nil {
-			return result, err
-		}
-		defer tx.Rollback()
 		for _, v := range p.Minutes {
 			if v.StartMS < p.Request.SinceMS || v.StartMS+60000 > p.Request.UntilMS || v.StartMS%60000 != 0 || !finiteHistoryValue(v.Wh) {
 				return result, errors.New("invalid correction minute")
@@ -445,16 +458,18 @@ func ApplyHistoryRepair(ctx context.Context, workdir, approvedSHA string) (Histo
 				return result, err
 			}
 		}
-		// All these tables are derived caches. Original observations and their
-		// quality are untouched; a new Core process recomputes corrected days.
-		for _, table := range []string{"energy_daily", "energy_daily_partial", "history_daily_quality"} {
-			if _, err = tx.ExecContext(ctx, `DELETE FROM `+table); err != nil {
-				return result, err
-			}
-		}
-		if err = tx.Commit(); err != nil {
+	}
+	// Invalidate on retries too: cache contents are excluded from the evidence
+	// digest and must not supply an unverified result.
+	// All these tables are derived caches. Original observations and their
+	// quality are untouched; a new Core process recomputes corrected days.
+	for _, table := range []string{"energy_daily", "energy_daily_partial", "history_daily_quality"} {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM `+table); err != nil {
 			return result, err
 		}
+	}
+	if err = tx.Commit(); err != nil {
+		return result, err
 	}
 	after, err := s.DailyEnergy(p.Request.SinceMS, p.Request.UntilMS)
 	if err != nil {

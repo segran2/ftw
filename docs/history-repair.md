@@ -81,7 +81,12 @@ bin/ftw-history-repair apply --workdir ./repair-2026-10-19 \
 The operation verifies the backup hashes and unchanged working inputs,
 inserts all correction minutes and clears derived daily caches in one SQLite
 transaction. A conflict rolls the transaction back. Retrying the same applied
-plan does not add energy again. `apply-result.json` reports before/after
+plan does not add energy again. Every retry also verifies a logical digest of
+the complete working history, including its schema and unrelated estimates.
+Only the exact correction rows from the reviewed plan and recomputable daily
+cache contents are excluded. Unexpected original rows, schema changes or
+unrelated corrections require a new working copy and plan. Older plans without
+this evidence digest cannot authorize a retry after their first application. `apply-result.json` reports before/after
 household Wh and quality for the **selected range**, not an assumed full day.
 If another gap remains unsupported, the complete total stays unknown and the
 accepted subtotal remains available.

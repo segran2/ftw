@@ -36,7 +36,10 @@ Inspect `minutes` (flow, whole-minute Wh, endpoint times and powers), `skipped`,
 source generation and evidence digest. The boundary timestamps are not raw
 polls: their retained resolution is part of the method. Choose the smallest
 bound that covers the reviewed gaps. An unsupported edge remains unknown.
-Apply the actual reviewed hash and verified independent backup:
+Apply the actual reviewed hash and verified independent backup. The apply
+command runs SQLite `quick_check` against that backup before reserving the
+live writer; a matching generation alone is not sufficient:
+
 
 ```sh
 ftw-history-endpoints apply --state /var/lib/ftw/state.db \
