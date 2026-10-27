@@ -5,6 +5,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
@@ -216,6 +217,32 @@ func (s *State) importRiseCeilingW(fuseMaxW float64) float64 {
 		eff = riseW
 	}
 	return eff
+}
+
+// PlanningImportCeiling is the ceiling as the planner gets it, from the hour
+// the live limit counts: the clock hour in progress and what it has used.
+// Time with no record counts at the ceiling. Until a reading measures the
+// hour against this ceiling, the rest of the hour may hold the ceiling, so
+// the time before counts as used. A planned hour holds the ceiling less half
+// a rise step: the car runs in whole steps and a rise keeps a step in hand,
+// so a car under the ceiling ends each hour 0.4-0.6 kWh short of it. Planned
+// at the ceiling the plan promised the car 8-15 % more than it got; at half
+// a step less the car gets as much, within 1 % of the promise with the
+// battery covering the house and 6 % without
+// (TestSiteSimPlanUnderImportCeiling). Zero while the ceiling is off.
+// Callers hold the control lock.
+func PlanningImportCeiling(s *State) mpc.ImportCeiling {
+	if s == nil || !(s.PeakImportCeilingW > 0) {
+		return mpc.ImportCeiling{}
+	}
+	now, ceiling := s.now(), s.PeakImportCeilingW
+	start := s.importHourStart(now)
+	elapsedWh := ceiling * now.Sub(start).Hours()
+	if h := &s.importHour; s.importHourMeasured() {
+		elapsedWh = h.importedWh + ceiling*h.unknown.Hours()
+	}
+	step := evPhaseMarginA * s.SiteFuseVoltage * float64(s.SiteFusePhases)
+	return mpc.ImportCeiling{W: ceiling, MeanW: max(0, ceiling-step/2), HourStart: start, ElapsedWh: elapsedWh}
 }
 
 // ImportHourStatus is the clock hour's import budget left, negative once it

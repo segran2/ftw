@@ -95,7 +95,7 @@ func TestNativeEnergyplanDownsideAndAsyncShadow(t *testing.T) {
 	svc := shadowTestService(t)
 	svc.Optimizer = o
 	info, err := svc.Optimizer.(*EnergyplanOptimizer).Health(context.Background())
-	if err != nil || info.Name != "ftw-solver" || info.Version != "0.5.2" {
+	if err != nil || info.Name != "ftw-solver" || info.Version != "0.6.0" {
 		t.Fatalf("bundled worker health: %+v %v", info, err)
 	}
 	start := time.Now().UTC().Truncate(time.Hour)
@@ -373,11 +373,16 @@ func TestEnergyplanTimeBudgetRespectsRemainingSlot(t *testing.T) {
 	if got := energyplanTimeBudget(slots, p); got != 0 {
 		t.Fatalf("200ms remaining fleet budget=%v, want fail-fast", got)
 	}
-	trimFirstSlotRemaining(slots, 2*time.Second)
-	got := energyplanTimeBudget(slots, p)
-	remaining := remainingFirstSlot(slots)
-	if got <= 0 || got > remaining || remaining-got != energyplanPublishMargin {
-		t.Fatalf("2s remaining fleet budget=%v remaining=%v", got, remaining)
+	// Core's call ends energyplanPublishMargin before the slot does. A
+	// worker that spends its whole budget must still answer before that:
+	// 5 % of the time left, at least 30 ms.
+	for _, left := range []time.Duration{2 * time.Second, 500 * time.Millisecond, energyplanFleetBudget + 60*time.Millisecond} {
+		trimFirstSlotRemaining(slots, left)
+		got, remaining := energyplanTimeBudget(slots, p), remainingFirstSlot(slots)
+		deadline := remaining - energyplanPublishMargin
+		if want := deadline - max(deadline/20, 30*time.Millisecond); got <= 0 || got != want {
+			t.Fatalf("%v remaining: fleet budget=%v, want %v under the %v call deadline", left, got, want, deadline)
+		}
 	}
 	small, smallParams := topologyFixture(1, 0)
 	trimFirstSlotRemaining(small, 2*time.Second)

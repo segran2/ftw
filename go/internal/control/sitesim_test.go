@@ -215,7 +215,8 @@ func (s *simSite) step() {
 	}
 	if s.downUntil.IsZero() {
 		if m := tick.Meter; m != nil {
-			s.emit("meter", telemetry.DerMeter, m.W, nil, map[string]any{"l1_a": m.PhaseA[0], "l2_a": m.PhaseA[1], "l3_a": m.PhaseA[2]})
+			s.emit("meter", telemetry.DerMeter, m.W, nil, map[string]any{"l1_a": m.PhaseA[0], "l2_a": m.PhaseA[1], "l3_a": m.PhaseA[2],
+				"l1_w": m.PhaseW[0], "l2_w": m.PhaseW[1], "l3_w": m.PhaseW[2]})
 		}
 		if b := tick.Battery; b != nil {
 			s.emit("battery", telemetry.DerBattery, b.W, &b.SoC, nil)
@@ -360,7 +361,9 @@ func (s *simSite) check() {
 		s.fail("over Core's limit for more than %v (heat %.1f A, limit %.0f A)", allow, math.Sqrt(max(s.heat[0], s.heat[1], s.heat[2])), limitA)
 	}
 	// (b) With the meter on schedule, room for the car's minimum and a car
-	// that asks, the car draws within a minute plus the charger's delay.
+	// that asks, the car draws within a minute plus the charger's delay
+	// and the battery-command settling window. A battery raise may still
+	// occupy that window even after the physical meter shows it.
 	if !s.wantsCharge() {
 		s.needSince = time.Time{}
 	} else if s.needSince.IsZero() {
@@ -368,7 +371,7 @@ func (s *simSite) check() {
 	}
 	if !s.needSince.IsZero() && p.EVSE.DrawW <= 0 {
 		s.idleWithRoom += sitesim.Step
-		if wait := time.Minute + p.EVSE.Delay; now.Sub(s.needSince) > wait {
+		if wait := time.Minute + p.EVSE.Delay + evSettle; now.Sub(s.needSince) > wait {
 			s.fail("the car is idle after %v with room for it", wait)
 		}
 	}
@@ -385,6 +388,11 @@ func (s *simSite) check() {
 func (s *simSite) wantsCharge() bool {
 	p, e := s.p, s.p.EVSE
 	if p.Car == nil || !p.Car.Plugged || p.Offline("evse") || !s.downUntil.IsZero() || p.Now.Sub(s.meterAt) > max(p.Meter.Every, sitesim.Step)+sitesim.Step {
+		return false
+	}
+	// After a real overload, an idle car must wait for the fuse to cool.
+	// Its recovery deadline starts when that heat no longer blocks a start.
+	if e.DrawW <= 0 && max(s.heat[0], s.heat[1], s.heat[2]) > math.Pow(p.Fuse.RatingA-evPhaseMarginA, 2) {
 		return false
 	}
 	phases := min(e.Phases, p.Car.Phases)
@@ -597,9 +605,9 @@ func simScenarios() []simScenario {
 		}
 	}
 	return []simScenario{
-		{name: "export start", known: "export counted as import, fuse_heat.go:120", run: 5 * time.Minute,
+		{name: "export start", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) { p.HouseW, p.PVW = houseA(2, 2, 2), -22*690 }},
-		{name: "export start, unsigned phase currents", known: "export counted as import, fuse_heat.go:120", run: 5 * time.Minute,
+		{name: "export start, unsigned phase currents", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) { p.HouseW, p.PVW, p.Meter.Unsigned = houseA(2, 2, 2), -22*690, true }},
 		{name: "charger's own load balancer", known: "a cut comes off an offer the car does not draw, ev_fuse_budget.go:172", run: 20 * time.Minute,
 			plant: func(p *sitesim.Plant) {
@@ -645,7 +653,7 @@ func simScenarios() []simScenario {
 			plant: surplus, lp: surplusPhase("")},
 		{name: "phase mode auto, 9 kW surplus", run: 5 * time.Minute, surplus: true,
 			plant: surplus, lp: surplusPhase("auto")},
-		{name: "9 kW surplus, readback 10 s late", known: "surplus adds back the charger's late readback, surplus_reserve.go:128", run: 5 * time.Minute, surplus: true,
+		{name: "9 kW surplus, readback 10 s late", run: 5 * time.Minute, surplus: true,
 			plant: func(p *sitesim.Plant) { surplus(p); p.EVSE.ReadbackLag = 10 * time.Second }, lp: surplusPhase("3p")},
 		{name: "surplus_unlock_bat_soc saved, Charge now", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) {

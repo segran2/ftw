@@ -10,13 +10,13 @@ import (
 	"testing"
 	"time"
 
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/smartcharging"
 	"github.com/lorenzodonini/ocpp-go/ws"
 
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/ocpp"
+	"github.com/srcfl/ftw/go/internal/ocpp/chargersocket"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
@@ -160,7 +160,7 @@ func connectTestCharger(t *testing.T, port int, id, user, pass string) (*profile
 	if user != "" || pass != "" {
 		client.SetBasicAuth(user, pass)
 	}
-	cp := ocpp16.NewChargePoint(id, nil, client)
+	cp := chargersocket.ChargePoint16(id, client)
 	cp.SetSmartChargingHandler(fake)
 	if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
 		t.Fatalf("connect %s: %v", id, err)

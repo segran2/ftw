@@ -85,17 +85,17 @@ func TestFuseHeatCountsGapAtLastCurrentSeen(t *testing.T) {
 	} {
 		store, state := fuseHeatState()
 		t0 := time.Unix(1_800_000_000, 0)
-		state.stepFuseHeat(meterAt(store, t0.Add(-time.Hour), [3]float64{20, 20, 20}))
-		state.stepFuseHeat(meterAt(store, t0, [3]float64{tc.before, 20, 20}))
+		state.stepFuseHeat0(meterAt(store, t0.Add(-time.Hour), [3]float64{20, 20, 20}))
+		state.stepFuseHeat0(meterAt(store, t0, [3]float64{tc.before, 20, 20}))
 		held := state.fuseHeat.sq
 		silent := store.Get("meter", telemetry.DerMeter)
 		for range 30 {
-			state.stepFuseHeat(silent) // ticks with no new reading
+			state.stepFuseHeat0(silent) // ticks with no new reading
 		}
 		if state.fuseHeat.sq != held {
 			t.Fatalf("%s: heat moved to %v without a reading", tc.name, state.fuseHeat.sq)
 		}
-		state.stepFuseHeat(meterAt(store, t0.Add(gap), [3]float64{tc.after, 20, 20}))
+		state.stepFuseHeat0(meterAt(store, t0.Add(gap), [3]float64{tc.after, 20, 20}))
 		a := tc.before
 		want := a*a - (a*a-held[0])*math.Exp(-gap.Seconds()/60)
 		if got := state.fuseHeat.sq[0]; math.Abs(got-want) > 1e-9 {
@@ -110,7 +110,7 @@ func TestFuseHeatCountsGapAtLastCurrentSeen(t *testing.T) {
 // A Core restart has no memory: the first reading sets the heat.
 func TestFuseHeatStartsAtFirstReadingAfterRestart(t *testing.T) {
 	store, state := fuseHeatState()
-	state.stepFuseHeat(meterAt(store, time.Unix(1_800_000_000, 0), [3]float64{26, 3, 0}))
+	state.stepFuseHeat0(meterAt(store, time.Unix(1_800_000_000, 0), [3]float64{26, 3, 0}))
 	if state.fuseHeat.sq != [3]float64{676, 9, 0} {
 		t.Fatalf("first reading set %v", state.fuseHeat.sq)
 	}
@@ -500,3 +500,62 @@ func TestStartLevelReadsHeatOnlyOverTheLimit(t *testing.T) {
 		})
 	}
 }
+
+// A phase's current takes its direction from the same phase's power: P1
+// reports current as a magnitude, Pixii signs it. It counts as export only
+// when the power says so clearly and the phases add up to the total;
+// otherwise as import.
+func TestPhaseCurrentsTakeDirectionFromPhasePower(t *testing.T) {
+	_, state := fuseHeatState()
+	for _, tc := range []struct {
+		name   string
+		data   map[string]float64
+		totalW float64
+		want   []float64
+	}{
+		{"p1", map[string]float64{"l1_a": 20, "l2_a": 3, "l3_a": 5, "l1_w": -4600, "l2_w": 690, "l3_w": 0}, -3910, []float64{-20, 3, 5}},
+		{"signed", map[string]float64{"l1_a": -20, "l2_a": -3, "l3_a": 5, "l1_w": -4600, "l2_w": -690, "l3_w": 1150}, -4140, []float64{-20, -3, 5}},
+		{"no phase power", map[string]float64{"l1_a": -20, "l2_a": 3, "l3_a": 5}, -2760, []float64{20, 3, 5}},
+		{"phase power against the total", map[string]float64{"l1_a": 40, "l2_a": 1, "l3_a": 1, "l1_w": -9200, "l2_w": 230, "l3_w": 230}, 9660, []float64{40, 1, 1}},
+		{"near 0 W", map[string]float64{"l1_a": 0.2, "l2_a": 3, "l3_a": 5, "l1_w": -10, "l2_w": 690, "l3_w": 1150}, 1830, []float64{0.2, 3, 5}},
+		{"reactive", map[string]float64{"l1_a": 10, "l2_a": 3, "l3_a": 5, "l1_w": -300, "l2_w": 690, "l3_w": 1150}, 1540, []float64{10, 3, 5}},
+	} {
+		raw, _ := json.Marshal(tc.data)
+		amps, present, valid := phaseCurrentsA(&telemetry.DerReading{Data: raw}, state, tc.totalW)
+		if !present || !valid || len(amps) != 3 || amps[0] != tc.want[0] || amps[1] != tc.want[1] || amps[2] != tc.want[2] {
+			t.Errorf("%s: %v (present %v, valid %v), want %v", tc.name, amps, present, valid, tc.want)
+		}
+	}
+}
+
+// An exporting phase is never over the limit for an EV cut, hot or above
+// the instant limit: less EV load would raise its export. An importing
+// phase beside it still cuts.
+func TestExportingPhaseIsNeverOverForACut(t *testing.T) {
+	h := fuseHeat{set: true}
+	h.sq = [3]float64{32 * 32, 26 * 26, 2 * 2}
+	if got := h.overA([]float64{-32, 2, 2}, 24, 30); got != 0 {
+		t.Fatalf("export of 32 A cuts %.1f A, want 0", got)
+	}
+	if got := h.overA([]float64{-32, 26, 2}, 24, 30); got != 2 {
+		t.Fatalf("L2 at 26 A beside export cuts %.1f A, want 2", got)
+	}
+}
+
+// An exporting phase counts at its reading for a rise and a start: new load
+// lowers its current, and its heat from an earlier import does not count.
+func TestExportingPhaseLevelIsItsReading(t *testing.T) {
+	h := fuseHeat{set: true}
+	h.sq = [3]float64{20 * 20, 4, 4}
+	amps := []float64{-12, 2, 2}
+	if got := h.levelA(amps, [3]float64{3, 3, 3}); got != 5 {
+		t.Fatalf("rise level %.1f A, want L2's 2 A plus 3 A on its way", got)
+	}
+	if got := h.startLevelA(amps, [3]float64{}, 24); got != 2 {
+		t.Fatalf("start level %.1f A, want L2's 2 A", got)
+	}
+}
+
+// stepFuseHeat0 folds a reading with phase currents but no phase power, so
+// its total does not matter.
+func (s *State) stepFuseHeat0(meter *telemetry.DerReading) { s.stepFuseHeat(meter, 0) }

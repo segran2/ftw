@@ -42,6 +42,7 @@ type Controller struct {
 	commandTimeout  time.Duration
 	wallboxCycleSeq atomic.Uint64
 	resumeOffers    map[string]*resumeOffer // owned by the dispatch tick
+	unpluggedSince  map[string]time.Time    // owned by the dispatch tick
 	energySamples   map[string]*meteredEnergy
 
 	// fuseEVMax is this tick's EV share of the site fuse. nil means no cap.
@@ -118,6 +119,8 @@ type Controller struct {
 	// transient surplus spike can't ratchet the EV up a step it can't hold
 	// (which would whipsaw the home battery's PI). See computeSurplusCmd.
 	surplusStepW map[string]float64
+	// surplusOrders is each loadpoint's latest order as surplus reads it.
+	surplusOrders map[string]surplusOrder
 
 	// vehicleStatus is the bound vehicle driver and its charging state.
 	// nil disables auto-wake.
@@ -233,6 +236,10 @@ func (w *surplusWindow) push(v float64) float64 {
 	if w.n < surplusWindowSize {
 		w.n++
 	}
+	return w.mean()
+}
+
+func (w *surplusWindow) mean() float64 {
 	var sum float64
 	for i := 0; i < w.n; i++ {
 		sum += w.buf[i]
@@ -1336,7 +1343,9 @@ func (c *Controller) observeTick(now time.Time, cfg Config, sample EVSample, dis
 	c.manager.SetSurplusWithheld(cfg.ID, wasSurplus && enteringSurplusPaused)
 	c.manager.ObserveSample(cfg.ID, sample)
 	c.observePhases(cfg, sample, now)
-	c.restoreManualHoldForSession(cfg.ID)
+	if !c.holdInUnplugGrace(cfg.ID, sample.Connected, now) {
+		c.restoreManualHoldForSession(cfg.ID)
+	}
 	c.evaluateBatteryBoost(cfg.ID, now, sample.Connected, dispatchAllowed && !sample.PowerUnavailable)
 }
 
@@ -1426,8 +1435,12 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		// Release any manual override when the vehicle unplugs. A
 		// persistent "Start" hold (zero ExpiresAt) would otherwise
 		// survive the session and silently re-apply to the next car;
-		// "until Stop or unplug" is the operator's mental model.
-		c.ClearManualHold(lpCfg.ID)
+		// "until Stop or unplug" is the operator's mental model. One
+		// reading is not an unplug: the cable must stay out for
+		// UnplugGrace, as the cars runtime counts it.
+		if since, seen := c.unpluggedSince[lpCfg.ID]; !seen || now.Sub(since) >= UnplugGrace {
+			c.ClearManualHold(lpCfg.ID)
+		}
 		return
 	}
 	if !wasPlugged {
@@ -1568,7 +1581,7 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 		// After the surplus clamp, a wake-kick still offers the minimum
 		// step. A 0 A wallbox cannot finish the session the wake started.
 		if c.wakeKickActive(lpCfg.ID, now) {
-			minKick := smallestNonZero(c.pickSurplusSteps(now, lpCfg))
+			minKick := surplusMinStepW(lpCfg, c.pickSurplusSteps(now, lpCfg))
 			if minKick > 0 && cmdW < minKick {
 				slog.Info("loadpoint wake-kick", "lp", lpCfg.ID,
 					"prev_cmd_w", cmdW, "kick_w", minKick)
@@ -1657,6 +1670,7 @@ func (c *Controller) tickOne(ctx context.Context, now time.Time, lpCfg Config, s
 	if w, ok := cmd["power_w"].(float64); ok {
 		offerW, haveOffer = w, true
 		c.manager.setCommandedForManual(lpCfg.ID, w, cmdReason, manualCommandUpdatedAt)
+		c.noteSurplusOrder(lpCfg.ID, now, w)
 		mode, _ := cmd["phase_mode"].(string)
 		split, _ := cmd["phase_split_w"].(float64)
 		c.manager.setCommandedPhases(lpCfg.ID, c.commandPhases(mode, w, split))
@@ -1958,8 +1972,10 @@ func (c *Controller) computeSurplusCmd(now time.Time, lpCfg Config, wantW float6
 	// `−pvW − loadW`, i.e. PV-magnitude minus house load — invariant
 	// under whatever the home battery is currently doing with the
 	// surplus. The EV's own draw is part of that closure already, so
-	// we don't add it here.
-	instant := surplusW
+	// we don't add it here. The chargers' readings lag their draw, so the
+	// closure's EV draw is replaced by what our orders let the meter show.
+	adjW, raisingW := c.surplusOrderAdjustW(now, lpCfg.ID)
+	instant := surplusW + adjW
 	if instant < 0 {
 		instant = 0
 	}
@@ -1968,7 +1984,7 @@ func (c *Controller) computeSurplusCmd(now time.Time, lpCfg Config, wantW float6
 	if steps == nil {
 		steps = c.pickSurplusSteps(now, lpCfg) // A hold ended after chooseTick.
 	}
-	minStep := smallestNonZero(steps)
+	minStep := surplusMinStepW(lpCfg, steps)
 
 	// Compatibility variables for the rest of the function — the
 	// pause/resume hysteresis and wake-kick reuse these names.
@@ -2032,15 +2048,77 @@ func (c *Controller) computeSurplusCmd(now time.Time, lpCfg Config, wantW float6
 			}
 		}
 	}
+	// A raise on its way already claims its room: no further raise until a
+	// reading shows it.
+	if raisingW > 0 && snapped > raisingW {
+		snapped = math.Max(prev, raisingW)
+	}
 	c.setSurplusStepW(lpCfg.ID, snapped)
 	return snapped
 }
 
+// surplusRaiseSettle bounds how long a raise counts as on its way when no
+// reading shows it: the slowest charger we know, Easee Cloud's 180 s.
+const surplusRaiseSettle = 3 * time.Minute
+
+// surplusOrder is a loadpoint's latest order and what its readings have
+// shown of it since. A reading lags the draw, so one past halfway from the
+// order before to this one shows it only after one short of halfway.
+type surplusOrder struct {
+	w, prevW     float64
+	at           time.Time
+	below, shown bool
+}
+
+func (c *Controller) noteSurplusOrder(id string, now time.Time, w float64) {
+	if c.surplusOrders == nil {
+		c.surplusOrders = map[string]surplusOrder{}
+	}
+	if o, ok := c.surplusOrders[id]; !ok || o.w != w {
+		c.surplusOrders[id] = surplusOrder{w: w, prevW: o.w, at: now}
+	}
+}
+
+// surplusOrderAdjustW is what surplus adds to the closure's EV readings so
+// it counts each charger at what the meter may show of our orders, and the
+// raise this loadpoint has on its way (0 for none). A raise counts at its
+// order until a reading shows it: the meter shows its room as export until
+// it lands, then the draw while the reading still lags, so only import
+// lowers it. A charger ordered off counts at 0: its reading still shows the
+// draw after the stop has landed. A smaller cut keeps the reading, which
+// shows the draw the meter still has until the cut lands.
+func (c *Controller) surplusOrderAdjustW(now time.Time, id string) (adjW, raisingW float64) {
+	for _, st := range c.manager.States() {
+		o, ok := c.surplusOrders[st.ID]
+		if !st.PluggedIn || !ok || !finite(st.CurrentPowerW) {
+			continue
+		}
+		reading, order := math.Max(0, st.CurrentPowerW), math.Max(0, o.w)
+		if reading < (math.Max(0, o.prevW)+order)/2 {
+			o.below = true
+		} else if o.below {
+			o.shown = true
+		}
+		c.surplusOrders[st.ID] = o
+		if order > o.prevW && !o.shown && now.Sub(o.at) < surplusRaiseSettle {
+			adjW += order - reading
+			if st.ID == id {
+				raisingW = order
+			}
+			continue
+		}
+		if order == 0 {
+			adjW -= reading // A charger ordered off is leaving.
+		}
+	}
+	return adjW, raisingW
+}
+
 // pickSurplusSteps returns the step set surplus_only should snap to
-// for this loadpoint. Default is 3Φ-eligible only (the no-flap rule);
-// when the day's peak forecast surplus can't sustain a 3Φ minimum,
-// we fall back to all allowed steps and STICK there for the session
-// — re-upgrading would just cycle the contactor when clouds shift.
+// for this loadpoint. Default is 3Φ-eligible only: three phases from 6 A
+// each. Below that minimum surplus may use all allowed steps, so one
+// phase. A switch either way holds for phaseSwitchMinHold, or the
+// contactor cycles when clouds shift.
 //
 // `now` is the dispatch tick's time, threaded down from Tick →
 // computeSurplusCmd / wake-kick so day-rollover unlock + lock-set
@@ -2048,10 +2126,22 @@ func (c *Controller) computeSurplusCmd(now time.Time, lpCfg Config, wantW float6
 // can drive it deterministically.
 func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 	if c == nil {
-		return surplus3PhaseSteps(lpCfg)
+		return surplus3PhaseSteps(lpCfg, SiteFuse{})
 	}
-	steps3 := surplus3PhaseSteps(lpCfg)
-	minStep3 := smallestNonZero(steps3)
+	if len(lpCfg.AllowedStepsW) == 0 {
+		// No step table, no one-phase ladder to fall back to: a one-phase
+		// order would cap the charger under its minimum. The charger holds
+		// three phases, through a pause too, and a one-phase lock from
+		// before the table went is cleared. A pin still wins.
+		c.phaseLockMu.Lock()
+		delete(c.phaseLocked1P, lpCfg.ID)
+		delete(c.phaseLockedAt, lpCfg.ID)
+		c.selectPhaseLocked3P(lpCfg.ID, now)
+		c.phaseLockMu.Unlock()
+		return nil
+	}
+	steps3 := surplus3PhaseSteps(lpCfg, c.siteFuse())
+	minStep3 := surplusMinStepW(lpCfg, steps3)
 
 	// 3Φ-only charger: an operator who pinned "3p" is telling us the
 	// wallbox can't fall back to single-phase (e.g. CTEK Chargestorm —
@@ -2069,6 +2159,10 @@ func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 		c.phaseLockMu.Unlock()
 		return steps3
 	}
+
+	// The surplus measured now. Each forecast below starts now, so its
+	// peak is never less than this.
+	live, liveOK := c.liveSurplusW(lpCfg.ID)
 
 	c.phaseLockMu.Lock()
 	locked := c.phaseLocked1P[lpCfg.ID]
@@ -2092,6 +2186,17 @@ func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 			return steps3
 		}
 	}
+	// Measured surplus above the 3Φ minimum ends the lock once it has
+	// held for phaseSwitchMinHold. Three phases then hold as long.
+	if locked && minStep3 > 0 && liveOK && live >= minStep3 && now.Sub(lockedAt) >= phaseSwitchMinHold {
+		delete(c.phaseLocked1P, lpCfg.ID)
+		delete(c.phaseLockedAt, lpCfg.ID)
+		c.selectPhaseLocked(lpCfg.ID, true, now)
+		c.phaseLockMu.Unlock()
+		slog.Info("loadpoint surplus_only unlocked: live surplus covers 3Φ",
+			"lp", lpCfg.ID, "live_surplus_w", live, "min_3p_step_w", minStep3)
+		return steps3
+	}
 	c.phaseLockMu.Unlock()
 
 	if locked {
@@ -2113,26 +2218,17 @@ func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 	// Gated on "no prior decision" so we don't flap mid-session: once
 	// we've committed to a phase, the dwell-hold + forecast logic
 	// downstream keep us there for the session.
-	if minStep3 > 0 && c.siteSurplusForEVW != nil {
+	if liveOK && live >= minStep3 {
 		c.phaseLockMu.Lock()
 		_, hasPrev := c.phaseSelected3P[lpCfg.ID]
+		if !hasPrev {
+			c.selectPhaseLocked(lpCfg.ID, true, now)
+		}
 		c.phaseLockMu.Unlock()
 		if !hasPrev {
-			if liveSurplus, ok := c.siteSurplusForEVW(); ok &&
-				!math.IsNaN(liveSurplus) && !math.IsInf(liveSurplus, 0) &&
-				liveSurplus >= minStep3 {
-				c.phaseLockMu.Lock()
-				if c.phaseSelected3P == nil {
-					c.phaseSelected3P = map[string]bool{}
-					c.phaseSelectedAt = map[string]time.Time{}
-				}
-				c.phaseSelected3P[lpCfg.ID] = true
-				c.phaseSelectedAt[lpCfg.ID] = now
-				c.phaseLockMu.Unlock()
-				slog.Info("loadpoint surplus_only: 3Φ at session start (live surplus override)",
-					"lp", lpCfg.ID, "live_surplus_w", liveSurplus, "min_3p_step_w", minStep3)
-				return steps3
-			}
+			slog.Info("loadpoint surplus_only: 3Φ at session start (live surplus override)",
+				"lp", lpCfg.ID, "live_surplus_w", live, "min_3p_step_w", minStep3)
+			return steps3
 		}
 	}
 
@@ -2154,6 +2250,9 @@ func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 	if c.nearTermPeakSurplusW != nil {
 		const nearTermWindow = 30 * time.Minute
 		nearPeak, peakOK := c.nearTermPeakSurplusW(nearTermWindow)
+		if peakOK && liveOK && live > nearPeak {
+			nearPeak = live
+		}
 
 		c.phaseLockMu.Lock()
 		prevSelected3P, hasPrev := c.phaseSelected3P[lpCfg.ID]
@@ -2187,12 +2286,7 @@ func (c *Controller) pickSurplusSteps(now time.Time, lpCfg Config) []float64 {
 			recordDecision = selected3P != prevSelected3P
 		}
 		if recordDecision {
-			if c.phaseSelected3P == nil {
-				c.phaseSelected3P = map[string]bool{}
-				c.phaseSelectedAt = map[string]time.Time{}
-			}
-			c.phaseSelected3P[lpCfg.ID] = selected3P
-			c.phaseSelectedAt[lpCfg.ID] = now
+			c.selectPhaseLocked(lpCfg.ID, selected3P, now)
 		}
 		c.phaseLockMu.Unlock()
 
@@ -2224,6 +2318,9 @@ afterNearTerm:
 	if !ok {
 		return steps3
 	}
+	if liveOK && live > peak {
+		peak = live
+	}
 	if peak >= minStep3 {
 		return steps3
 	}
@@ -2238,8 +2335,12 @@ afterNearTerm:
 	if !lpCfg.SurplusOnly {
 		return lpCfg.AllowedStepsW
 	}
-	// Lock to 1Φ for the rest of the day.
+	// Lock to 1Φ for the rest of the day, once a 3Φ choice has held.
 	c.phaseLockMu.Lock()
+	if c.phaseSelected3P[lpCfg.ID] && now.Sub(c.phaseSelectedAt[lpCfg.ID]) < phaseSwitchMinHold {
+		c.phaseLockMu.Unlock()
+		return steps3
+	}
 	if c.phaseLocked1P == nil {
 		c.phaseLocked1P = map[string]bool{}
 		c.phaseLockedAt = map[string]time.Time{}
@@ -2289,6 +2390,18 @@ func (c *Controller) surplusLockedTo1P(id string) bool {
 	return c.phaseLocked1P[id]
 }
 
+// selectPhaseLocked3P records three phases as the session's phase choice.
+// Caller holds phaseLockMu.
+func (c *Controller) selectPhaseLocked3P(id string, now time.Time) {
+	if c.phaseSelected3P == nil {
+		c.phaseSelected3P = map[string]bool{}
+		c.phaseSelectedAt = map[string]time.Time{}
+	}
+	if !c.phaseSelected3P[id] {
+		c.phaseSelected3P[id], c.phaseSelectedAt[id] = true, now
+	}
+}
+
 // dwellSelectedPhaseMode returns the phase_mode string ("1p"/"3p")
 // implied by the near-term dwell selection for this loadpoint, or the
 // empty string when no dwell decision is on file (first-tick, fresh
@@ -2324,32 +2437,59 @@ func sameLocalDay(a, b time.Time) bool {
 	return la.Year() == lb.Year() && la.Month() == lb.Month() && la.Day() == lb.Day()
 }
 
-// surplus3PhaseSteps returns AllowedStepsW filtered down to entries
-// at or above the loadpoint's PhaseSplitW (default 3680 W) — i.e. the
-// steps the driver will deliver on 3Φ. 0 is always included so
-// "pause" is still a representable command.
+// surplus3PhaseSteps returns the steps the driver will deliver on 3Φ:
+// those planned charging gets, from 6 A on each phase. 3,680 W is 16 A on
+// one phase, not 5.3 A on three. 0 is always included so "pause" is still
+// a representable command.
 //
 // When PhaseMode is "1p" we don't filter — the operator explicitly
 // locked the install to 1Φ, so a 3Φ-only set would just wedge the
 // loadpoint at 0.
-func surplus3PhaseSteps(lpCfg Config) []float64 {
-	if lpCfg.PhaseMode == "1p" {
+func surplus3PhaseSteps(lpCfg Config, site SiteFuse) []float64 {
+	if lpCfg.PhaseMode == "1p" || len(lpCfg.AllowedStepsW) == 0 {
+		// Without a step table the charger takes any power from its
+		// minimum to its maximum, as SnapChargeW reads no steps.
 		return lpCfg.AllowedStepsW
 	}
-	split := lpCfg.PhaseSplitW
-	if split <= 0 {
-		split = defaultPhaseSplitW
+	return PlanningSteps(lpCfg, site)
+}
+
+// liveSurplusW is the EV-available surplus now, never above the average
+// the pause gate keeps: one high reading must not switch to three phases,
+// and a drop shows at once.
+func (c *Controller) liveSurplusW(id string) (float64, bool) {
+	if c.siteSurplusForEVW == nil {
+		return 0, false
 	}
-	out := []float64{0}
-	for _, s := range lpCfg.AllowedStepsW {
-		if s == 0 {
-			continue
-		}
-		if s >= split {
-			out = append(out, s)
-		}
+	w, ok := c.siteSurplusForEVW()
+	if !ok || !finite(w) {
+		return 0, false
 	}
-	return out
+	c.surplusMu.Lock()
+	defer c.surplusMu.Unlock()
+	if win := c.surplusWin[id]; win != nil && win.n > 0 {
+		w = math.Min(w, win.mean())
+	}
+	return w, true
+}
+
+// selectPhaseLocked records a surplus phase choice; phaseLockMu is held.
+func (c *Controller) selectPhaseLocked(id string, threePhase bool, now time.Time) {
+	if c.phaseSelected3P == nil {
+		c.phaseSelected3P = map[string]bool{}
+		c.phaseSelectedAt = map[string]time.Time{}
+	}
+	c.phaseSelected3P[id] = threePhase
+	c.phaseSelectedAt[id] = now
+}
+
+// surplusMinStepW is the least surplus may order: the smallest step, or
+// the charger's minimum when it has no step table.
+func surplusMinStepW(lpCfg Config, steps []float64) float64 {
+	if len(steps) == 0 {
+		return lpCfg.MinChargeW
+	}
+	return smallestNonZero(steps)
 }
 
 func smallestNonZero(steps []float64) float64 {
@@ -2493,7 +2633,8 @@ func (c *Controller) computeCommandForBudget(now time.Time, lpCfg Config, curren
 	}
 	if d.LoadpointFallback[lpCfg.ID] {
 		st, known := c.manager.State(lpCfg.ID)
-		if _, _, needed := DeadlineNeed(st); !known || !needed {
+		minW, maxW, steps := c.PlanningLimits(st)
+		if _, _, needed := DeadlineNeed(st, minW, maxW, steps); !known || !needed {
 			return 0, true, false
 		}
 	}

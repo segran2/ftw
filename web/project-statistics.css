@@ -38,7 +38,7 @@
 }
 .project-statistics-panel .project-statistics-error {
   margin: 12px 0 0;
-  color: var(--red-e);
+  color: var(--alarm);
 }
 .project-statistics-saved {
   margin: 0;

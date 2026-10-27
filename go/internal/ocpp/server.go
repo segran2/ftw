@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -64,15 +65,25 @@ type Server struct {
 	done     chan struct{}
 	doneV201 chan struct{}
 	stopOnce sync.Once
+	// profileSlots admits one unanswered charging profile per charger id;
+	// see attemptLimit.
+	profileMu    sync.Mutex
+	profileSlots map[string]chan struct{}
 }
 
-// Start brings up the OCPP CS on the configured bind:port. Returns
-// immediately once the listener is up; the WebSocket loop runs in its own
+// Start brings up the OCPP CS on the configured bind:port. It returns once
+// the ports have been found free; each WebSocket loop runs in its own
 // goroutine until ctx is cancelled or Stop() is called.
+//
+// An error means no charger can connect. A 2.0.1 port that cannot be opened
+// is logged instead, and the 1.6 listener still runs for the chargers that
+// dial it. Either way the reason is recorded as the last error of each
+// charger the site names, where its device status is read; a charger's first
+// message on the 1.6 listener clears it.
 //
 // The returned Server is the handle for shutdown — main.go is expected to
 // call Stop() during graceful drain.
-func Start(ctx context.Context, cfg *Config, tel *telemetry.Store) (*Server, error) {
+func Start(ctx context.Context, cfg *Config, tel *telemetry.Store) (_ *Server, err error) {
 	if cfg == nil {
 		return nil, errors.New("ocpp: nil config")
 	}
@@ -80,6 +91,27 @@ func Start(ctx context.Context, cfg *Config, tel *telemetry.Store) (*Server, err
 		return nil, errors.New("ocpp: nil telemetry store")
 	}
 	cfg.Defaults()
+	unreachable := func(err error) {
+		for _, id := range cfg.ApprovedIDs {
+			tel.RecordDriverError(id, err.Error())
+		}
+	}
+	defer func() {
+		if err != nil {
+			unreachable(err)
+		}
+	}()
+	if err := checkPort(cfg.Port); err != nil {
+		return nil, err
+	}
+	v201 := cfg.PortV201 > 0
+	if v201 {
+		if err := checkPort(cfg.PortV201); err != nil {
+			slog.Error("ocpp: 2.0.1 listener not started; chargers that dial it cannot connect", "port", cfg.PortV201, "err", err)
+			unreachable(err)
+			v201 = false
+		}
+	}
 
 	auth := newAuthorizer(cfg)
 	sockets := newSocketSessions()
@@ -104,10 +136,11 @@ func Start(ctx context.Context, cfg *Config, tel *telemetry.Store) (*Server, err
 
 	s := &Server{cfg: cfg, cs: cs, handler: h, sockets: sockets, done: make(chan struct{})}
 	h.identityProbe = s.requestBootNotification
+	h.later = sockets.later
 
 	// OCPP 2.0.1 on its own port, when configured. Same handler and therefore
 	// the same charger state and telemetry — only the message encoding differs.
-	if cfg.PortV201 > 0 {
+	if v201 {
 		wsServer201, err := newListener(cfg, auth, sockets)
 		if err != nil {
 			return nil, err
@@ -182,6 +215,18 @@ func Start(ctx context.Context, cfg *Config, tel *telemetry.Store) (*Server, err
 		s.Stop()
 	}()
 	return s, nil
+}
+
+// checkPort opens and closes port on every interface, as ws.Server.Start
+// does. That Start runs in a goroutine and, when its own listen fails,
+// returns with the error sent to a logger nobody reads, so a taken port has
+// to be found here or the chargers stay away with no reason given.
+func checkPort(port int) error {
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("ocpp: %w", err)
+	}
+	return l.Close()
 }
 
 // newListener builds one version's WebSocket server — TLS when configured —

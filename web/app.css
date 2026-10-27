@@ -209,7 +209,7 @@ body.ftw-app .icon-btn:hover {
 }
 body.ftw-app .icon-btn[aria-pressed="true"] {
   color: var(--fg);
-  background: oklch(0.3 0.1 var(--accent-hue) / 0.2);
+  background: color-mix(in oklab, var(--accent-e) 12%, transparent);
   border-color: var(--accent-e);
 }
 body.ftw-app .icon-btn[aria-pressed="true"]:hover {
@@ -346,7 +346,7 @@ body.ftw-app #overview-cars[hidden] {
   display: none !important;
 }
 body.ftw-app .overview-cars-age {
-  color: var(--amber);
+  color: var(--fg-dim);
   font-family: var(--mono);
   font-size: 11px;
 }
@@ -434,15 +434,15 @@ body.ftw-app .overview-health-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--red-e);
-  box-shadow: 0 0 0 3px color-mix(in oklch, var(--red-e) 14%, transparent);
+  background: var(--alarm);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--alarm) 14%, transparent);
 }
 body.ftw-app .overview-health.is-connected {
   color: var(--fg-dim);
 }
 body.ftw-app .overview-health.is-connected .overview-health-dot {
-  background: var(--green-e);
-  box-shadow: 0 0 0 3px color-mix(in oklch, var(--green-e) 14%, transparent);
+  background: var(--live);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--live) 14%, transparent);
 }
 body.ftw-app .section-kicker {
   margin: 0 0 3px;
@@ -746,10 +746,10 @@ body.ftw-app .val-import      { color: var(--red-e); }
 body.ftw-app .val-export      { color: var(--green-e); }
 body.ftw-app .val-generation  { color: var(--amber); }
 body.ftw-app .val-charging    { color: var(--cyan); }
-body.ftw-app .val-discharging { color: var(--cyan-dim); }
+body.ftw-app .val-discharging { color: var(--energy-gives); }
 body.ftw-app .val-neutral     { color: var(--fg); }
-body.ftw-app .val-ev-charging { color: var(--green-e); }
-body.ftw-app .val-ev-connected{ color: var(--amber); }
+body.ftw-app .val-ev-charging { color: var(--violet); }
+body.ftw-app .val-ev-connected{ color: var(--fg-dim); }
 
 /* Fuse — own row, one box per phase. */
 body.ftw-app .fuse-row {
@@ -814,7 +814,7 @@ body.ftw-app .fuse-phase-col .fuse-phase-w {
   padding: 0 4px;
 }
 body.ftw-app .fuse-phase-col .fuse-phase-w.export {
-  color: var(--cyan);
+  color: var(--green-e);
 }
 body.ftw-app .fuse-phase-box .fuse-phase-label {
   font-family: var(--mono);
@@ -857,11 +857,9 @@ body.ftw-app .fuse-fill {
   background: var(--green-e);
   transition: width 0.3s, background 0.3s;
 }
-body.ftw-app .fuse-phase-fill.warn,
-body.ftw-app .fuse-fill.warn { background: var(--amber); }
 body.ftw-app .fuse-phase-fill.crit,
-body.ftw-app .fuse-fill.crit { background: var(--red-e); }
-body.ftw-app .fuse-phase-fill.export { background: var(--cyan); }
+body.ftw-app .fuse-fill.crit { background: var(--alarm); }
+body.ftw-app .fuse-phase-fill.export { background: var(--green-e); }
 body.ftw-app .fuse-bar {
   /* Fallback single-bar track (used when the site meter doesn't
      report per-phase amperage). Same theme-aware background as the
@@ -1012,7 +1010,7 @@ body.ftw-app .history-toggle button {
   cursor: pointer;
   transition: color 220ms ease;
 }
-body.ftw-app .history-toggle button.active { color: #0a0a0a; }
+body.ftw-app .history-toggle button.active { color: var(--on-accent); }
 body.ftw-app .history-toggle button:not(.active):hover { color: var(--fg); }
 body.ftw-app .history-toggle button:focus-visible {
   outline: 1px solid var(--accent-e);
@@ -1167,7 +1165,7 @@ body.ftw-app .mode-buttons button:hover {
   color: var(--fg);
 }
 body.ftw-app .mode-buttons button.active {
-  background: oklch(0.3 0.1 var(--accent-hue) / 0.25);
+  background: color-mix(in oklab, var(--accent-e) 14%, transparent);
   border-color: var(--accent-e);
   color: var(--fg);
 }
@@ -1228,7 +1226,7 @@ body.ftw-app .plan-style-steps button:hover {
   color: var(--fg);
 }
 body.ftw-app .plan-style-steps button[aria-checked="true"] {
-  background: oklch(0.3 0.1 var(--accent-hue) / 0.35);
+  background: color-mix(in oklab, var(--accent-e) 18%, transparent);
   box-shadow: inset 0 0 0 1px var(--accent-e);
   color: var(--fg);
 }
@@ -1271,7 +1269,7 @@ body.ftw-app .plan-style-note .btn-link {
   font-size: 13px;
 }
 body.ftw-app .plan-style-status {
-  color: var(--red-e);
+  color: var(--alarm);
 }
 /* The numbers describe the plan that is still running until the new one
    lands, so they step back while the box replans. */
@@ -1465,8 +1463,7 @@ body.ftw-app .plan-horizon button {
 body.ftw-app .plan-horizon button:hover { color: var(--fg); }
 body.ftw-app .plan-horizon button.active {
   background: var(--accent-e);
-  /* On-accent text is near-black per the shared design system, never white. */
-  color: #0a0a0a;
+  color: var(--on-accent);
 }
 
 body.ftw-app .chart-title-row {
@@ -1637,8 +1634,8 @@ body.ftw-app .live-stat-value {
 }
 body.ftw-app .live-stat-value.is-import   { color: var(--red-e); }
 body.ftw-app .live-stat-value.is-export   { color: var(--green-e); }
-body.ftw-app .live-stat-value.is-charging { color: var(--accent-e); }
-body.ftw-app .live-stat-value.is-discharging { color: var(--blue-e, #60a5fa); }
+body.ftw-app .live-stat-value.is-charging { color: var(--cyan); }
+body.ftw-app .live-stat-value.is-discharging { color: var(--energy-gives); }
 body.ftw-app .live-stat-value.is-neutral { color: var(--fg-dim); }
 
 /* 24 h battery + SoC history block — sits below the live power chart.
@@ -1686,12 +1683,9 @@ body.ftw-app .range-buttons button:not(.active):hover {
   border-color: var(--fg-dim);
 }
 body.ftw-app .range-buttons button.active {
-  /* On-accent text per the shared design system is near-black, not white — so the
-     amber ON state is readable in both themes and stops looking
-     washed-out in light mode where the old oklch(0.15 …) barely
-     differed from pure black. */
+  /* The ON state is ink with --on-accent text, so it reads in both themes. */
   background: var(--accent-e);
-  color: #0a0a0a;
+  color: var(--on-accent);
   border-color: var(--accent-e);
   font-weight: 600;
 }
@@ -1831,8 +1825,8 @@ body.ftw-app .plan-state-badge {
   text-transform: uppercase;
 }
 body.ftw-app .plan-state-badge.is-active {
-  border-color: color-mix(in oklch, var(--green-e) 55%, var(--line));
-  color: var(--green-e);
+  border-color: color-mix(in oklab, var(--live) 55%, var(--line));
+  color: var(--live);
 }
 body.ftw-app .plan-state-badge.is-warn {
   border-color: color-mix(in oklch, var(--accent-e) 60%, var(--line));
@@ -2204,20 +2198,20 @@ body.ftw-app .btn-add:disabled {
   opacity: 0.75;
 }
 body.ftw-app .btn-remove {
-  color: var(--red-e);
+  color: var(--alarm);
   flex: 0 0 auto;
 }
 body.ftw-app .btn-remove:hover {
   background: transparent;
-  border-color: var(--red-e);
+  border-color: var(--alarm);
 }
 body.ftw-app .settings-status {
   color: var(--fg-muted);
   font-family: var(--mono);
 }
-body.ftw-app .settings-status.success { color: var(--green-e); }
-body.ftw-app .settings-status.warning { color: var(--amber); }
-body.ftw-app .settings-status.error { color: var(--red-e); }
+body.ftw-app .settings-status.success { color: var(--live); }
+body.ftw-app .settings-status.warning { color: var(--alarm); }
+body.ftw-app .settings-status.error { color: var(--alarm); }
 body.ftw-app .creds-badge {
   border-radius: 999px;
   font-family: var(--mono);
@@ -2226,9 +2220,9 @@ body.ftw-app .creds-badge {
   text-transform: uppercase;
 }
 body.ftw-app .creds-badge.creds-saved {
-  background: color-mix(in srgb, var(--green-e) 10%, transparent);
-  border-color: color-mix(in srgb, var(--green-e) 35%, transparent);
-  color: var(--green-e);
+  background: color-mix(in srgb, var(--live) 10%, transparent);
+  border-color: color-mix(in srgb, var(--live) 35%, transparent);
+  color: var(--live);
 }
 body.ftw-app .creds-badge.creds-missing {
   background: color-mix(in srgb, var(--accent-e) 10%, transparent);
@@ -2347,8 +2341,8 @@ body.ftw-app .drv-catalog-tag {
 /* Four of thirty-seven have run on customer hardware. That is the difference
    worth showing, so it is the only tag that carries colour. */
 body.ftw-app .drv-catalog-proven {
-  border-color: color-mix(in srgb, var(--green-e) 40%, transparent);
-  color: var(--green-e);
+  border-color: color-mix(in srgb, var(--live) 40%, transparent);
+  color: var(--live);
 }
 body.ftw-app .drv-catalog-unproven {
   border-color: color-mix(in srgb, var(--accent-e) 30%, transparent);
@@ -2449,10 +2443,10 @@ body.ftw-app .drv-editor-problem {
   text-align: left;
 }
 body.ftw-app .drv-editor-problem:hover { color: var(--fg); }
-body.ftw-app .drv-editor-error { border-left-color: var(--red-e); }
+body.ftw-app .drv-editor-error { border-left-color: var(--alarm); }
 body.ftw-app .drv-editor-warning { border-left-color: var(--accent-e); }
 body.ftw-app .drv-editor-clean {
-  color: var(--green-e);
+  color: var(--live);
   font-family: var(--mono);
   font-size: 0.72rem;
 }
@@ -2508,10 +2502,10 @@ body.ftw-app .driver-test-status {
   font-size: 0.75rem;
 }
 body.ftw-app .driver-test-status.ok {
-  color: var(--green-e);
+  color: var(--live);
 }
 body.ftw-app .driver-test-status.error {
-  color: var(--red-e);
+  color: var(--alarm);
 }
 body.ftw-app .driver-test-output {
   background: var(--ink-sunken);
@@ -2565,10 +2559,10 @@ body.ftw-app .v2x-command-status {
   min-height: 1em;
 }
 body.ftw-app .v2x-command-status.ok {
-  color: var(--green-e);
+  color: var(--live);
 }
 body.ftw-app .v2x-command-status.error {
-  color: var(--red-e);
+  color: var(--alarm);
 }
 @media (max-width: 720px) {
   body.ftw-app .v2x-control-panel {
@@ -2642,7 +2636,7 @@ body.ftw-app .driver-test-empty {
   font-size: 0.78rem;
 }
 body.ftw-app .driver-test-error {
-  color: var(--red-e);
+  color: var(--alarm);
   margin-top: 8px;
 }
 
@@ -2985,9 +2979,6 @@ html[data-theme="light"] body.ftw-app > header .icon-btn,
 html[data-theme="light"] body.ftw-app > header .settings-btn {
   color: var(--fg);
 }
-html[data-theme="light"] body.ftw-app .mode-buttons button.active {
-  background: oklch(0.75 0.14 var(--accent-hue) / 0.25);
-}
 html[data-theme="light"] body.ftw-app .status-bar {
   background: var(--ink-sunken);
 }
@@ -3072,7 +3063,7 @@ body.ftw-app .twin-profile-toggle button {
 
 body.ftw-app .twin-profile-toggle button.active {
   background: var(--accent-e);
-  color: #0a0a0a;
+  color: var(--on-accent);
 }
 
 body.ftw-app .twin-profile-toggle button:not(.active):hover {

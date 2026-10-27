@@ -238,15 +238,26 @@ func TestTLSMisconfigurationRefusesToStart(t *testing.T) {
 		{name: "cert without key", tls: &TLSConfig{CertFile: "cert.pem"}},
 		{name: "key without cert", tls: &TLSConfig{KeyFile: "key.pem"}},
 		{name: "cert file missing", tls: &TLSConfig{CertFile: "no-such-cert.pem", KeyFile: "no-such-key.pem"}},
+		{name: "cert does not load", tls: &TLSConfig{CertFile: unreadablePEM(t, "cert.pem"), KeyFile: unreadablePEM(t, "key.pem")}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &Config{Enabled: true, Bind: "127.0.0.1", Port: freePort(t), TLS: tc.tls}
 			if _, err := Start(context.Background(), cfg, telemetry.NewStore()); err == nil {
-				t.Fatal("a broken TLS config started anyway, serving plaintext")
+				t.Fatal("a broken TLS config started anyway")
 			}
 		})
 	}
+}
+
+// unreadablePEM writes a file that exists but holds no PEM block.
+func unreadablePEM(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestSchemeFollowsTLS(t *testing.T) {

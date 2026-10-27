@@ -36,7 +36,8 @@ func TestEVBatteryReliefRetentionRespectsEligibility(t *testing.T) {
 			case "no_order":
 				delete(state.batteryCommands, "first")
 			}
-			out := retainEVBatteryRelief([]DispatchTarget{{Driver: "first", TargetW: 0}}, map[string]float64{"first": -1745}, 1725, store, state)
+			sent(state, "ev", 10350, 10350)
+			out := clampEVBatteryHeadroom([]DispatchTarget{{Driver: "first", TargetW: 0}}, store, state, 17250)
 			want := 0.0
 			if mode == "healthy" {
 				want = -20

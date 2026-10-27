@@ -44,7 +44,7 @@
 //       { id: "bat-main", corner: "top-right",    title: "BATTERY",
 //         kw:  2.2, toHub: false, color: "var(--cyan)",  sub: "charging", soc: 78 },
 //       { id: "ev",       corner: "bottom-right", title: "EV CHARGER",
-//         kw:  3.7, toHub: false, color: "var(--green-e)", sub: "charging" },
+//         kw:  3.7, toHub: false, color: "var(--violet)", sub: "charging" },
 //     ],
 //   });
 
@@ -144,7 +144,7 @@ const ANGLE_BOTTOM_CENTER =  Math.PI / 2;
 const CORNER_PLACEHOLDER_COLOR = {
   "top-left":     "var(--amber)",
   "top-right":    "var(--cyan)",
-  "bottom-right": "var(--green-e)",
+  "bottom-right": "var(--violet)",
   "bottom-left":  "var(--red-e)",
 };
 const CORNER_PLACEHOLDER_ROLE = {
@@ -1167,8 +1167,8 @@ class FtwEnergyFlow extends FtwElement {
       <svg class="${this._svgClass()}" data-agg="${aggAttr}" viewBox="${P.vbX} 0 ${P.vbW} ${P.H}" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Energy flow">
         <defs>
           <radialGradient id="ef-hub" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stop-color="oklch(0.85 0.18 var(--accent-hue))" stop-opacity="0.55"/>
-            <stop offset="70%" stop-color="oklch(0.5 0.12 var(--accent-hue))" stop-opacity="0.04"/>
+            <stop offset="0%" stop-color="var(--hero-glow-a)" stop-opacity="0.55"/>
+            <stop offset="70%" stop-color="var(--hero-glow-a)" stop-opacity="0.04"/>
             <stop offset="100%" stop-color="transparent"/>
           </radialGradient>
           <filter id="ef-soft">
@@ -1568,7 +1568,7 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
   //  - "⚠ " prefix when the vehicle reading is stale (driver lost
   //    contact with the car for more than its stale_after_s window).
   //    Used to be "★ " — but "★" universally reads as "favourite",
-  //    the opposite of "degraded". A warning glyph + amber color
+  //    the opposite of "degraded". A warning glyph in --fg-dim
   //    matches the rest of the app's stale signalling.
   // When a charge-limit is also known, render as "24/50%" — no spaces
   // around the slash, the format reads as "current of limit".
@@ -1584,7 +1584,7 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
     const socBody = showLimit
       ? `${socPrefix}${Math.round(soc)}/${Math.round(chargeLimit)}%`
       : `${socPrefix}${Math.round(soc)}%`;
-    const fillColor = socStale ? "var(--stat-warn, #f59e0b)" : "var(--cyan)";
+    const fillColor = socStale ? "var(--fg-dim)" : "var(--cyan)";
     const titleAttr = socStale ? ` data-tooltip="Reading is stale (no recent contact with vehicle)"` : "";
     socText = `<text x="${x}" y="${y + socY}" text-anchor="middle"
              fill="${fillColor}" font-weight="600" class="sv-node-sub"${titleAttr}>${aggPrefix}${stalePrefix}${socBody}</text>`;
@@ -1621,14 +1621,15 @@ function renderCircleNode({ pos, title, nameLabel, value, sub, color, soc,
     </g>`;
 }
 
-// The overview stays quiet while FTW is in control. Core's warning draws an
-// amber triangle and its alarm a red disc; the whole bubble stays the target.
+// The overview stays quiet while FTW is in control. Core's warning draws a
+// triangle and its alarm a disc, both in the alarm colour; the whole bubble
+// stays the target.
 function renderControlMark(mark, x, y, r) {
   const alarm = mark.tone === 'alarm';
   const size = Math.max(7, Math.min(11, r * 0.15));
   const glyph = alarm
-    ? '<circle r="9" fill="var(--red-e)"/><path d="M0 -4.5 V1.2 M0 4.2 V4.4" stroke="var(--hero-box-fill)" stroke-width="2.2" stroke-linecap="round"/>'
-    : '<path d="M0 -9 L9.5 7.5 H-9.5 Z" fill="var(--amber)" stroke-linejoin="round"/><path d="M0 -3.2 V1.8 M0 4.6 V4.8" stroke="var(--hero-box-fill)" stroke-width="2" stroke-linecap="round"/>';
+    ? '<circle r="9" fill="var(--alarm)"/><path d="M0 -4.5 V1.2 M0 4.2 V4.4" stroke="var(--hero-box-fill)" stroke-width="2.2" stroke-linecap="round"/>'
+    : '<path d="M0 -9 L9.5 7.5 H-9.5 Z" fill="var(--alarm)" stroke-linejoin="round"/><path d="M0 -3.2 V1.8 M0 4.6 V4.8" stroke="var(--hero-box-fill)" stroke-width="2" stroke-linecap="round"/>';
   return `<g class="ef-control-mark" data-tone="${escapeXml(mark.tone)}" transform="translate(${x + r * Math.SQRT1_2} ${y - r * Math.SQRT1_2}) scale(${size / 9})">
     <title>${escapeXml(mark.label)}</title>
     <circle r="12" fill="var(--hero-box-fill)"/>

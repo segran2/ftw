@@ -302,6 +302,20 @@ func probeCases() []fieldCase {
 		c.carPhases = 1
 		out = append(out, c)
 	}
+	for _, fuse := range []float64{16, 25} {
+		for _, ms := range []struct{ mode, steps string }{{"", "mixed"}, {"auto", "mixed"}, {"3p", "mixed"}, {"", "3p"}, {"auto", "3p"}} {
+			// The same car on a table with three-phase levels: the reserve
+			// orders one of them, as the plan does.
+			out = append(out, fieldCase{report: "probe", fuseA: fuse, mode: ms.mode, steps: ms.steps, timing: timingEasee, carPhases: 1, use: useNoPlan,
+				house: houseBalanced, houseName: "balanced"})
+		}
+	}
+	for _, steps := range []string{"mixed", "3p"} {
+		// A 2.3 kW one-phase car, below the charger's three-phase levels
+		// over three: marked, it is ordered three times its own level.
+		out = append(out, fieldCase{report: "car2300W", fuseA: 25, steps: steps, timing: timingFast, carPhases: 1, use: useNoPlan,
+			house: houseBalanced, houseName: "balanced", car: func(car *sitesim.Car) { car.MaxW = 2300 }})
+	}
 	c := helpReport(usePlanned, timingEasee)
 	c.houseStep = 30 * time.Minute
 	return append(out, c)
@@ -755,7 +769,8 @@ func runFieldCase(c fieldCase, trace func(string, ...any)) (*simSite, *fieldRun)
 		s.plan = f.plan.directive
 	case useNoPlan:
 		run, kettle = time.Hour, []time.Duration{20 * time.Minute}
-		svc := &mpc.Service{LoadpointStates: func() []loadpoint.State { return s.mgr.States() }}
+		svc := &mpc.Service{LoadpointStates: func() []loadpoint.State { return s.mgr.States() },
+			PlanningLimits: func(st loadpoint.State) (float64, float64, []float64) { return s.ctrl.PlanningLimits(st) }} // as main.go wires it
 		s.plan = func(now time.Time) (loadpoint.Directive, bool) {
 			d, ok := svc.SlotDirectiveAt(now)
 			return d.LoadpointDirective(), ok

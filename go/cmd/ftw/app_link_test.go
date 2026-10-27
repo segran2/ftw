@@ -11,6 +11,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/config"
 	"github.com/srcfl/ftw/go/internal/control"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
+	"github.com/srcfl/ftw/go/internal/mpc"
 	"github.com/srcfl/ftw/go/internal/state"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
@@ -467,5 +468,35 @@ func TestAnOfflineSiteMeterSendsNoPhases(t *testing.T) {
 
 	if got := site.Snapshot().GridPhaseA; got != [3]*float64{} {
 		t.Fatalf("an offline meter sent phases %v", got)
+	}
+}
+
+// One replan moves the plan's rev once, however many sessions read it. A
+// session that read the old plan just before another session counted the new
+// one must not count the old plan again when its turn comes.
+func TestPlanRevMovesOncePerReplanAcrossSessions(t *testing.T) {
+	svc := mpc.New(nil, nil, "SE3", mpc.Params{})
+	svc.InstallPlan(mpc.Plan{GeneratedAtMs: 1_760_000_000_000}, svc.Defaults, "")
+	plans := &appPlans{planner: svc}
+	if rev := plans.Rev(); rev != 1 {
+		t.Fatalf("first plan: rev %d, want 1", rev)
+	}
+
+	// The test holds the counter. A session that reads the plan before it
+	// takes the counter still has the old plan when it gets it.
+	plans.revMu.Lock()
+	slow := make(chan uint64)
+	go func() { slow <- plans.Rev() }()
+	time.Sleep(50 * time.Millisecond) // let the slow session reach the counter
+	svc.InstallPlan(mpc.Plan{GeneratedAtMs: 1_760_000_060_000}, svc.Defaults, "")
+	// Another session counts the replan, as its own Rev does under the lock.
+	plans.lastGen, plans.rev = 1_760_000_060_000, 2
+	plans.revMu.Unlock()
+
+	if rev := <-slow; rev != 2 {
+		t.Errorf("the slow session got rev %d for the replan, want 2", rev)
+	}
+	if rev := plans.Rev(); rev != 2 {
+		t.Errorf("the next read got rev %d with no replan since, want 2", rev)
 	}
 }

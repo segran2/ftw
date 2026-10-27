@@ -300,8 +300,9 @@ func (m *Manager) persistSession(id string) {
 }
 
 // observeConnectionProof handles a lost socket without inventing a cable
-// edge or refreshing the last physical observation. A fresh Boot alone must
-// not let an older manual Start follow an unidentified connection.
+// edge or refreshing the last physical observation. A fresh Boot alone does
+// not prove the same car. Charge now keeps its power and checks the next
+// hardware proof (restoreManualHoldForSession).
 func (m *Manager) observeConnectionProof(id string, generation uint64, unknown bool) {
 	m.sessionMu.Lock()
 	defer m.sessionMu.Unlock()

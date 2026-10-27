@@ -194,17 +194,20 @@ func commandAmps(cmd sentCommand) float64 {
 }
 
 // Simulatorprov 21 Oct 2026, case s5s: surplus only, 9.3 kW of surplus and
-// a plan that shows no PV. The day's 1p lock hands back every step, so 1p
+// a plan that shows no PV. The day's 1p lock handed back every step, so 1p
 // went out at 5,750 W with the 25 A fuse as its only limit: 25 A on one
-// phase of a 16 A charger. A one-phase charger left on an empty mode gets
-// the same lock and must keep its full 16 A.
+// phase of a 16 A charger. The surplus is above the three-phase minimum, so
+// a three-phase charger runs on three phases. A one-phase charger left on
+// an empty mode must keep its full 16 A.
 func TestSurplusOnePhaseOfferStaysWithinTheCharger(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		cfg  Config
+		name  string
+		cfg   Config
+		phase string
+		wantW float64
 	}{
-		{"16 A three-phase charger, auto", Config{MinChargeW: 4140, MaxChargeW: 11040, PhaseMode: "auto", AllowedStepsW: threePhaseSteps}},
-		{"16 A one-phase charger, empty mode", Config{MinChargeW: 1380, MaxChargeW: 3680, AllowedStepsW: onePhaseSteps}},
+		{"16 A three-phase charger, auto", Config{MinChargeW: 4140, MaxChargeW: 11040, PhaseMode: "auto", AllowedStepsW: threePhaseSteps}, "3p", 8970},
+		{"16 A one-phase charger, empty mode", Config{MinChargeW: 1380, MaxChargeW: 3680, AllowedStepsW: onePhaseSteps}, "1p", 3680},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.Local)
@@ -223,7 +226,6 @@ func TestSurplusOnePhaseOfferStaysWithinTheCharger(t *testing.T) {
 				samples[cfg.DriverName] = EVSample{Connected: true, RequestActive: true, PowerW: cmd.power}
 				now = now.Add(5 * time.Second)
 			}
-			onePhase := 0
 			for _, cmd := range sender.calls {
 				if cmd.action != "ev_set_current" {
 					continue
@@ -231,16 +233,13 @@ func TestSurplusOnePhaseOfferStaysWithinTheCharger(t *testing.T) {
 				if a := commandAmps(cmd); a > 16+1e-9 {
 					t.Fatalf("offer %+v is %.1f A per phase to a 16 A charger", cmd, a)
 				}
-				if cmd.phaseMode == "1p" {
-					onePhase++
-					if cmd.maxAmpsPerPhase > 16+1e-9 {
-						t.Fatalf("1p offer %+v allows %.1f A per phase", cmd, cmd.maxAmpsPerPhase)
-					}
+				if cmd.phaseMode == "1p" && cmd.maxAmpsPerPhase > 16+1e-9 {
+					t.Fatalf("1p offer %+v allows %.1f A per phase", cmd, cmd.maxAmpsPerPhase)
 				}
 			}
 			last, ok := lastSetCurrent(sender.calls)
-			if onePhase == 0 || !ok || last.phaseMode != "1p" || last.power != 3680 {
-				t.Fatalf("%d 1p offers, last %+v; want the 1p lock to charge at 3,680 W (16 A)", onePhase, last)
+			if !ok || last.phaseMode != tc.phase || last.power != tc.wantW {
+				t.Fatalf("last offer %+v; want %.0f W on %s", last, tc.wantW, tc.phase)
 			}
 		})
 	}

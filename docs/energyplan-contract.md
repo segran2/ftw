@@ -36,10 +36,11 @@ whose I/O exceeds the call deadline; a later call may start a fresh process.
 The handshake identifies the worker, its version, protocol range and features.
 Protocol compatibility and supported features govern use, not matching Core
 and Energyplan release numbers. Current features are `champion`,
-`forecast_reset`, `partial_slots`, `demand_charges`, `ev_duty` and
-`charging_periods` and `published_prices`; the worker also reports
-`forecast_protocol_version`.
-Core negotiates `charging_periods` before sending its optional fields.
+`forecast_reset`, `partial_slots`, `demand_charges`, `ev_duty`,
+`charging_periods`, `published_prices` and `hourly_import_caps`; the worker
+also reports `forecast_protocol_version`.
+Core negotiates `charging_periods` before sending its optional fields, and
+`hourly_import_caps` before sending `hourly_import_caps`.
 
 New optional request fields need capability negotiation or a paired update
 that preserves deployed clients. Unknown optimizer request fields are errors.
@@ -91,6 +92,31 @@ Multiple batteries keep their own limits. Current execution requires a common
 charge/discharge direction in each slot. Demand-charge windows use explicit
 UTC intervals and elapsed import from Core; Core owns local calendar and
 daylight-saving conversion.
+
+`hourly_import_caps` carries the owner's hourly import limit as a hard
+limit. Each entry is `{start_ms, end_ms, max_mean_w, elapsed_import_wh}`:
+one local clock hour as UTC milliseconds, the mean import the hour may hold
+in W, and the import in Wh the hour has already used before the plan starts
+(0 for later hours). Core sends one entry per clock hour that overlaps the
+plan, from the first slot's execution start to the horizon end; a
+daylight-saving day has 23 or 25. The hour in progress may start before the
+first slot and the last may end after the horizon; an entry outside the plan
+is ignored. Entries must not overlap, last 1 minute to 25 hours, and number
+at most 512. Import is `max(0, grid)` per pulse state: a duty slot imports
+`duty * max(0, grid on)` plus `(1 - duty) * max(0, grid off)`, at the cut
+points between the cars' duties. In every scenario, the plan's import inside
+an hour from execution start must not exceed
+`max_mean_w * hours - elapsed_import_wh`. In an hour where every car is off
+it may instead reach what the house alone imports there,
+`max(0, load_w + pv_w)` per slot with the battery idle, if that is more: Core
+cannot cut the house, but its live limit stops a car before the house.
+`max_mean_w` may be 0: the hour then has room for the house alone. The worker
+is stricter in one case: while a car pulses into solar surplus and the
+battery charges, it counts the car's on-step import plus the whole charge.
+The cap wins over EV goals, whose miss shows in
+`flex_shortfall_wh`. The plan reports each hour in
+`plan.hourly_import_caps` as `{start_ms, end_ms, import_wh, max_wh}` on the
+published forecast, `import_wh` including the elapsed part.
 
 Thermal, commercial and recourse inputs are unsupported. Protocol v1 has no
 per-phase electrical model, future connection windows or phase-switch schedule.
@@ -169,11 +195,12 @@ objective. Unknown bounds and gaps remain null. When executed pulse cost and
 the optimized cost model differ, report `feasible` and omit the cost bound.
 Core validates physical execution; it does not independently prove optimality.
 
-Current Core allows 500 ms for small plans and 5 s for larger plans or demand
-charges, with a 7 s transport timeout. It reduces the budget near the first
-slot's end and leaves 50 ms for validation/publication. These are compute and
-call budgets, not a proven wall-time SLA. Measure queueing, startup, decoding,
-solving, replay, encoding and Core validation separately when changing them.
+Current Core allows 500 ms for small plans and 5 s for larger plans, demand
+charges or hourly import caps, with a 7 s transport timeout. It reduces the
+budget near the first slot's end and leaves 50 ms for validation/publication.
+These are compute and call budgets, not a proven wall-time SLA. Measure
+queueing, startup, decoding, solving, replay, encoding and Core validation
+separately when changing them.
 
 A warm worker may keep one previous plan as a candidate. Before reuse it must
 match asset identities, advance time, rebuild energy from current measurements,

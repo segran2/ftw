@@ -28,6 +28,7 @@ type plantLine struct {
 	Mark    string                 `json:"mark"`
 	Event   json.RawMessage        `json:"event"`
 	PhaseA  [3]float64             `json:"phase_a"` // through each fuse, + into the site
+	PhaseW  [3]float64             `json:"phase_w"`
 	Fuse    *plantFuse             `json:"fuse"`
 	Devices map[string]plantDevice `json:"devices"`
 }
@@ -69,6 +70,9 @@ type ftwLoadpoint struct {
 		Known bool `json:"known"`
 	} `json:"charger"`
 	CommandedReason string `json:"commanded_reason"`
+	Manual          struct {
+		LimitReason string `json:"limit_reason"` // the clamp behind a limited Charge now
+	} `json:"manual"`
 	ControlFeedback struct {
 		Status   string `json:"status"` // following, not_following, limited...
 		Severity string `json:"severity"`
@@ -92,8 +96,10 @@ type sample struct {
 	Damage [3]float64
 	Blown  [3]bool
 	CarW   []float64 // by loadpoint, in lpIDs order
+	SiteW  float64   // through the fuses, + into the site
 	BatW   float64
 	Bat    plantDevice // the inverter
+	Bat2   plantDevice // the second, if any
 	Status *ftwStatus
 	LPs    []ftwLoadpoint
 }
@@ -165,7 +171,8 @@ func loadRun(dir string, meta map[string]any) (*runData, error) {
 			next++
 		}
 		s := &sample{T: l.T, PhaseA: l.PhaseA, Damage: l.Fuse.Damage, Blown: l.Fuse.Blown,
-			BatW: l.Devices["inverter"].BatteryW, Bat: l.Devices["inverter"]}
+			SiteW: l.PhaseW[0] + l.PhaseW[1] + l.PhaseW[2],
+			BatW:  l.Devices["inverter"].BatteryW, Bat: l.Devices["inverter"], Bat2: l.Devices["inverter2"]}
 		for _, id := range lpIDs {
 			if dev, ok := l.Devices[id]; ok {
 				s.CarW = append(s.CarW, dev.W)

@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,8 @@ type scenario struct {
 }
 
 var scenarios = []scenario{
+	{name: "s18-16", dir: "s18-car-first-battery-charge-16A", minutes: 8, short: true,
+		run: s18, judge: judgeS18},
 	{name: "s0-25", dir: "s0-idle-charger-25A", minutes: 5.1, short: true,
 		run: func(c *runCtx) (map[string]any, error) { return s0(c, 25, 60) }, judge: judgeS0},
 	{name: "s0b-25", dir: "s0b-idle-charger-default-hb-25A", minutes: 5.1,
@@ -38,8 +41,7 @@ var scenarios = []scenario{
 	{name: "s1-25", dir: "s1-chargenow-25A", minutes: 3.6, short: true,
 		run: func(c *runCtx) (map[string]any, error) { return s1(c, 25) }, judge: judgeS1},
 	{name: "s2-16", dir: "s2-export-16A", minutes: 3.1,
-		run: func(c *runCtx) (map[string]any, error) { return s2(c, 16) }, judge: judgeS2,
-		known: map[string]string{"car starts within 60 s": "export counted as import (review fuse finding 1), next beta"}},
+		run: func(c *runCtx) (map[string]any, error) { return s2(c, 16) }, judge: judgeS2},
 	{name: "s3-16", dir: "s3-step-16A", minutes: 6.7, short: true,
 		run: func(c *runCtx) (map[string]any, error) { return s3(c, 16) }, judge: judgeS3},
 	{name: "s3-25", dir: "s3-step-25A", minutes: 6.7, short: true,
@@ -49,11 +51,9 @@ var scenarios = []scenario{
 	{name: "s4b-25", dir: "s4b-unlock-nophase-25A", minutes: 3.6,
 		run: func(c *runCtx) (map[string]any, error) { return s4(c, 25, "") }, judge: judgeS4},
 	{name: "s5-25", dir: "s5-surplus-auto-25A", minutes: 5.2,
-		run: func(c *runCtx) (map[string]any, error) { return s5(c, 25, nil) }, judge: judgeS5,
-		known: map[string]string{"charges at least the minimum 90 % of the time": "surplus without allowed_steps_w never starts, loadpoint/controller.go surplus3PhaseSteps; next beta"}},
+		run: func(c *runCtx) (map[string]any, error) { return s5(c, 25, nil) }, judge: judgeS5},
 	{name: "s5s-25", dir: "s5s-surplus-auto-steps-25A", minutes: 5.2,
-		run: func(c *runCtx) (map[string]any, error) { return s5(c, 25, easeeSteps) }, judge: judgeS5,
-		known: map[string]string{"charges at least the minimum 90 % of the time": "phase mode auto stays on 1p under 9 kW surplus (R1); next beta"}},
+		run: func(c *runCtx) (map[string]any, error) { return s5(c, 25, easeeSteps) }, judge: judgeS5},
 	{name: "s6-25", dir: "s6-inverter-offline-25A", minutes: 7.7,
 		run: func(c *runCtx) (map[string]any, error) { return s6(c, 25) }, judge: judgeS6},
 	{name: "s7-25", dir: "s7-restart-25A", minutes: 23,
@@ -80,8 +80,7 @@ var scenarios = []scenario{
 	{name: "s12-20", dir: "s12-one-phase-night-20A", minutes: 57,
 		run: func(c *runCtx) (map[string]any, error) { return s12(c, 20) }, judge: judgeS12},
 	{name: "s13-25", dir: "s13-socket-reconnect-25A", minutes: 6,
-		run: func(c *runCtx) (map[string]any, error) { return s13(c, 25) }, judge: judgeS13,
-		known: map[string]string{"Charge now goes on after the charger returns": "a socket reconnect turns Charge now into a 0 W pause; srcfl/ftw#1788"}},
+		run: func(c *runCtx) (map[string]any, error) { return s13(c, 25) }, judge: judgeS13},
 	{name: "s15-25", dir: "s15-one-phase-charger-chargenow-25A", minutes: 4.6, short: true,
 		run: func(c *runCtx) (map[string]any, error) { return s15(c, 25) }, judge: judgeS15},
 	{name: "s15b-25", dir: "s15b-one-phase-charger-1p-25A", minutes: 4.6,
@@ -94,6 +93,11 @@ var scenarios = []scenario{
 		run: func(c *runCtx) (map[string]any, error) { return s15p(c, 25) }, judge: judgeS15p},
 	{name: "s14-25", dir: "s14-one-phase-car-25A", minutes: 22,
 		run: func(c *runCtx) (map[string]any, error) { return s14(c, 25) }, judge: judgeS14},
+	{name: "s16-25", dir: "s16-import-ceiling-idle-start-25A", minutes: 68,
+		run: func(c *runCtx) (map[string]any, error) { return s16(c, 25) }, judge: judgeS16},
+	{name: "s17-25", dir: "s17-two-equal-batteries-25A", minutes: 30,
+		run: func(c *runCtx) (map[string]any, error) { return s17(c, 25) }, judge: judgeS17,
+		tolerate: map[string]string{"Energyplan's plan moves the batteries half the time": "the day's prices: within the hour's wait the plan may keep both batteries idle for later, dearer hours"}},
 }
 
 // runCtx is where one scenario runs.
@@ -1022,5 +1026,240 @@ func judgeS15bat(d *runData) (metrics, []criterion) {
 		crit("car charging within 10 s of Charge now", le(start, 10)),
 		crit("fuse holds", !anyBlown(d.window(t0, t1))),
 		crit("over fuse - 1 A at most 3 s", longest <= 3),
+	}
+}
+
+// ---- 16. An idle car under the hour's import ceiling ----
+
+// localHour is the local clock hour that holds t, the hour Core's import
+// ceiling bills.
+func localHour(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
+}
+
+// s16 is the help report of 25 Oct 2026 (#1828): a 4.5 kW ceiling on each
+// clock hour's mean import, a house of 1.3 kW and Charge now on a car whose
+// minimum is 4 140 W. House and minimum are above the ceiling, so the car
+// can start only on the room the hour has saved, and the next hour stops it.
+// Core counts the part of an hour before its first reading at the ceiling,
+// so the run starts in an hour's first minutes or waits for :56 and runs
+// one whole clock hour after it. The battery is held idle at its floor so
+// that only the house and the car import.
+func s16(c *runCtx, fuse float64) (map[string]any, error) {
+	const ceilingW = 4500
+	if m := time.Now().Minute(); m >= 4 && m < 56 {
+		sleepS(time.Until(localHour(time.Now()).Add(56 * time.Minute)).Seconds())
+	}
+	var hour time.Time
+	idle := map[string]any{"direction": "idle", "power_w": 0, "hold_s": 1800}
+	err := with(c, stackSpec{fuseA: fuse, loadsW: [3]float64{433, 433, 434}, socPct: 5}, func(st *stack) error {
+		if err := st.post("/api/battery/manual_hold", idle, nil); err != nil {
+			return err
+		}
+		if err := st.post("/api/peak_import_ceiling", map[string]any{"peak_import_ceiling_w": ceilingW}, nil); err != nil {
+			return err
+		}
+		if err := st.plug(0); err != nil {
+			return err
+		}
+		st.mark("charge_now")
+		if err := st.chargeNow("garage", 16, "3p", 0); err != nil {
+			return err
+		}
+		if hour = localHour(time.Now()); time.Now().Minute() >= 30 {
+			hour = hour.Add(time.Hour)
+		}
+		end := hour.Add(63 * time.Minute)
+		for left := time.Until(end); left > 0; left = time.Until(end) {
+			sleepS(math.Min(left.Seconds(), 1200))
+			if err := st.post("/api/battery/manual_hold", idle, nil); err != nil {
+				return err
+			}
+		}
+		st.mark("end")
+		return nil
+	})
+	return map[string]any{"scenario": "s16", "fuse": fuse, "house_w": 1300, "ceiling_w": ceilingW,
+		"hour": float64(hour.Unix())}, err
+}
+
+func judgeS16(d *runData) (metrics, []criterion) {
+	ceiling, h1, t1 := d.metaF("ceiling_w"), d.metaF("hour"), d.marks["end"]
+	h2 := h1 + 3600
+	const minW = 4140
+	// Each clock hour's import through the fuses, over the part the house
+	// recorded. Core counts the rest at the ceiling, so the recorded part
+	// must hold it too.
+	wh, s := map[float64]float64{}, map[float64]float64{}
+	w := d.window(d.marks["charge_now"], t1)
+	for i := 1; i < len(w); i++ {
+		dt := w[i].T - w[i-1].T
+		k := h1 + 3600*math.Floor((w[i].T-h1)/3600)
+		wh[k] += math.Max(0, w[i].SiteW) * dt / 3600
+		s[k] += dt
+	}
+	means, worst := map[string]float64{}, 0.0
+	for k, sec := range s {
+		if sec < 60 {
+			continue
+		}
+		mean := wh[k] / sec * 3600
+		means[time.Unix(int64(k), 0).Format("15:04")] = math.Round(mean)
+		worst = math.Max(worst, mean)
+	}
+	start := d.firstT(h1, func(r *sample) bool { return carW(r, 0) >= 0.9*minW })
+	stop := d.firstT(h2, func(r *sample) bool { return carW(r, 0) < 0.1*minW })
+	// While the ceiling holds the idle car, from a minute into the hour to
+	// its start: the reason it gives.
+	heldEnd := h2
+	if start != nil {
+		heldEnd = h1 + *start - 5
+	}
+	held, says, fuseSays := 0, 0, 0
+	for _, r := range d.window(h1+60, heldEnd) {
+		if r.LPs == nil {
+			continue
+		}
+		lp := firstLP(r)
+		held++
+		switch {
+		case lp.CommandedReason == "import_limit" || lp.Manual.LimitReason == "import_limit":
+			says++
+		case lp.CommandedReason == "fuse_limit" || lp.Manual.LimitReason == "fuse_limit":
+			fuseSays++
+		}
+	}
+	m := metrics{"hour_means_w": means, "worst_hour_mean_w": math.Round(worst), "car_start_s_into_hour": roundp(start, 0),
+		"car_stop_s_after_hour": roundp(stop, 0), "held_samples": held, "import_limit_samples": says,
+		"fuse_limit_samples": fuseSays, "max_abs_i": round(maxOf(w, maxAbsI), 1)}
+	return m, []criterion{
+		crit("the car starts on the hour's room before :45", start != nil && *start < 45*60),
+		crit("every hour's import holds the ceiling", worst <= ceiling*1.01),
+		crit("the next hour stops the car within 60 s", le(stop, 60)),
+		crit("while held the car says import_limit, never fuse_limit", held > 0 && says >= held*9/10 && fuseSays == 0),
+		crit("fuse holds", !anyBlown(w)),
+	}
+}
+
+// ---- 17. Two equal batteries share the plan's total ----
+
+// s17 is Rann's site (#1814): two equal batteries at 74 % and 60 % that took
+// turns under the plan, one discharging while the other stood at 0 W.
+// Energyplan's plan puts each quarter's discharge on one battery; Core must
+// share it. Core DP plans one battery only, so this runs Energyplan, as a
+// beta box does. A 3 kW house with no PV. Over 48 h the plan keeps the
+// batteries for the dearest hours, often tomorrow's; over 6 h they hold
+// more than the house needs, so it discharges now. The run still waits up
+// to an hour for a quarter the plan discharges, then runs 15 min. It keeps
+// the plan's order for each battery every 30 s in plan.jsonl.
+func s17(c *runCtx, fuse float64) (map[string]any, error) {
+	err := with(c, stackSpec{fuseA: fuse, loadsW: [3]float64{1000, 1000, 1000}, socPct: 74, soc2Pct: 60,
+		engine: "energyplan", horizonH: 6}, func(st *stack) error {
+		f, err := os.Create(filepath.Join(st.rundir, "plan.jsonl"))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		// moving logs the plan's order for each battery now and says
+		// whether it moves them.
+		moving := func() bool {
+			var p struct {
+				Plan struct {
+					Actions []struct {
+						SlotStartMs   int64              `json:"slot_start_ms"`
+						SlotLenMin    float64            `json:"slot_len_min"`
+						StoragePowerW map[string]float64 `json:"storage_power_w"`
+					} `json:"actions"`
+				} `json:"plan"`
+			}
+			if st.get("/api/mpc/plan", &p) != nil {
+				return false
+			}
+			ms := time.Now().UnixMilli()
+			for _, a := range p.Plan.Actions {
+				if a.SlotStartMs <= ms && ms < a.SlotStartMs+int64(a.SlotLenMin*60000) {
+					b, _ := json.Marshal(map[string]any{"t": now(), "storage_power_w": a.StoragePowerW})
+					f.Write(append(b, '\n'))
+					return planMoves(a.StoragePowerW)
+				}
+			}
+			return false
+		}
+		sleepS(60)
+		for wait := time.Now().Add(time.Hour); !moving() && time.Now().Before(wait); {
+			sleepS(30)
+		}
+		st.mark("start")
+		for end := time.Now().Add(900 * time.Second); time.Now().Before(end); {
+			sleepS(30)
+			moving()
+		}
+		st.mark("end")
+		return nil
+	})
+	return map[string]any{"scenario": "s17", "fuse": fuse, "house_w": 3000, "soc_pct": []float64{74, 60}, "horizon_h": 6}, err
+}
+
+// planMoves is true when a plan's orders move the batteries 300 W or more.
+func planMoves(w map[string]float64) bool {
+	sum := 0.0
+	for _, v := range w {
+		sum += v
+	}
+	return math.Abs(sum) >= 300
+}
+
+func judgeS17(d *runData) (metrics, []criterion) {
+	t0, t1 := d.marks["start"], d.marks["end"]
+	w := d.window(t0, t1)
+	moving, shared := 0, 0
+	for _, r := range w {
+		a, b := r.Bat.BatteryW, r.Bat2.BatteryW
+		fleet := a + b
+		if math.Abs(fleet) < 500 {
+			continue
+		}
+		moving++
+		// Each takes at least a quarter of the fleet, the same way.
+		if a/fleet >= 0.25 && b/fleet >= 0.25 {
+			shared++
+		}
+	}
+	// The plan's order for each battery over the judged window.
+	polls, planned := 0, 0
+	readLines(filepath.Join(d.dir, "plan.jsonl"), func(b []byte) {
+		var l struct {
+			T             float64            `json:"t"`
+			StoragePowerW map[string]float64 `json:"storage_power_w"`
+		}
+		if json.Unmarshal(b, &l) != nil || l.T < t0-1 || l.T > t1 {
+			return
+		}
+		polls++
+		if planMoves(l.StoragePowerW) {
+			planned++
+		}
+	})
+	energyplan := false
+	if b, err := os.ReadFile(filepath.Join(d.dir, "ftw.log")); err == nil {
+		energyplan = strings.Contains(string(b), "Energyplan primary")
+	}
+	exercised := energyplan && polls > 0 && planned*2 >= polls
+	gap := func(r *sample) float64 { return r.Bat.SoCPct - r.Bat2.SoCPct }
+	var gap0, gap1, wait float64
+	if len(w) > 0 {
+		gap0, gap1, wait = gap(w[0]), gap(w[len(w)-1]), t0-d.samples[0].T
+	}
+	m := metrics{"moving_samples": moving, "shared_samples": shared, "samples": len(w),
+		"plan_polls": polls, "plan_moving_polls": planned, "energyplan": energyplan,
+		"wait_s": round(wait, 0), "soc_gap_start": round(gap0, 2), "soc_gap_end": round(gap1, 2),
+		"bat_w_mean": []float64{math.Round(meanOf(w, func(r *sample) float64 { return r.Bat.BatteryW })),
+			math.Round(meanOf(w, func(r *sample) float64 { return r.Bat2.BatteryW }))}}
+	return m, []criterion{
+		crit("Energyplan's plan moves the batteries half the time", exercised), // the setup
+		crit("each battery takes a quarter of the fleet's power 90 % of the time", moving > 0 && shared*10 >= moving*9),
+		// Shared by the energy each can still give, the fuller one gives more.
+		crit("the charge gap shrinks while the plan moves them", !exercised || gap1 < gap0-0.2),
+		crit("fuse holds", !anyBlown(w)),
 	}
 }

@@ -9,7 +9,8 @@ car on them. FTW talks to it over Modbus and OCPP as on a real site. Each
 scenario starts a fresh house and a fresh `state.db`, drives the house and
 FTW, and judges the run against fixed criteria from what flowed through the
 fuse (the house's record) and what FTW said (its API, once a second). FTW
-runs `planner_self` with the Core planner and SE3 prices.
+runs `planner_self` with SE3 prices and the Core planner, or Energyplan
+with `FTW_SITE_ENGINE=energyplan`, the engine a beta box runs.
 
 The house lives in device-simulator; this directory keeps only what is
 FTW's: the scenarios, FTW's configuration, the criteria and the pinned
@@ -32,6 +33,7 @@ make siterig-judge DIR=/tmp/ftw-site-123  # judge a recorded run again
 | `FTW_SITE_PORT_BASE` | first port on 127.0.0.1 (default 18700): the house on base+0..59, FTW on base+90 and +91 |
 | `FTW_SITE_SHARD` | `k/n`: shard k of n, for several machines |
 | `FTW_SITE_OUT` | run directories, `summary.md` and `summary.json` (default: a new temporary directory) |
+| `FTW_SITE_ENGINE` | the planner: `core` (default) or `energyplan`, the worker in `optimizer/native/bundle` |
 | `FTW_SITE_DEVSIM_SRC` | a device-simulator checkout at the pinned commit; without it the test clones the pin into the user cache |
 | `FTW_SITE_FTW_BIN`, `FTW_SITE_DEVSIM_BIN` | prebuilt binaries |
 | `FTW_SITE_CATALOG` | the fault catalog, for `TestCatalogCoverage` |
@@ -81,7 +83,7 @@ tick as 2 s more.
 | `s2-16` Charge now during export | 16 A, 1 A house, 7 kW PV, full battery: 9.1 A export per phase | car starts within 60 s (**known**: export counted as import); fuse holds | |
 | `s3-16`, `s3-25` Load step | car and a 3 kW battery hold charging, then 13 A (16 A) or 21 A (25 A) per phase for 180 s | fuse holds; over the limit at most 7 s after the step | yes |
 | `s4-25`, `s4b-25` Saved unlock | `surplus_unlock_bat_soc` 0.9 saved, not armed; Charge now 3p, and bare (s4b) | no stops; no offer drops to 0 W; full power over the last minute | |
-| `s5-25`, `s5s-25` Surplus only | 25 A, 9.3 kW surplus, `auto`; s5 without steps, s5s with Easee's | no offer above 16 A; fuse holds; only 6–16 A; ≥ 4 140 W 90 % of the time (**known** in both) | |
+| `s5-25`, `s5s-25` Surplus only | 25 A, 9.3 kW surplus, `auto`; s5 without steps, s5s with Easee's | no offer above 16 A; fuse holds; only 6–16 A; ≥ 4 140 W 90 % of the time | |
 | `s5t-25` Surplus with a goal | as s5s with a goal, 3.8 kW of export, a charger that switches phases | no offer above 16 A; fuse holds; ≥ 6 A on one phase 90 % of the time | |
 | `s6-25` Inverter offline | 1.5 kW PV, the inverter silent for 300 s | Home use shown and marked estimated throughout; measured before and after; never estimated while every driver reads | |
 | `s7-25` Restart | Charge now, 15 min, Core down 20 s, 420 s after | the day's Home use is kept; Home use back within 30 s; Charge now never below 4 140 W; full power within 420 s | |
@@ -92,9 +94,11 @@ tick as 2 s more.
 | `s10-25` Two chargers | `carport` 60 s late; cut 6 A and raise 16 A together | fuse holds; over the limit at most 3 s after the step | |
 | `s11-25` Pause, then restart | a charger applying 5 s late; Charge now 16 A, 0 W for 25 s, then 6 A | an offer within 60 s of the restart; over the limit at most 3 s; fuse holds | |
 | `s12-20` One-phase night | 3 × 20 A, house 1.6/1.7/2.3 A, a charger applying 40 s late, the field's step table on `auto`, a plan for 6.6 kWh by the first quarter hour 40 min out | fuse holds; planned charging never orders one phase; no order cut while every phase has room, unless the plan paused; 90 % of the plan by the ready time | |
-| `s13-25` Socket reconnect | Charge now 16 A, the charger's connection gone for 10 s | Charge now goes on after the charger returns (**known**: #1788); no unplug seen | |
+| `s13-25` Socket reconnect | Charge now 16 A, the charger's connection gone for 10 s | Charge now goes on after the charger returns; no unplug seen | |
 | `s15-25` One-phase charger, Charge now | 25 A, 3 A per phase, an Easee wired on L1 (6-16 A, steps to 3 680 W, no phase mode); Charge now on the phases `/api/loadpoints` reports, as the app sends it, 180 s | 16 A on L1 within 60 s; held 95 %; fuse holds; no `fuse_limit` | yes |
 | `s15b-25`, `s15c-25` | as s15, phase mode `1p` and `auto` | as s15 | |
 | `s15bat-16` One-phase charger, battery rising | 16 A, 3 A per phase, the s15 charger, battery at 50 % following its EMS 8 s late; PV 2.1 kW rising every 30 s (+2.5 kW, then 1.5 kW) so Core charges the battery in steps; Charge now 6 s after the second step, while the raise is on its way | the battery order rose over 1 150 W in the 20 s before (setup check); car charging within 10 s; fuse holds; over the limit at most 3 s | |
 | `s15p-25` One-phase charger, planned | as s15, a plan for 600 Wh by the first quarter hour 15 min out | fuse holds; 90 % of the plan by the ready time; never called not following | |
 | `s14-25` One-phase car | an 11 kW charger with a one-phase car, a plan it cannot meet, 20 min | 3.4–3.8 kW over the last 10 min; never called not following | |
+| `s16-25` Import ceiling | 25 A, house 1.3 kW, battery idle at its floor, `peak_import_ceiling_w` 4 500, Charge now 16 A: house and the car's 4 140 W minimum are above the ceiling. Starts in an hour's first minutes or waits for :56, then runs one whole clock hour and 3 min | the car starts on the hour's room before :45; every clock hour's recorded import averages at most the ceiling + 1 %; the next hour stops the car within 60 s; while held it says `import_limit` 90 % of the time and never `fuse_limit`; fuse holds | |
+| `s17-25` Two equal batteries | 25 A, house 3 kW, no PV, two hybrids with 10 kWh at 74 % and 60 %, Energyplan whatever `FTW_SITE_ENGINE` says (Core DP plans one battery), a 6 h horizon (over 48 h the plan keeps the batteries for tomorrow's dearer hours). Waits up to an hour for a quarter the plan discharges, then 15 min | Energyplan's plan moves the batteries in half the polls (setup; tolerated, the day's prices decide); while the fleet moves 500 W or more, each battery takes at least a quarter of it 90 % of the time; while the plan moves them, the charge gap shrinks by over 0.2 points; fuse holds | |

@@ -36,26 +36,26 @@ class FtwProgressBar extends FtwElement {
       transition: width 0.3s ease, background 0.25s ease;
       border-radius: inherit;
     }
-    .solid-ok       { background: var(--green-e); }
-    .solid-warn     { background: var(--amber); }
-    .solid-bad      { background: var(--red-e); }
+    .solid-ok       { background: var(--live); }
+    .solid-warn     { background: var(--fg-dim); }
+    .solid-bad      { background: var(--alarm); }
     .solid-neutral  { background: var(--fg-muted); }
 
     /* Gradient stops: reveal red→amber→green as the fill grows (ASC,
      * low=bad, high=good — SoC) or green→amber→red (DESC, low=good,
-     * high=bad — fuse/peak load). Uses the application functional tokens
-     * so the ramp flips correctly in the light theme. */
+     * high=bad — fuse/peak load). Uses the state tokens so the ramp flips
+     * correctly in the light theme. */
     .grad-asc {
       background: linear-gradient(90deg,
-        var(--red-e) 0%,
-        var(--amber) 30%,
-        var(--green-e) 60%);
+        var(--alarm) 0%,
+        var(--fg-dim) 30%,
+        var(--live) 60%);
     }
     .grad-desc {
       background: linear-gradient(90deg,
-        var(--green-e) 0%,
-        var(--amber) 60%,
-        var(--red-e) 85%);
+        var(--live) 0%,
+        var(--fg-dim) 60%,
+        var(--alarm) 85%);
     }
   `;
 

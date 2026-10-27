@@ -50,7 +50,7 @@ type ExternalOptimizer struct {
 	cfg            ExternalOptimizerConfig
 	transport      OptimizerTransport
 	timeBudget     func([]Slot, Params) time.Duration
-	prepareRequest func(context.Context, *externalRequest, Params) error
+	prepareRequest func(context.Context, *externalRequest, []Slot, Params) error
 }
 
 func NewExternalOptimizer(cfg ExternalOptimizerConfig) (*ExternalOptimizer, error) {
@@ -75,6 +75,8 @@ type externalRequest struct {
 	FlexLoads     []externalFlexLoad     `json:"flex_loads"`
 	ThermalLoads  []map[string]any       `json:"thermal_loads"`
 	DemandCharges []externalDemandCharge `json:"demand_charges,omitempty"`
+	// Sent only to a worker that announces hourly_import_caps.
+	HourlyImportCaps []externalImportCap `json:"hourly_import_caps,omitempty"`
 }
 
 type externalSettings struct {
@@ -129,6 +131,16 @@ type externalDemandCharge struct {
 	TopN       int                  `json:"top_n"`
 	AlreadyKW  []float64            `json:"already_kw,omitempty"`
 	Hours      []externalDemandHour `json:"hours,omitempty"`
+}
+
+// externalImportCap is one clock hour of the owner's import ceiling: the
+// plan's import in it may reach MaxMeanW over the hour less what the hour
+// had used before the plan starts.
+type externalImportCap struct {
+	StartMs         int64   `json:"start_ms"`
+	EndMs           int64   `json:"end_ms"`
+	MaxMeanW        float64 `json:"max_mean_w"`
+	ElapsedImportWh float64 `json:"elapsed_import_wh"`
 }
 
 type externalDemandHour struct {
@@ -213,7 +225,7 @@ func (o *ExternalOptimizer) Optimize(ctx context.Context, slots []Slot, p Params
 	}
 	request := o.buildRequest(slots, p)
 	if o.prepareRequest != nil {
-		if err := o.prepareRequest(ctx, &request, p); err != nil {
+		if err := o.prepareRequest(ctx, &request, slots, p); err != nil {
 			return Plan{}, fmt.Errorf("prepare optimizer request: %w", err)
 		}
 	}
@@ -668,6 +680,10 @@ func validatePlan(slots []Slot, p Params, plan *Plan, vehicleRules bool) error {
 	plan.LoadpointShortfallWh = deadlineShortfall
 	if math.Abs(plan.TotalCostOre-totalCost) > 0.1 {
 		return fmt.Errorf("total cost %.4f, want %.4f", plan.TotalCostOre, totalCost)
+	}
+	// Last, so an overrun hour is the only rule the plan breaks.
+	if err := validateImportHours(slots, p, plan.Actions); err != nil {
+		return &importHourOverrun{plan: *plan, err: err}
 	}
 	return nil
 }

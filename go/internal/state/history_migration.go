@@ -299,11 +299,11 @@ func (s *Store) mergeHistoricalSamples(ctx context.Context, samples []Sample, re
 	}
 	s.historyWriteMu.Lock()
 	defer s.historyWriteMu.Unlock()
-	tx, err := s.history.BeginTx(ctx, nil)
+	tx, end, err := s.beginHistoryWrite(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer end()
 	if err := s.insertSamplesAndHours(ctx, tx, rs); err != nil {
 		return err
 	}

@@ -73,7 +73,7 @@
       '<input type="number" min="0" step="100" class="drv-write-max" ' +
       'data-path="drivers.' + idx + '.config.write.max_w" value="' + escHtml(ceilingValue) + '" ' +
       'placeholder="e.g. 9000">' +
-      '<p class="drv-write-warning" style="color:var(--red-e);font-size:0.78rem;margin:6px 0 0" hidden></p>' +
+      '<p class="drv-write-warning" style="color:var(--alarm);font-size:0.78rem;margin:6px 0 0" hidden></p>' +
       '<p style="color:var(--text-dim);font-size:0.75rem;margin:8px 0 0">' +
       'On the pump itself: set the Local REST API to <strong>read/write</strong> (installer menu 7.5.15) and turn on the external Solar PV source — ' +
       '“<strong>Modbus TCP/IP Ext. (Solar PV)</strong>”, register 2107, in the pump’s <strong>solar electricity</strong> settings (menu 4.2.2; a plus function, added from installer menu 7.2.1 if the menu is missing). ' +
@@ -2202,15 +2202,15 @@
               var soc = res.body.soc_pct != null ? Math.round(res.body.soc_pct) + "%" : "?";
               var lim = res.body.charge_limit_pct != null ? Math.round(res.body.charge_limit_pct) + "%" : "?";
               var st = res.body.charging_state || "";
-              statusEl.style.color = "var(--green-e)";
+              statusEl.style.color = "var(--live)";
               statusEl.textContent = "✓ SoC " + soc + " · limit " + lim + (st ? " · " + st : "");
             } else {
-              statusEl.style.color = "var(--red-e)";
+              statusEl.style.color = "var(--alarm)";
               statusEl.textContent = "✗ " + ((res.body && res.body.error) || "verification failed");
             }
           }).catch(function (e) {
             if (statusEl) {
-              statusEl.style.color = "var(--red-e)";
+              statusEl.style.color = "var(--alarm)";
               statusEl.textContent = "✗ " + e.message;
             }
           }).finally(function () {
@@ -2233,7 +2233,7 @@
           function setStatus(msg, color) {
             if (statusEl) { statusEl.textContent = msg; statusEl.style.color = color || "var(--text-dim)"; }
           }
-          if (!name) { setStatus("Save the driver name first", "var(--red-e)"); return; }
+          if (!name) { setStatus("Save the driver name first", "var(--alarm)"); return; }
           setStatus("Opening MyUplink…");
           cbtn.disabled = true;
           var redirectURI = location.origin + "/api/oauth/myuplink/callback";
@@ -2243,13 +2243,13 @@
             .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
             .then(function (res) {
               if (!res.ok || !res.body || !res.body.authorize_url) {
-                setStatus("✗ " + ((res.body && res.body.error) || "could not start consent — save Client ID + Secret first"), "var(--red-e)");
+                setStatus("✗ " + ((res.body && res.body.error) || "could not start consent — save Client ID + Secret first"), "var(--alarm)");
                 return;
               }
               window.open(res.body.authorize_url, "_blank");
-              setStatus("Complete the consent in the new tab. If it returns here, reload; if not, paste the URL below.", "var(--green-e)");
+              setStatus("Complete the consent in the new tab. If it returns here, reload; if not, paste the URL below.", "var(--fg)");
             })
-            .catch(function (e) { setStatus("✗ " + e.message, "var(--red-e)"); })
+            .catch(function (e) { setStatus("✗ " + e.message, "var(--alarm)"); })
             .finally(function () { cbtn.disabled = false; });
         });
       });
@@ -2266,7 +2266,7 @@
             if (statusEl) { statusEl.textContent = msg; statusEl.style.color = color || "var(--text-dim)"; }
           }
           var url = input ? input.value.trim() : "";
-          if (!url) { setStatus("Paste the redirect URL first", "var(--red-e)"); return; }
+          if (!url) { setStatus("Paste the redirect URL first", "var(--alarm)"); return; }
           setStatus("Completing…");
           mbtn.disabled = true;
           apiFetch("/api/oauth/myuplink/exchange", {
@@ -2277,12 +2277,12 @@
             .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
             .then(function (res) {
               if (res.ok && res.body && res.body.status === "connected") {
-                setStatus("✓ Connected — reload to refresh the badge.", "var(--green-e)");
+                setStatus("✓ Connected — reload to refresh the badge.", "var(--live)");
               } else {
-                setStatus("✗ " + ((res.body && res.body.error) || "exchange failed"), "var(--red-e)");
+                setStatus("✗ " + ((res.body && res.body.error) || "exchange failed"), "var(--alarm)");
               }
             })
-            .catch(function (e) { setStatus("✗ " + e.message, "var(--red-e)"); })
+            .catch(function (e) { setStatus("✗ " + e.message, "var(--alarm)"); })
             .finally(function () { mbtn.disabled = false; });
         });
       });

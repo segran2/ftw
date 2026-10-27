@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-func TestLostHardwareProofPausesOldStartButAllowsANewExplicitStart(t *testing.T) {
+// A lost hardware proof is not an unplug. Start keeps its power until the
+// charger proves itself again; another session or other hardware pauses it.
+func TestLostHardwareProofKeepsStartUntilAnotherSessionProvesItself(t *testing.T) {
 	cfg := holdLoadpoint()
 	sender := &fakeSender{}
 	sample := EVSample{Connected: true, RequestActive: true, DeviceID: "easee:A", SessionID: "session-1"}
@@ -14,37 +16,86 @@ func TestLostHardwareProofPausesOldStartButAllowsANewExplicitStart(t *testing.T)
 	c := newTestController(t, []Config{cfg}, nil, samples, sender)
 	c.SetSiteFuse(SiteFuse{MaxAmps: 16, Voltage: 230, PhaseCnt: 3})
 	now := time.Now()
-	tick := func(want float64) {
+	tick := func(device, session string, want float64, unconfirmed bool) {
 		t.Helper()
+		sample.DeviceID, sample.SessionID = device, session
+		samples[cfg.DriverName] = sample
 		c.Tick(context.Background(), now)
 		now = now.Add(time.Second)
 		if last, ok := lastSetCurrent(sender.calls); !ok || last.power != want {
-			t.Fatalf("commands=%+v, want latest power %v", sender.calls, want)
+			t.Fatalf("%q/%q: commands=%+v, want latest power %v", device, session, sender.calls, want)
+		}
+		if state, _ := c.manager.State(cfg.ID); state.ManualRestoreUnconfirmed != unconfirmed {
+			t.Fatalf("%q/%q: unconfirmed=%v, want %v", device, session, state.ManualRestoreUnconfirmed, unconfirmed)
 		}
 	}
-	tick(0)
+	tick("easee:A", "session-1", 0, false)
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, Persistent: true})
-	tick(4140)
-	sample.DeviceID, sample.SessionID = "", ""
-	samples[cfg.DriverName] = sample
-	tick(0)
-	if state, _ := c.manager.State(cfg.ID); !state.ManualRestoreUnconfirmed {
-		t.Fatal("lost proof did not explain the pause")
-	}
-	tick(0)
-	if state, _ := c.manager.State(cfg.ID); !state.ManualRestoreUnconfirmed {
-		t.Fatal("a later unknown sample cleared the confirmation requirement")
-	}
-	// This request belongs to the currently unknown socket, not the older
-	// device. It works now and may acquire its first fresh hardware identity.
+	tick("easee:A", "session-1", 4140, false)
+	tick("", "", 4140, false)
+	tick("", "", 4140, false)
+	tick("easee:A", "session-1", 4140, false)
+	tick("", "", 4140, false)
+	tick("easee:A", "session-2", 0, true)
+	// A new Start belongs to the session now on the charger.
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, Persistent: true})
-	tick(4140)
-	sample.DeviceID, sample.SessionID = "easee:B", "session-2"
-	samples[cfg.DriverName] = sample
-	tick(4140)
-	if state, _ := c.manager.State(cfg.ID); state.ManualRestoreUnconfirmed {
-		t.Fatal("new explicit Start still asks for confirmation")
+	tick("easee:A", "session-2", 4140, false)
+	tick("", "", 4140, false)
+	tick("easee:B", "session-3", 0, true)
+}
+
+// A driver that reports its session late can come back with the hardware
+// but no session yet. The next session it reports must not inherit Start.
+func TestLostProofCannotHandStartToALateNewSession(t *testing.T) {
+	cfg := holdLoadpoint()
+	sender := &fakeSender{}
+	sample := EVSample{Connected: true, RequestActive: true, DeviceID: "easee:A", SessionID: "session-1"}
+	samples := map[string]EVSample{cfg.DriverName: sample}
+	c := newTestController(t, []Config{cfg}, nil, samples, sender)
+	c.SetSiteFuse(SiteFuse{MaxAmps: 16, Voltage: 230, PhaseCnt: 3})
+	now := time.Now()
+	tick := func(device, session string, want float64, unconfirmed bool) {
+		t.Helper()
+		sample.DeviceID, sample.SessionID = device, session
+		samples[cfg.DriverName] = sample
+		c.Tick(context.Background(), now)
+		now = now.Add(time.Second)
+		if last, ok := lastSetCurrent(sender.calls); !ok || last.power != want {
+			t.Fatalf("%q/%q: commands=%+v, want latest power %v", device, session, sender.calls, want)
+		}
+		if state, _ := c.manager.State(cfg.ID); state.ManualRestoreUnconfirmed != unconfirmed {
+			t.Fatalf("%q/%q: unconfirmed=%v, want %v", device, session, state.ManualRestoreUnconfirmed, unconfirmed)
+		}
 	}
+	tick("easee:A", "session-1", 0, false)
+	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, Persistent: true})
+	tick("easee:A", "session-1", 4140, false)
+	tick("", "", 4140, false)
+	tick("easee:A", "", 4140, false)
+	tick("easee:A", "session-1", 4140, false)
+	tick("", "", 4140, false)
+	tick("easee:A", "", 4140, false)
+	tick("easee:A", "session-2", 0, true)
+}
+
+// A kept Charge now leaves the saved record as it was, so a restart after a
+// socket drop restores it too.
+func TestChargeNowKeptAcrossReconnectSurvivesARestart(t *testing.T) {
+	store := &sessionMemory{data: map[string]string{}}
+	charging := EVSample{Connected: true, RequestActive: true, ConnectionGeneration: 1, DeviceID: "ocpp:A"}
+	samples := map[string]EVSample{"easee": charging}
+	c, sender := bootController(t, store, samples)
+	now := time.Now()
+	c.SetManualHold("garage", ManualHold{PowerW: 4140, Persistent: true})
+	tickWants(t, c, sender, now, 4140, false)
+	samples["easee"] = EVSample{ConnectionUnknown: true, ConnectionGeneration: 1}
+	tickWants(t, c, sender, now.Add(time.Second), 4140, false)
+	charging.ConnectionGeneration = 2
+	samples["easee"] = charging
+	tickWants(t, c, sender, now.Add(2*time.Second), 4140, false)
+
+	c, sender = bootController(t, store, samples)
+	tickWants(t, c, sender, now.Add(30*time.Second), 4140, false)
 }
 
 func TestLostHardwareProofKeepsExplicitPauseConfirmed(t *testing.T) {
@@ -350,7 +401,9 @@ func TestConcurrentSetAndClearPersistInControllerOrder(t *testing.T) {
 	}
 }
 
-func TestManualStartWithoutHardwareCannotFollowAnotherSocket(t *testing.T) {
+// A Start before the first hardware proof binds to the first proof, across a
+// reconnect too. Other hardware after a later reconnect pauses it.
+func TestManualStartBeforeHardwareProofSurvivesAReconnect(t *testing.T) {
 	cfg := holdLoadpoint()
 	sender := &fakeSender{}
 	sample := EVSample{Connected: true, RequestActive: true, ConnectionGeneration: 1}
@@ -358,29 +411,24 @@ func TestManualStartWithoutHardwareCannotFollowAnotherSocket(t *testing.T) {
 	c := newTestController(t, []Config{cfg}, nil, samples, sender)
 	c.SetSiteFuse(SiteFuse{MaxAmps: 16, Voltage: 230, PhaseCnt: 3})
 	now := time.Now()
-	tick := func(want float64) {
+	tick := func(generation uint64, device string, want float64, unconfirmed bool) {
 		t.Helper()
+		sample.ConnectionGeneration, sample.DeviceID = generation, device
+		samples[cfg.DriverName] = sample
 		c.Tick(context.Background(), now)
 		now = now.Add(time.Second)
 		if last, ok := lastSetCurrent(sender.calls); !ok || last.power != want {
-			t.Fatalf("commands=%+v, want %v", sender.calls, want)
+			t.Fatalf("socket %d %q: commands=%+v, want %v", generation, device, sender.calls, want)
+		}
+		if st, _ := c.manager.State(cfg.ID); st.ManualRestoreUnconfirmed != unconfirmed {
+			t.Fatalf("socket %d %q: unconfirmed=%v, want %v", generation, device, st.ManualRestoreUnconfirmed, unconfirmed)
 		}
 	}
-	tick(0)
+	tick(1, "", 0, false)
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, Persistent: true})
-	tick(4140)
-	sample.ConnectionGeneration = 2
-	samples[cfg.DriverName] = sample
-	tick(0)
-	if st, _ := c.manager.State(cfg.ID); !st.ManualRestoreUnconfirmed {
-		t.Fatal("new socket inherited unknown hardware Start")
-	}
-	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, Persistent: true})
-	tick(4140)
-	sample.DeviceID = "easee:A"
-	samples[cfg.DriverName] = sample
-	tick(4140)
-	if st, _ := c.manager.State(cfg.ID); st.ManualRestoreUnconfirmed {
-		t.Fatal("first proof on same socket invalidated explicit Start")
-	}
+	tick(1, "", 4140, false)
+	tick(2, "", 4140, false)
+	tick(2, "easee:A", 4140, false)
+	tick(3, "easee:A", 4140, false)
+	tick(4, "easee:B", 0, true)
 }

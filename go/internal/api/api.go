@@ -784,7 +784,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// storage: surface DB corruption-recovery events from this boot so a
 	// corrupt database is never a silent, blank-dashboard failure again.
 	if s.deps.State != nil {
-		storage := map[string]any{"state": "ok", "cache": "ok"}
+		storage := map[string]any{"state": "ok", "cache": "ok", "history": "ok"}
 		for _, ev := range s.deps.State.HealEvents() {
 			storage[ev.Tier] = ev.Action // "rebuilt" | "restored"
 			storage["last_event_ms"] = ev.AtMs
@@ -1714,6 +1714,9 @@ func (s *Server) handlePostConfigWith(w http.ResponseWriter, r *http.Request, re
 		// declared via DRIVER.config_secrets — keeps config-package
 		// catalog-agnostic.
 		restoreDriverConfigSecrets(&newCfg, s.deps.Cfg, s.driverSecretKeys())
+		// A reviewed draft must save exactly as reviewed; the next load
+		// fills its unset timings instead.
+		newCfg.Site.FillUnsetTimings()
 	}
 	s.deps.CfgMu.RUnlock()
 
@@ -1934,6 +1937,11 @@ func (s *Server) handleSetPeakImportCeiling(w http.ResponseWriter, r *http.Reque
 	s.deps.CtrlMu.Lock()
 	s.deps.Ctrl.PeakImportCeilingW = req.PeakImportCeilingW
 	s.deps.CtrlMu.Unlock()
+	// The plan spreads each hour's import under the ceiling; a new ceiling
+	// changes what the plan may deliver.
+	if s.deps.MPC != nil && req.PeakImportCeilingW != prevW {
+		s.deps.MPC.RequestReplan("import_ceiling_changed")
+	}
 	writeJSON(w, 200, map[string]any{"status": "ok", "peak_import_ceiling_w": req.PeakImportCeilingW})
 }
 

@@ -253,8 +253,8 @@ class FtwEnergyCake extends FtwElement {
   }
 
   _renderSlices(selfPct) {
-    // Two-slice donut. Self-consumption is the amber/accent slice
-    // because it's "yours"; import is the red/--red-e slice because
+    // Two-slice donut. Self-consumption is the ink/accent slice
+    // because it's "yours"; import is the grid slice because
     // it's the bit you'd want to shrink.
     const self = ringPath({
       startPct: 0,

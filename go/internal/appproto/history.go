@@ -14,10 +14,11 @@ import (
 // in package protocol, because FTW Cloud must compute the same tiles. This
 // file plans which tiles answer a query and reads them from the store.
 //
-// Power series are derived from the energy ledger: a bucket's mean power is
-// its energy divided by its width. That is an average, and it is presented as
-// one — the chunk carries its step, and the app labels it. Sub-bucket wiggles
-// are gone, which is the correct price for history that survives a restart.
+// A series holds a bucket's mean power: measured power for grid, PV and
+// battery, the energy ledger's consumer use for load (see appHistory in
+// cmd/ftw). That is an average, and it is presented as one — the chunk
+// carries its step, and the app labels it. Sub-bucket wiggles are gone,
+// which is the correct price for history that survives a restart.
 
 // HistoryProvider answers windows of stored series.
 //

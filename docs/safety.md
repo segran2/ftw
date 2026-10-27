@@ -59,6 +59,12 @@ current holds it back only while it is over the limit. Where the meter
 reports phase currents, they replace total import as the EVs' fuse check; a
 tariff import ceiling still applies.
 
+A phase's current takes its direction from the same phase's power. It
+counts as export only when that power shows it clearly and the phases'
+powers add up to the meter's total; otherwise it counts as import. An
+exporting phase is never cut for: less EV load would raise its export. A
+rise or start on it reads its current as it is, without its heat.
+
 The implementation and tests in [`go/internal/control`](../go/internal/control)
 are authoritative. Planner-side limits in [`go/internal/mpc`](../go/internal/mpc)
 reduce infeasible plans but do not

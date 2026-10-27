@@ -859,9 +859,9 @@
         button.mark { cursor: pointer; }
 
         /* An update waiting is an affordance — "something is downloadable,
-           open me" — so it fades to ask for attention. Blue keeps it clear
-           of every alarm colour in the palette; nothing is wrong. */
-        .mark.update { color: var(--cyan, #38bdf8); animation: fade 1.8s ease-in-out infinite; }
+           open me" — so it fades to ask for attention. Ink keeps it clear
+           of the alarm and of every energy colour; nothing is wrong. */
+        .mark.update { color: var(--fg, #eef3ff); animation: fade 1.8s ease-in-out infinite; }
 
         /* A degraded optimizer is a state, not an affordance: the planner
            has fallen back to the Go solver, which often needs no action.
@@ -869,14 +869,14 @@
            stay apart for an operator who cannot separate them by colour
            — the failure that got the old shared amber dot misread as an
            update icon in the field (#690, #693). */
-        .mark.warning { color: var(--amber, #f59e0b); animation: fade 1.8s ease-in-out infinite; }
+        .mark.warning { color: var(--fg-dim, #9aa5b8); animation: fade 1.8s ease-in-out infinite; }
 
         /* Nothing pending: the quiet "all good" light. Static, because a
            steady state should not compete with the two that want reading. */
-        .mark.ok { color: var(--green-e, #22c55e); }
+        .mark.ok { color: var(--live, #83f52c); }
 
         /* Connection lost outranks and replaces the others — see _render. */
-        .mark.offline { color: var(--red-e, #ef4444); }
+        .mark.offline { color: var(--alarm, #ff453a); }
 
         @keyframes fade {
           0%, 100% { opacity: 1; }
@@ -932,7 +932,7 @@
         .notes-link:hover { text-decoration: underline; }
         .err {
           margin-top: 0.75rem;
-          color: var(--red-e, #f87171); font-size: 0.85rem;
+          color: var(--alarm, #ff453a); font-size: 0.85rem;
         }
         .dim { color: var(--fg-dim, #a0a0a0); font-size: 0.8rem; }
         .cmd, code { font-family: var(--mono, ui-monospace, monospace); }

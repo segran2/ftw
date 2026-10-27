@@ -13,120 +13,19 @@ import (
 	ocpp201 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ws"
 
+	"github.com/srcfl/ftw/go/internal/ocpp/chargersocket"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
-// chargerSocket is the WebSocket client every test charger dials with. It
-// closes three races that ocpp-go v0.19.0's ws.Client has on close, each of
-// which has failed CI:
-//
-//   - Write checks the connection, then queues without a lock, while the write
-//     pump closes that queue on Stop. A server request answered as the charger
-//     stops sends on a closed channel and panics (#1712).
-//   - ocppj.Client.Stop installs its own disconnect handler while the write
-//     pump may be reading the old one after the server closed: a data race.
-//   - If the pump has already called the old handler, ocppj.Client.Stop waits
-//     for a call that never comes, and the package hits its timeout.
-//
-// It serializes Write with Stop, keeps the disconnect handler itself, and
-// passes a disconnect the pump has already reported to the handler Stop
-// installed. A Write while the server closes the socket can still meet the
-// first race; chargers therefore stop before the server, at cleanup.
-type chargerSocket struct {
-	*ws.Client
-
-	mu       sync.Mutex
-	stopping bool
-	onDown   func(error)
-	onUp     func()
-	// installed counts disconnect handlers; reportedTo is the one that was
-	// told of the current disconnect, 0 while connected.
-	installed, reportedTo int
-}
-
-func newChargerSocket(client *ws.Client) *chargerSocket {
-	s := &chargerSocket{Client: client}
-	// Set once, before the pumps start, so the library never sees a change.
-	client.SetDisconnectedHandler(s.disconnected)
-	client.SetReconnectedHandler(s.reconnected)
-	return s
-}
-
-func (s *chargerSocket) SetDisconnectedHandler(fn func(error)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.onDown = fn
-	s.installed++
-}
-
-func (s *chargerSocket) SetReconnectedHandler(fn func()) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.onUp = fn
-}
-
-func (s *chargerSocket) disconnected(err error) {
-	s.mu.Lock()
-	fn := s.onDown
-	s.reportedTo = s.installed
-	s.mu.Unlock()
-	if fn != nil {
-		fn(err)
-	}
-}
-
-func (s *chargerSocket) reconnected() {
-	s.mu.Lock()
-	fn := s.onUp
-	s.reportedTo = 0
-	s.mu.Unlock()
-	if fn != nil {
-		fn()
-	}
-}
-
-func (s *chargerSocket) Start(url string) error {
-	s.mu.Lock()
-	s.stopping, s.reportedTo = false, 0
-	s.mu.Unlock()
-	return s.Client.Start(url)
-}
-
-func (s *chargerSocket) Write(data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.stopping {
-		return errors.New("test charger is stopping")
-	}
-	return s.Client.Write(data)
-}
-
-func (s *chargerSocket) Stop() {
-	s.mu.Lock()
-	s.stopping = true
-	var missed func(error)
-	if s.reportedTo != 0 && s.reportedTo != s.installed {
-		missed, s.reportedTo = s.onDown, s.installed
-	}
-	s.mu.Unlock()
-	s.Client.Stop()
-	if missed != nil {
-		missed(nil)
-	}
-}
-
 func wsURL(port int) string { return fmt.Sprintf("ws://127.0.0.1:%d", port) }
 
-// dialChargePoint16 starts a 1.6 charge point on a chargerSocket. setup runs
-// before Start, to register handlers; client may carry credentials or TLS.
-// The stop it returns runs once and is also registered as cleanup, so a test
-// may disconnect on purpose.
+// dialChargePoint16 starts a 1.6 charge point on a chargersocket.Socket.
+// setup runs before Start, to register handlers; client may carry credentials
+// or TLS. The stop it returns runs once and is also registered as cleanup, so
+// a test may disconnect on purpose.
 func dialChargePoint16(t *testing.T, url, id string, client *ws.Client, setup func(ocpp16.ChargePoint)) (ocpp16.ChargePoint, func(), error) {
 	t.Helper()
-	if client == nil {
-		client = ws.NewClient()
-	}
-	cp := ocpp16.NewChargePoint(id, nil, newChargerSocket(client))
+	cp := chargersocket.ChargePoint16(id, client)
 	if setup != nil {
 		setup(cp)
 	}
@@ -140,7 +39,7 @@ func dialChargePoint16(t *testing.T, url, id string, client *ws.Client, setup fu
 // dialChargingStation201 is dialChargePoint16 for OCPP 2.0.1.
 func dialChargingStation201(t *testing.T, url, id string, setup func(ocpp201.ChargingStation)) (ocpp201.ChargingStation, func(), error) {
 	t.Helper()
-	cs := ocpp201.NewChargingStation(id, nil, newChargerSocket(ws.NewClient()))
+	cs := chargersocket.ChargingStation201(id, nil)
 	if setup != nil {
 		setup(cs)
 	}
@@ -156,9 +55,11 @@ func dialChargingStation201(t *testing.T, url, id string, setup func(ocpp201.Cha
 // after the chargers a test dials later.
 //
 // freePort hands back a port the kernel just released, and another socket can
-// take it before the library binds it. The library then gives up on that
-// listener without an error, so a listener goroutine that exits early means
-// the port was lost: try fresh ones.
+// take it before Start checks it, or between that check and the library's
+// bind. In the first case Start fails, or for 2.0.1 starts without that
+// listener; in the second the library gives up on the listener without an
+// error, so a listener goroutine that exits early means the port was lost.
+// Either way, try fresh ones.
 func startOCPP(t *testing.T, cfg Config, tel *telemetry.Store, v201 bool) *Server {
 	t.Helper()
 	const attempts = 5
@@ -169,10 +70,14 @@ func startOCPP(t *testing.T, cfg Config, tel *telemetry.Store, v201 bool) *Serve
 			c.PortV201 = freePort(t)
 		}
 		srv, err := Start(context.Background(), &c, tel)
+		var taken *net.OpError
+		if errors.As(err, &taken) && attempt < attempts {
+			continue // another test took the port after freePort gave it back
+		}
 		if err != nil {
 			t.Fatalf("start: %v", err)
 		}
-		if listening(t, srv) {
+		if (!v201 || srv.csms != nil) && listening(t, srv) {
 			t.Cleanup(srv.Stop)
 			return srv
 		}
@@ -216,23 +121,4 @@ func listening(t *testing.T, srv *Server) bool {
 		}
 	}
 	return true
-}
-
-// The write pump reports a server-side close to the handler of the moment.
-// When ocppj.Client.Stop installs its own handler after that, Stop must
-// still hear of the disconnect, once, or it waits forever.
-func TestChargerSocketPassesAMissedDisconnectToStop(t *testing.T) {
-	s := newChargerSocket(ws.NewClient())
-	var first, second int
-	s.SetDisconnectedHandler(func(error) { first++ })
-	s.disconnected(errors.New("server closed")) // as the write pump does
-	s.SetDisconnectedHandler(func(error) { second++ })
-	s.Stop()
-	s.Stop()
-	if first != 1 || second != 1 {
-		t.Fatalf("disconnect reached the first handler %d times and Stop's %d times, want once each", first, second)
-	}
-	if err := s.Write([]byte("[]")); err == nil {
-		t.Fatal("a stopped charger still wrote")
-	}
 }

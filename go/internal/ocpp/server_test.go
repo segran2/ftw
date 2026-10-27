@@ -1,7 +1,10 @@
 package ocpp
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +36,60 @@ func startServer(t *testing.T, tel *telemetry.Store, approved ...string) (int, *
 	t.Helper()
 	srv := startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", HeartbeatIntervalS: 60, ApprovedIDs: approved}, tel, false)
 	return srv.cfg.Port, srv
+}
+
+// A port another process holds fails Start, and each charger the site names
+// carries the reason in its health. The library gives up on the port inside
+// a goroutine and logs nowhere we read, so without this the chargers stay
+// away and nothing says why.
+func TestStartFailsWhenItsPortIsTaken(t *testing.T) {
+	taken := holdPort(t)
+	tel := telemetry.NewStore()
+	cfg := &Config{Enabled: true, Bind: "127.0.0.1", Port: taken, ApprovedIDs: []string{"garage"}}
+	if _, err := Start(context.Background(), cfg, tel); err == nil {
+		t.Fatalf("Start succeeded with port %d taken", taken)
+	} else if !strings.Contains(err.Error(), fmt.Sprint(taken)) {
+		t.Errorf("error %q does not name port %d", err, taken)
+	}
+	if h := tel.DriverHealth("garage"); h == nil || !strings.Contains(h.LastError, fmt.Sprint(taken)) {
+		t.Fatalf("the charger's health does not say why it cannot connect: %+v", h)
+	}
+}
+
+// A taken 2.0.1 port leaves the 1.6 listener running, so the chargers that
+// dial 1.6 are still steered. The reason stays on each charger that has not
+// connected.
+func TestATaken201PortLeavesThe16ListenerRunning(t *testing.T) {
+	taken := holdPort(t)
+	tel := telemetry.NewStore()
+	srv := startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", PortV201: taken, HeartbeatIntervalS: 60, ApprovedIDs: []string{"garage", "carport"}}, tel, false)
+	if srv.csms != nil {
+		t.Fatalf("a 2.0.1 listener started on taken port %d", taken)
+	}
+	cp, _, err := dialChargePoint16(t, wsURL(srv.cfg.Port), "garage", nil, nil)
+	if err != nil {
+		t.Fatalf("a 1.6 charger could not connect: %v", err)
+	}
+	if _, err := cp.BootNotification("Home", "Easee"); err != nil {
+		t.Fatal(err)
+	}
+	if h := tel.DriverHealth("garage"); h == nil || h.LastError != "" {
+		t.Errorf("the connected 1.6 charger still shows an error: %+v", h)
+	}
+	if h := tel.DriverHealth("carport"); h == nil || !strings.Contains(h.LastError, fmt.Sprint(taken)) {
+		t.Errorf("the charger that has not connected does not say why: %+v", h)
+	}
+}
+
+// holdPort takes a port on every interface until the test ends.
+func holdPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 func TestStopIsConcurrentAndIdempotent(t *testing.T) {

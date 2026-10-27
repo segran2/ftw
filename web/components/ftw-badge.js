@@ -36,24 +36,24 @@ class FtwBadge extends FtwElement {
       font-size: 0.65rem;
     }
     :host([status="ok"]) {
-      color: var(--green-e);
-      border-color: color-mix(in srgb, var(--green-e) 45%, transparent);
-      background: color-mix(in srgb, var(--green-e) 12%, var(--ink-raised));
+      color: var(--live);
+      border-color: color-mix(in srgb, var(--live) 45%, transparent);
+      background: color-mix(in srgb, var(--live) 12%, var(--ink-raised));
     }
     :host([status="warn"]) {
-      color: var(--amber);
-      border-color: color-mix(in srgb, var(--amber) 45%, transparent);
-      background: color-mix(in srgb, var(--amber) 12%, var(--ink-raised));
+      color: var(--alarm);
+      border-color: color-mix(in srgb, var(--alarm) 45%, transparent);
+      background: color-mix(in srgb, var(--alarm) 12%, var(--ink-raised));
     }
     :host([status="error"]) {
-      color: var(--red-e);
-      border-color: color-mix(in srgb, var(--red-e) 45%, transparent);
-      background: color-mix(in srgb, var(--red-e) 12%, var(--ink-raised));
+      color: var(--alarm);
+      border-color: color-mix(in srgb, var(--alarm) 45%, transparent);
+      background: color-mix(in srgb, var(--alarm) 12%, var(--ink-raised));
     }
     :host([status="info"]) {
-      color: var(--cyan);
-      border-color: color-mix(in srgb, var(--cyan) 45%, transparent);
-      background: color-mix(in srgb, var(--cyan) 12%, var(--ink-raised));
+      color: var(--fg-dim);
+      border-color: color-mix(in srgb, var(--fg-dim) 45%, transparent);
+      background: color-mix(in srgb, var(--fg-dim) 12%, var(--ink-raised));
     }
   `;
 

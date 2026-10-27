@@ -517,9 +517,9 @@ const (
 type Resolution string
 
 const (
-	// ResN1h comes from the hourly_rollup.
+	// ResN1h comes from the power_history.
 	ResN1h Resolution = "1h"
-	// ResN5m comes from the energy_ledger.
+	// ResN5m comes from the power_history.
 	ResN5m Resolution = "5m"
 )
 
