@@ -15,6 +15,8 @@ import (
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
 	types201 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 	"github.com/lorenzodonini/ocpp-go/ws"
+
+	"github.com/srcfl/ftw/go/internal/ocpp/chargersocket"
 )
 
 // DialOpts is how a simulated charge point reaches FTW.
@@ -87,7 +89,7 @@ func (s *Sim) Dial(opts DialOpts) error {
 		if opts.URL201 == "" {
 			return fmt.Errorf("%s needs a 2.0.1 URL", s.Model.ID)
 		}
-		cs := ocpp201.NewChargingStation(id, nil, client)
+		cs := chargersocket.ChargingStation201(id, client)
 		h := &handlers201{sim: s}
 		cs.SetProvisioningHandler(h)
 		cs.SetSmartChargingHandler(h)
@@ -100,7 +102,7 @@ func (s *Sim) Dial(opts DialOpts) error {
 		if opts.URL16 == "" {
 			return fmt.Errorf("%s needs a 1.6 URL", s.Model.ID)
 		}
-		cp := ocpp16.NewChargePoint(id, nil, client)
+		cp := chargersocket.ChargePoint16(id, client)
 		cp.SetCoreHandler(s)
 		cp.SetSmartChargingHandler(s)
 		cp.SetRemoteTriggerHandler(s)

@@ -51,9 +51,9 @@ function planetColor(role, watts, thresholdW) {
   }
   if (role === "pv") return isIdle(watts, thresholdW) ? "var(--fg-muted)" : "var(--amber)";
   if (role === "battery") {
-    return isIdle(watts, thresholdW) ? "var(--cyan)" : watts >= 0 ? "var(--green-e)" : "var(--red-e)";
+    return !isIdle(watts, thresholdW) && watts < 0 ? "var(--energy-gives)" : "var(--cyan)";
   }
-  if (role === "ev") return isIdle(watts, thresholdW) ? "var(--white-s)" : "var(--green-e)";
+  if (role === "ev") return isIdle(watts, thresholdW) ? "var(--white-s)" : "var(--violet)";
   return "var(--fg)";
 }
 
@@ -88,8 +88,8 @@ export function flowReadingsFromStatus(status, opts) {
     { text: `↑ ${formatEnergyToday(today, "export_wh", false)}`, color: "var(--green-e)", bold: true },
   ];
   const batDailyParts = [
-    { text: `↑ ${formatEnergyToday(today, "bat_charged_wh", false)}`, color: "var(--green-e)", bold: true },
-    { text: `↓ ${formatEnergyToday(today, "bat_discharged_wh", false)}`, color: "var(--red-e)", bold: true },
+    { text: `↑ ${formatEnergyToday(today, "bat_charged_wh", false)}`, color: "var(--cyan)", bold: true },
+    { text: `↓ ${formatEnergyToday(today, "bat_discharged_wh", false)}`, color: "var(--energy-gives)", bold: true },
   ];
 
   const gridW = num(status && status.grid_w);

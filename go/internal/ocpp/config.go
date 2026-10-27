@@ -94,11 +94,10 @@ func (t *TLSConfig) serverTLS() (*tls.Config, error) {
 	if !t.Enabled() {
 		return nil, errors.New("ocpp: tls needs both cert_file and key_file")
 	}
-	if _, err := os.Stat(t.CertFile); err != nil {
-		return nil, fmt.Errorf("ocpp: tls cert_file: %w", err)
-	}
-	if _, err := os.Stat(t.KeyFile); err != nil {
-		return nil, fmt.Errorf("ocpp: tls key_file: %w", err)
+	// ServeTLS loads the pair again inside the listener goroutine, where a
+	// failure stops the listener with no error anyone sees.
+	if _, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile); err != nil {
+		return nil, fmt.Errorf("ocpp: tls cert_file and key_file: %w", err)
 	}
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if t.ClientCAFile == "" {

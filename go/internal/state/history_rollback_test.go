@@ -182,8 +182,10 @@ func isHistoryTestWrite(query string) bool {
 	return strings.HasPrefix(q, "INSERT ") || strings.HasPrefix(q, "UPDATE ") || strings.HasPrefix(q, "DELETE ")
 }
 
-func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
-	for _, kind := range []string{"archive", "backfill", "completion"} {
+// Each writer that holds historyWriteMu around a transaction keeps it until
+// SQLite has rolled a cancelled transaction back.
+func TestHistoryWriterWaitsForCancelledRollback(t *testing.T) {
+	for _, kind := range []string{"archive", "backfill", "completion", "tick", "cold-hours", "import"} {
 		t.Run(kind, func(t *testing.T) {
 			s := freshStore(t)
 			if kind == "backfill" {
@@ -199,7 +201,7 @@ func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
 			if err := s.history.Close(); err != nil {
 				t.Fatal(err)
 			}
-			d := &slowHistoryRollbackDriver{started: make(chan struct{}), release: make(chan struct{})}
+			d := &slowHistoryRollbackDriver{blocked: make(chan struct{}), started: make(chan struct{}), release: make(chan struct{})}
 			name := fmt.Sprintf("maintenance-rollback-%s-%d", kind, time.Now().UnixNano())
 			sql.Register(name, d)
 			var err error
@@ -219,21 +221,40 @@ func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
 				case "backfill":
 					_, err := s.backfillSeriesHoursSnapshot(ctx, 64)
 					return err
+				case "tick":
+					_, err := s.recordHistoryBatch(ctx, "", "", &HistoryPoint{TsMs: seriesHourMs}, nil, nil, 0)
+					return err
+				case "cold-hours":
+					minute := BucketSummary{StartMS: seriesHourMs, ResolutionMS: ArchiveResolutionMS, FirstMS: seriesHourMs, LastMS: seriesHourMs, N: 1, Sum: 1200, Min: 1200, Max: 1200, Last: 1200}
+					return s.writeHourBuckets(ctx, map[string]*namedHour{"meter": {driver: "meter", metric: "pv_w", hour: seriesHourMs, sources: []BucketSummary{minute}}}, "plain-archive:rollback-test")
+				case "import":
+					return s.mergeHistoricalSamples(ctx, []Sample{{Driver: "meter", Metric: "pv_w", TsMs: seriesHourMs + 1000, Value: 1300}}, nil)
 				default:
 					return s.ensureSeriesHours(ctx)
 				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			d.armed.Store(true)
 			done := make(chan error, 1)
 			go func() { done <- run(ctx) }()
+			// Cancel once the write is under way, so the rollback held below
+			// is that write's. A deadline could land earlier, in a
+			// read that holds no writer mutex yet.
+			select {
+			case <-d.blocked:
+			case err := <-done:
+				t.Fatalf("the write ended before it wrote: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the write did not start")
+			}
+			cancel()
 			select {
 			case <-d.started:
 			case err := <-done:
-				t.Fatalf("maintenance ended before rollback: %v", err)
+				t.Fatalf("the write ended before rollback: %v", err)
 			case <-time.After(5 * time.Second):
-				t.Fatal("maintenance did not start rollback")
+				t.Fatal("the write did not start rollback")
 			}
 			waitCtx, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			lockErr := lockContext(waitCtx, s.historyWriteMu.TryLock)
@@ -245,13 +266,15 @@ func TestHistoryMaintenanceWaitsForCancelledRollback(t *testing.T) {
 			select {
 			case err = <-done:
 			case <-time.After(5 * time.Second):
-				t.Fatal("maintenance did not finish after rollback")
+				t.Fatal("the write did not finish after rollback")
 			}
 			if lockErr == nil {
-				t.Fatal("maintenance released the writer mutex before SQLite rollback finished")
+				t.Fatal("the write released the writer mutex before SQLite rollback finished")
 			}
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("cancelled maintenance: %v", err)
+			// The archive write also has its own 1 s limit, which a stalled
+			// test goroutine can let expire before it cancels.
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("cancelled write: %v", err)
 			}
 			if err := run(context.Background()); err != nil {
 				t.Fatalf("retry after rollback: %v", err)

@@ -393,11 +393,11 @@ func (s *Store) recordHistoryBatch(ctx context.Context, batchID, payloadHash str
 
 	s.historyWriteMu.Lock()
 	defer s.historyWriteMu.Unlock()
-	tx, err := s.history.BeginTx(ctx, nil)
+	tx, end, err := s.beginHistoryWrite(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer end()
 	seq, skipped, err := s.writeHistoryBatchTx(ctx, tx, batchID, payloadHash, p, rs, observations)
 	if err != nil {
 		return 0, err
@@ -411,6 +411,27 @@ func (s *Store) recordHistoryBatch(ctx context.Context, batchID, payloadHash str
 		return 0, err
 	}
 	return seq, nil
+}
+
+// beginHistoryWrite begins a transaction on a connection of its own, for a
+// caller that holds historyWriteMu and calls end before it unlocks. A
+// cancelled Tx may report ErrTxDone before its automatic rollback releases
+// SQLite's writer. Closing the connection waits for that rollback, so the
+// next writer cannot read a snapshot and then fail its upgrade with BUSY.
+func (s *Store) beginHistoryWrite(ctx context.Context) (tx *sql.Tx, end func(), err error) {
+	conn, err := s.history.Conn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	tx, err = conn.BeginTx(ctx, nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return tx, func() {
+		_ = tx.Rollback()
+		_ = conn.Close()
+	}, nil
 }
 
 func ackHistoryReceipts(ctx context.Context, tx *sql.Tx, seq, acknowledgedSequence int64) error {

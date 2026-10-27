@@ -6,13 +6,27 @@
 
   var TOTAL_STEPS = 8;
   var currentStep = 1;
+  // A new box has no /api/auth/status until it first starts, so a missing
+  // one means this wizard claims it and asks for the house password. Run
+  // again from Settings, the box keeps the password it has.
+  var firstRun = false;
+  fetch('/api/auth/status', {cache: 'no-store'}).then(function (r) {
+    firstRun = r.status === 404;
+    // The answer can arrive after the last step is already on screen.
+    var step = document.getElementById('house-password-step');
+    if (step && currentStep === TOTAL_STEPS) step.hidden = !asksHousePassword();
+  }).catch(function () {});
+
+  function asksHousePassword() {
+    return firstRun && !window.FTWHomeAssistant;
+  }
 
   window.startAssistantSetup = async function () {
     var btn = document.getElementById('assistant-start');
     var note = document.getElementById('assistant-status');
 	var password = document.getElementById('assistant-password').value;
-	if (password.length < 10 || password !== document.getElementById('assistant-password-confirm').value) {
-	  note.textContent = 'Use at least 10 characters and enter the same house password twice.';
+	if (!password || password !== document.getElementById('assistant-password-confirm').value) {
+	  note.textContent = 'Enter the same house password twice.';
 	  return;
 	}
     btn.disabled = true;
@@ -826,7 +840,7 @@
       })
       .then(function (res) {
         if (!res.ok) {
-          statusEl.style.color = 'var(--red-e)';
+          statusEl.style.color = 'var(--alarm)';
           statusEl.textContent = (res.body && res.body.error) || 'Failed to load chargers';
           return;
         }
@@ -844,11 +858,11 @@
           sel.appendChild(opt);
         });
         group.style.display = 'block';
-        statusEl.style.color = 'var(--green-e)';
+        statusEl.style.color = 'var(--live)';
         statusEl.textContent = chargers.length + ' charger' + (chargers.length === 1 ? '' : 's') + ' found';
       })
       .catch(function (e) {
-        statusEl.style.color = 'var(--red-e)';
+        statusEl.style.color = 'var(--alarm)';
         statusEl.textContent = 'Error: ' + e.message;
       })
       .finally(function () {
@@ -926,6 +940,7 @@
     }
 
     document.getElementById('review-content').innerHTML = html;
+    document.getElementById('house-password-step').hidden = !asksHousePassword();
     document.getElementById('save-error').style.display = 'none';
     document.getElementById('save-actions').style.display = 'flex';
     document.getElementById('save-success').style.display = 'none';
@@ -940,10 +955,22 @@
     // hardware. The backend accepts this and runs with a no-op
     // control loop (no site meter to balance against).
     var btn = document.getElementById('save-btn');
+    var errEl = document.getElementById('save-error');
+    var cfg = buildConfig();
+    var asked = asksHousePassword();
+    if (asked) {
+      var password = document.getElementById('house-password').value;
+      if (!password || password !== document.getElementById('house-password-confirm').value) {
+        errEl.className = 'error-msg';
+        errEl.textContent = 'Choose a house password, and type the same one twice.';
+        errEl.style.display = 'block';
+        document.getElementById('house-password').focus();
+        return;
+      }
+      cfg.house_password = password;
+    }
     btn.disabled = true;
     btn.textContent = 'Saving...';
-
-    var cfg = buildConfig();
 
     fetch('/api/config', {
       method: 'POST',
@@ -955,6 +982,12 @@
         return r.json();
       })
       .then(function () {
+        if (asked) {
+          document.getElementById('house-password').value = '';
+          document.getElementById('house-password-confirm').value = '';
+          document.getElementById('save-success-password').hidden = false;
+        }
+        document.getElementById('house-password-step').hidden = true;
         document.getElementById('save-actions').style.display = 'none';
         document.getElementById('save-success').style.display = 'block';
         setTimeout(function () { window.location.href = '/'; }, 3000);
@@ -962,7 +995,6 @@
       .catch(function (err) {
         btn.disabled = false;
         btn.textContent = 'Start FTW';
-        var errEl = document.getElementById('save-error');
         errEl.className = 'error-msg';
         errEl.textContent = err.message;
         errEl.style.display = 'block';
@@ -1137,6 +1169,16 @@
     if (n > TOTAL_STEPS) return TOTAL_STEPS;
     return n;
   }
+
+  // A short house password is the owner's choice: a word, not a refusal.
+  [['assistant-password', 'assistant-password-hint'], ['house-password', 'house-password-hint']].forEach(function (ids) {
+    var input = document.getElementById(ids[0]);
+    var hint = document.getElementById(ids[1]);
+    input.addEventListener('input', function () {
+      var n = Array.from(input.value).length;
+      hint.textContent = n > 0 && n < 8 ? 'Short passwords are easy to guess. You can still use this one.' : '';
+    });
+  });
 
   document.getElementById('drv-ip').addEventListener('input', updateHostHint);
   document.getElementById('site-connection').addEventListener('change', chooseConnection);

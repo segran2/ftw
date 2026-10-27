@@ -337,3 +337,60 @@ func TestThePlanWithChargersVector(t *testing.T) {
 		t.Fatalf("plan bytes moved:\n got %s\nwant %s", got, planChargersVector)
 	}
 }
+
+// replanningChargers publishes a new plan on the box just before its first
+// read, as a replan can land while the box reads a plan for the wire.
+type replanningChargers struct {
+	box   *fakeBox
+	reads int
+}
+
+func (c *replanningChargers) PlanChargers(time.Time) []PlanCharger {
+	c.reads++
+	if c.reads == 1 {
+		c.box.replan(2, c.box.plan.GeneratedAtMs+60_000)
+	}
+	if c.box.planRev == 2 {
+		return []PlanCharger{{ID: "easee", PluggedIn: true, Windows: []PlanChargerWindow{{StartMs: 1, EndMs: 2, Wh: 7400}}, TotalWh: 7400}}
+	}
+	return []PlanCharger{{ID: "easee", Windows: []PlanChargerWindow{}}}
+}
+
+// A plan on the wire is one plan. Its rev, slots and chargers once came from
+// separate reads, and a replan between them sent the new plan's windows
+// under the old plan's rev (cmd/ftw TestAPlugInReachesAStreamingPhoneAsAPlan,
+// run 40115146270).
+func TestAReplanDuringTheReadSendsOnePlan(t *testing.T) {
+	clock := &fakeClock{uptimeMs: 60_000, now: time.UnixMilli(1_760_000_000_000)}
+	box := &fakeBox{identity: Identity{ID: "ftw-0001", Build: "test", TZ: "Europe/Stockholm"}}
+	box.replan(1, clock.now.UnixMilli())
+	chargers := &replanningChargers{box: box}
+	rec := &recorder{}
+	h, err := New(Config{
+		Clock: clock, Site: box, Info: box, Modes: box, Plans: box,
+		PlanChargers: chargers, Codec: testCodec{}, Sender: rec, Caller: ownerCaller(),
+		Grants: newGrants(), Commands: NewCmdLog(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(h.Close)
+
+	if err := h.sendPlan(nil); err != nil {
+		t.Fatal(err)
+	}
+	got := plans(rec)
+	if len(got) != 1 {
+		t.Fatalf("want one plan, got %d (%s)", len(got), rec.types())
+	}
+	p := body[Plan](t, got[0])
+	if len(p.Slots) == 0 {
+		t.Fatalf("plan rev %d has no slots", p.Rev)
+	}
+	if p.Rev != 2 || p.Slots[0].StartMs != box.plan.GeneratedAtMs {
+		t.Fatalf("plan rev %d with slots from %d, want rev 2 from %d", p.Rev, p.Slots[0].StartMs, box.plan.GeneratedAtMs)
+	}
+	if len(p.Chargers) != 1 || len(p.Chargers[0].Windows) != 1 {
+		t.Fatalf("chargers %+v, want the new plan's window", p.Chargers)
+	}
+}

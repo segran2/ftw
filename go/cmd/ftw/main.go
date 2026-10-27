@@ -54,6 +54,7 @@ import (
 	"github.com/srcfl/ftw/go/internal/drivers"
 	"github.com/srcfl/ftw/go/internal/events"
 	"github.com/srcfl/ftw/go/internal/forecast"
+	"github.com/srcfl/ftw/go/internal/ftwcli"
 	"github.com/srcfl/ftw/go/internal/gatewayidentity"
 	"github.com/srcfl/ftw/go/internal/ha"
 	"github.com/srcfl/ftw/go/internal/loadmodel"
@@ -325,6 +326,12 @@ func main() {
 			// Shift os.Args so the subcommand's flag.FlagSet sees its own flags.
 			runNovaClaim(os.Args[2:])
 			return
+		case "password":
+			// A container has no separate ftw command, so Core's own binary
+			// resets the house password: docker compose exec ftw /app/ftw
+			// password reset. It asks the running Core on loopback.
+			exitCode = ftwcli.Run(os.Args[1:], os.Stdout, os.Stderr)
+			return
 		}
 	}
 
@@ -402,6 +409,12 @@ func main() {
 	config.ManagedDriversDirOverride = filepath.Join(filepath.Dir(*configPath), "driver-repository", "active")
 
 	// ---- Load config ----
+	// Load reads settings from state.db, so heal a corrupt file first.
+	settingsHeal, err := config.HealSettingsDatabase(*configPath)
+	if err != nil {
+		slog.Error("heal settings database", "err", err)
+		os.Exit(1)
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		if isConfigMissing(*configPath) {
@@ -502,6 +515,9 @@ func main() {
 		slog.Error("open state", "err", err)
 		os.Exit(1)
 	}
+	if settingsHeal != nil {
+		st.RecordHealEvent(*settingsHeal)
+	}
 	if err := st.EnableHistoryAggregation(); err != nil {
 		slog.Error("enable history aggregation", "err", err)
 		os.Exit(1)
@@ -591,11 +607,9 @@ func main() {
 
 	// ---- Control state ----
 	ctrl := newControlStateFromConfig(cfg)
-	// Restore persisted mode + target if present. The planner variants
-	// have to be listed too — without them the strategy the user picked in
-	// the UI (planner_self / planner_cheap / planner_arbitrage) is silently
-	// dropped on restart and the dashboard appears to forget the selection.
-	restoreStoredMode(ctrl, st)
+	// Restore durable modes and targets. Forced Charge ends at restart;
+	// the planner makes a fresh plan instead of resuming that override.
+	restoreStoredMode(ctrl, st, cfg)
 	storedTrust, _ := st.LoadConfig(config.StateKeyForecastTrust)
 	storedExport, _ := st.LoadConfig(config.StateKeyBatteryExport)
 	storedSafetyK, _ := st.LoadConfig(config.StateKeySafetyK)
@@ -1150,7 +1164,7 @@ func main() {
 		ctrl.InverterGroups = inverterGroupsFrom(newCfg.Drivers)
 		ctrl.SupportsPVCurtail = supportsPVCurtailFrom(newCfg.Drivers)
 		ctrl.SolarFeedDrivers = solarFeedDriversFrom(newCfg.Drivers)
-		ctrl.DriverLimits = driverLimitsFrom(newCfg.ModbusControlDrivers(), newCfg.Batteries)
+		ctrl.DriverLimits = driverLimitsFrom(newCfg.ModbusControlDrivers(), newCfg.Batteries, newCfg.Planner)
 		// Fuse params + safety margin: previously startup-only.
 		// Hot-reload them so operators can tune the per-phase margin
 		// from the UI without restarting (e.g. raising it after the
@@ -1663,6 +1677,13 @@ func main() {
 			defer ctrlMu.Unlock()
 			return control.PhaseImbalanceW(tel, ctrl, timeout, time.Now())
 		}
+		// The planner keeps each clock hour under the owner's import
+		// ceiling, from the budget Core's live limit counts.
+		mpcSvc.ImportCeiling = func() mpc.ImportCeiling {
+			ctrlMu.Lock()
+			defer ctrlMu.Unlock()
+			return control.PlanningImportCeiling(ctrl)
+		}
 		// Cap planned export below the fuse when the operator set a site
 		// export ceiling, so the DP never schedules a discharge that would
 		// over-export and trip an inverter (the Ferroamp 0x8030 fault).
@@ -1701,6 +1722,11 @@ func main() {
 				}
 			}
 			return states
+		}
+		// The deadline reserve holds to the plan's limits. The controller
+		// reads them under its own locks; it is assigned further down.
+		mpcSvc.PlanningLimits = func(st loadpoint.State) (minW, maxW float64, steps []float64) {
+			return lpController.PlanningLimits(st)
 		}
 		mpcSvc.Loadpoints = func(slotLenMin int) []*mpc.LoadpointSpec {
 			specs := make([]*mpc.LoadpointSpec, 0)
@@ -1898,7 +1924,7 @@ func main() {
 			if ctx.Err() != nil {
 				return
 			}
-			_ = mpcSvc.Replan(ctx)
+			_ = mpcSvc.ReplanWithReason(ctx, "startup")
 			slog.Info("mpc: startup replan completed")
 		}()
 	}
@@ -2648,10 +2674,6 @@ func main() {
 	// bound at startup stays; no port gap for healthcheck probes.
 	apiHandler.Swap(handler)
 	slog.Info("HTTP API ready", "addr", httpSrv.Addr)
-	if err := trial.complete(selfUpdater); err != nil {
-		slog.Error("native trial readiness commit failed", "err", err)
-		os.Exit(1)
-	}
 	if trial == nil {
 		reconcileNativeFallback(nativeRoot, Version, selfUpdater)
 	}
@@ -2820,10 +2842,13 @@ func main() {
 
 	// ---- Control loop ----
 	controlInterval := time.Duration(cfg.Site.ControlIntervalS) * time.Second
+	if controlInterval <= 0 {
+		controlInterval = 2 * time.Second // same guard as the tick
+	}
 	// fuseMaxW is recomputed per tick from ctrl.SiteFuse* under ctrlMu —
 	// the config apply callback updates those fields directly, so a
 	// startup snapshot here would go stale on the first hot-reload.
-	dtS := float64(cfg.Site.ControlIntervalS)
+	dtS := controlInterval.Seconds()
 	// Every dispatch command carries its own deadline — see
 	// driverCommandTimeout for the stall it bounds.
 	driverCmdTimeout := driverCommandTimeout(controlInterval)
@@ -2837,13 +2862,6 @@ func main() {
 	ticker := time.NewTicker(controlInterval)
 	defer ticker.Stop()
 	var saveCount uint64
-	// Track FuseSaturated edge so we replan once when the joint allocator
-	// kicks in — the plan was made without knowledge of the live overage,
-	// and a replan with current EV/PV/load state usually finds a feasible
-	// schedule that doesn't fight the fuse.
-	var prevFuseSaturated bool
-	var lastFuseReplan time.Time
-	const fuseReplanCooldown = 60 * time.Second
 	var lastMissingPlanReplan time.Time
 	const missingPlanReplanCooldown = 5 * time.Second
 	// One-shot replan when the FIRST DerVehicle reading arrives. The
@@ -2862,6 +2880,32 @@ func main() {
 	const evStopReplanCooldown = 60 * time.Second
 	var staleDefaults staleSiteDefaultTracker
 	solarFeed := newSolarFeedSender()
+	// Every path out of a tick calls tickDone. The first one commits a native
+	// trial, so a release that cannot run its control loop is never committed.
+	// A tick blocked by a stale meter or by setup still counts.
+	tickSup := newTickSupervisor(time.Now(), controlInterval)
+	trialPending := true
+	tickDone := func() {
+		tickSup.beat(time.Now(), controlInterval)
+		if !trialPending {
+			return
+		}
+		trialPending = false
+		if err := trial.complete(selfUpdater); err != nil {
+			slog.Error("native trial readiness commit failed", "err", err)
+			os.Exit(1)
+		}
+	}
+	supCtx, stopSup := context.WithCancel(ctx)
+	defer stopSup()
+	go tickSup.run(supCtx, time.Second, time.Now, func() {
+		capMu.RLock()
+		observeOnlySnap := observeOnly
+		capMu.RUnlock()
+		sendDefaultsInParallel(reg.Names(), func(name string) {
+			sendDriverDefault(supCtx, srv, name, "control_tick_stalled", observeOnlySnap)
+		})
+	}, func() { os.Exit(1) })
 	for {
 		select {
 		case <-sigc:
@@ -2963,6 +3007,7 @@ func main() {
 				if _, err := persistTelemetryTick(st, tel, snapshotTickPersistControl(ctrl, ctrlMu), nowMs, watchdogTimeout, energyIdentity, forecastSettings.Snapshot()); err != nil {
 					slog.Warn("setup measurement persistence failed", "err", err)
 				}
+				tickDone()
 				continue
 			}
 			if watchdogTimeout <= 0 {
@@ -3064,6 +3109,7 @@ func main() {
 				if err != nil {
 					slog.Warn("tick persistence failed", "samples", sampleCount, "err", err)
 				}
+				tickDone()
 				continue
 			}
 
@@ -3136,19 +3182,23 @@ func main() {
 				evFuseDemands = lpController.FuseDemands()
 			}
 
-			ctrlMu.Lock()
-			ctrl.EVSurplusOnlyReserveW = evReserveW
-			ctrl.EVSurplusOnlyChargingW = evSurplusOnlyChargingW
-			ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
-			ctrl.BatteryBoostEVChargingW = boostEVW
-			ctrl.BatteryBoostReserveSoC = boostReserveSoC
-			ctrl.SetEVCommanded(lpStatesSnapshot)
-			ctrl.SetEVFuseDemands(evFuseDemands)
-			fuseMaxW := ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
-			targets := control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
-			planMissingNow := ctrl.Mode.IsPlannerMode() && ctrl.PlanStale
-			mode := ctrl.Mode
-			ctrlMu.Unlock()
+			var fuseMaxW float64
+			var targets []control.DispatchTarget
+			var planMissingNow bool
+			var mode control.Mode
+			withCtrlLock(ctrlMu, func() {
+				ctrl.EVSurplusOnlyReserveW = evReserveW
+				ctrl.EVSurplusOnlyChargingW = evSurplusOnlyChargingW
+				ctrl.EVCurtailHeadroomW = evCurtailHeadroomW
+				ctrl.BatteryBoostEVChargingW = boostEVW
+				ctrl.BatteryBoostReserveSoC = boostReserveSoC
+				ctrl.SetEVCommanded(lpStatesSnapshot)
+				ctrl.SetEVFuseDemands(evFuseDemands)
+				fuseMaxW = ctrl.SiteFuseAmps * ctrl.SiteFuseVoltage * float64(ctrl.SiteFusePhases)
+				targets = control.ComputeDispatch(tel, ctrl, capsSnap, fuseMaxW)
+				planMissingNow = ctrl.Mode.IsPlannerMode() && ctrl.PlanStale
+				mode = ctrl.Mode
+			})
 
 			// ---- Self-tune override: step one battery, hold its siblings at 0 ----
 			// Only the controllable battery pool is commanded, and the step
@@ -3156,9 +3206,9 @@ func main() {
 			finalTargets := targets
 			selfTuneName, selfTuneCmd, selfTuneActive := selfTune.CurrentCommand()
 			if selfTuneActive {
-				ctrlMu.Lock()
-				finalTargets = control.SelfTuneDispatch(tel, ctrl, capsSnap, fuseMaxW, selfTuneName, selfTuneCmd)
-				ctrlMu.Unlock()
+				withCtrlLock(ctrlMu, func() {
+					finalTargets = control.SelfTuneDispatch(tel, ctrl, capsSnap, fuseMaxW, selfTuneName, selfTuneCmd)
+				})
 			}
 			if troubleshootingMode {
 				gridW, haveGrid := troubleshootingGridW(tel, siteMeterDriver)
@@ -3248,28 +3298,12 @@ func main() {
 			// LP dispatch ran at the top of this tick — see the
 			// "EV dispatch first" block above.
 
-			// ---- Trigger MPC replan on fuse-saturation rising edge ----
-			// The joint allocator (control.dispatch) just throttled
-			// battery and EV to fit under the fuse. The plan was built
-			// without seeing this overage, so let MPC redraw with current
-			// state — usually it finds a slot allocation that doesn't
-			// require both battery charge and full-bore EV simultaneously.
-			ctrlMu.Lock()
-			fuseSatNow := ctrl.FuseSaturated
-			ctrlMu.Unlock()
-			if mpcSvc != nil && fuseSatNow && !prevFuseSaturated && time.Since(lastFuseReplan) > fuseReplanCooldown {
-				lastFuseReplan = time.Now()
-				go mpcSvc.Replan(ctx)
-				slog.Info("fuse-saturated → MPC replan triggered")
-			}
-			prevFuseSaturated = fuseSatNow
-
 			// Missing-plan retry: plans are in-memory only, so after an
 			// update/restart the first dispatch cycles can see nil/stale
 			// planner state. That must not wait for the normal 15 min
 			// interval; rebuild immediately, retrying briefly if prices /
 			// forecasts / telemetry were not ready during startup.
-			if mpcSvc != nil && planMissingNow && time.Since(lastMissingPlanReplan) > missingPlanReplanCooldown {
+			if missingPlanRetryDue(mpcSvc, planMissingNow, lastMissingPlanReplan, missingPlanReplanCooldown) {
 				lastMissingPlanReplan = time.Now()
 				go mpcSvc.ReplanWithReason(ctx, "missing_plan_retry")
 				slog.Info("missing MPC plan → replan triggered")
@@ -3341,6 +3375,7 @@ func main() {
 				}
 				modelsMu.Unlock()
 			}
+			tickDone()
 		}
 	}
 }
@@ -3628,12 +3663,23 @@ func driverCapacitiesFrom(drvList []config.Driver, loadpoints []config.Loadpoint
 	return out
 }
 
-// driverLimitsFrom gives dispatch the same per-driver limits as the planner.
-func driverLimitsFrom(drivers []config.Driver, batteries map[string]config.Battery) map[string]control.PowerLimits {
+// driverLimitsFrom gives dispatch the same per-driver power limits and charge
+// ceilings as the planner. Each battery's soc_max overrides the planner's.
+func driverLimitsFrom(drivers []config.Driver, batteries map[string]config.Battery, planner *config.Planner) map[string]control.PowerLimits {
+	ceiling := 1.0
+	if planner != nil && planner.SoCMax > 0 {
+		ceiling = planner.SoCMax
+	}
 	out := map[string]control.PowerLimits{}
 	for _, d := range drivers {
 		if !d.ObserveOnly {
-			out[d.Name] = batteryPowerLimits(d, batteries[d.Name])
+			limits := batteryPowerLimits(d, batteries[d.Name])
+			limits.SoCMax = ceiling
+			if b := batteries[d.Name]; b.SoCMax != nil {
+				limits.SoCMax = *b.SoCMax
+				limits.SoCMaxSet = true
+			}
+			out[d.Name] = limits
 		}
 	}
 	return out

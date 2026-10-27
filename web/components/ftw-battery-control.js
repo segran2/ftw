@@ -65,7 +65,7 @@ class FtwBatteryControl extends FtwElement {
     .seg-btn:hover { color: var(--fg); }
     .seg-btn.active {
       background: var(--accent-e);
-      color: #0a0a0a;
+      color: var(--on-accent);
     }
 
     .power-wrap {
@@ -119,7 +119,7 @@ class FtwBatteryControl extends FtwElement {
     }
     .chip.active {
       background: var(--accent-e);
-      color: #0a0a0a;
+      color: var(--on-accent);
       border-color: var(--accent-e);
     }
 
@@ -145,9 +145,9 @@ class FtwBatteryControl extends FtwElement {
     }
 
     .error {
-      background: color-mix(in srgb, var(--red-e) 12%, transparent);
-      border: 1px solid var(--red-e);
-      color: var(--red-e);
+      background: color-mix(in srgb, var(--alarm) 12%, transparent);
+      border: 1px solid var(--alarm);
+      color: var(--alarm);
       padding: 8px 12px;
       border-radius: 8px;
       font-size: 13px;
@@ -201,10 +201,10 @@ class FtwBatteryControl extends FtwElement {
       font-weight: 500;
       font-size: 14px;
       background: transparent;
-      color: var(--red-e);
-      border: 1px solid var(--red-e);
+      color: var(--alarm);
+      border: 1px solid var(--alarm);
     }
-    .stop-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--red-e) 12%, transparent); }
+    .stop-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--alarm) 12%, transparent); }
     .stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   `;
 

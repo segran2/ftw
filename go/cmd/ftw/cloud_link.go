@@ -50,8 +50,8 @@ type cloudSite struct {
 	// With it, the link sends the car class, and a charger's level and
 	// goal fields are views of its session's car.
 	cars *cars.Runtime
-	// history is the energy ledger, read as the app's history over Noise
-	// reads it, so a closed tile is the same bytes either way.
+	// history is the app's history, read as the app over Noise reads it,
+	// so a closed tile is the same bytes either way.
 	history *appHistory
 
 	sessMu   sync.Mutex
@@ -71,7 +71,7 @@ var _ cloudlink.HistorySite = (*cloudSite)(nil)
 // HistoryWindow serves the tiles class.
 func (c *cloudSite) HistoryWindow(ctx context.Context, names []string, stepMs, fromMs, toMs int64) (map[string][]protocol.HistorySample, error) {
 	if c.history == nil {
-		return nil, errors.New("no energy ledger")
+		return nil, errors.New("no history")
 	}
 	return c.history.Window(ctx, names, stepMs, fromMs, toMs)
 }

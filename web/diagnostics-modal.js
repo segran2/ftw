@@ -78,18 +78,18 @@
       ".ftw-diag-status-pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:0.7rem;letter-spacing:0.12em;text-transform:uppercase;padding:3px 10px;border:1px solid var(--line);border-radius:999px;color:var(--fg-dim);}",
       ".ftw-diag-status-pill::before{content:'';width:6px;height:6px;border-radius:999px;background:var(--line);}",
       ".ftw-diag-status-pill.ftw-diag-status-ok{color:var(--accent-e);border-color:var(--accent-e);}",
-      ".ftw-diag-status-pill.ftw-diag-status-ok::before{background:var(--green-e);box-shadow:0 0 10px var(--green-e);}",
+      ".ftw-diag-status-pill.ftw-diag-status-ok::before{background:var(--live);box-shadow:0 0 10px var(--live);}",
       ".ftw-diag-status-pill.ftw-diag-status-degraded{color:var(--accent-e);border-color:var(--accent-e);}",
       ".ftw-diag-status-pill.ftw-diag-status-degraded::before{background:var(--accent-e);box-shadow:0 0 10px var(--accent-e);}",
-      ".ftw-diag-status-pill.ftw-diag-status-offline{color:var(--red-e);border-color:var(--red-e);}",
-      ".ftw-diag-status-pill.ftw-diag-status-offline::before{background:var(--red-e);box-shadow:0 0 10px var(--red-e);}",
+      ".ftw-diag-status-pill.ftw-diag-status-offline{color:var(--alarm);border-color:var(--alarm);}",
+      ".ftw-diag-status-pill.ftw-diag-status-offline::before{background:var(--alarm);box-shadow:0 0 10px var(--alarm);}",
       ".ftw-diag-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}",
       // Ghost button per the shared design system: transparent bg, hover changes ONLY
       // the border colour (no bg or text-colour shift).
       ".ftw-diag-btn{font-family:var(--sans);font-size:0.78rem;font-weight:500;letter-spacing:0.02em;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);cursor:pointer;transition:border-color 120ms ease;}",
       ".ftw-diag-btn:hover{border-color:var(--fg-dim);}",
-      // Primary CTA: amber bg, near-black text, lift on hover (no colour shift).
-      ".ftw-diag-btn-primary{background:var(--accent-e);color:#0a0a0a;border-color:var(--accent-e);}",
+      // Primary CTA: accent bg, on-accent text, lift on hover (no colour shift).
+      ".ftw-diag-btn-primary{background:var(--accent-e);color:var(--on-accent);border-color:var(--accent-e);}",
       ".ftw-diag-btn-primary:hover{border-color:var(--accent-e);transform:translateY(-1px);}",
       // Close glyph: bare ghost, hover lifts to fg.
       ".ftw-diag-close{font-size:1.4rem;line-height:1;background:transparent;border:none;color:var(--fg-muted);cursor:pointer;padding:4px 8px;}",
@@ -102,7 +102,7 @@
       ".ftw-diag-kv{display:grid;grid-template-columns:140px 1fr;gap:6px 14px;font-family:var(--mono);font-size:0.84rem;font-variant-numeric:tabular-nums;}",
       ".ftw-diag-kv .k{color:var(--fg-muted);}",
       ".ftw-diag-kv .v{color:var(--fg);word-break:break-all;}",
-      ".ftw-diag-kv .v.err{color:var(--red-e);}",
+      ".ftw-diag-kv .v.err{color:var(--alarm);}",
       // Reading rows: type label, raw, smoothed, soc/age.
       ".ftw-diag-readings{display:grid;gap:2px;}",
       ".ftw-diag-reading{display:grid;grid-template-columns:80px 1fr 1fr 110px;gap:10px;font-family:var(--mono);font-size:0.84rem;font-variant-numeric:tabular-nums;padding:5px 0;border-bottom:1px solid var(--line-soft);}",
@@ -110,7 +110,7 @@
       ".ftw-diag-reading .label{color:var(--accent-e);text-transform:uppercase;letter-spacing:0.14em;font-size:0.68rem;align-self:center;}",
       ".ftw-diag-reading .num{color:var(--fg);}",
       ".ftw-diag-reading .num-dim{color:var(--fg-dim);}",
-      ".ftw-diag-reading.stale .num,.ftw-diag-reading.stale .num-dim,.ftw-diag-reading.stale .meta{color:var(--red-e);}",
+      ".ftw-diag-reading.stale .num,.ftw-diag-reading.stale .num-dim,.ftw-diag-reading.stale .meta{color:var(--alarm);}",
       ".ftw-diag-reading .meta{color:var(--fg-muted);text-align:right;}",
       // Metrics list: name dim, value strong.
       ".ftw-diag-metrics{display:grid;grid-template-columns:1fr auto 1fr auto;gap:4px 18px;font-family:var(--mono);font-size:0.82rem;font-variant-numeric:tabular-nums;}",
@@ -122,9 +122,9 @@
       ".ftw-diag-log-DEBUG{color:var(--fg-muted);}",
       ".ftw-diag-log-INFO{color:var(--fg);}",
       ".ftw-diag-log-WARN{color:var(--accent-e);}",
-      ".ftw-diag-log-ERROR{color:var(--red-e);}",
+      ".ftw-diag-log-ERROR{color:var(--alarm);}",
       ".ftw-diag-empty{color:var(--fg-muted);font-family:var(--mono);font-size:0.84rem;padding:14px 0;text-align:center;}",
-      ".ftw-diag-error{color:var(--red-e);font-family:var(--mono);font-size:0.82rem;}",
+      ".ftw-diag-error{color:var(--alarm);font-family:var(--mono);font-size:0.82rem;}",
       ".ftw-diag-job{position:fixed;inset:0;background:rgba(0,0,0,0.62);z-index:9100;display:flex;align-items:center;justify-content:center;}",
       ".ftw-diag-job-card{width:min(420px,90vw);background:var(--ink-raised);border:1px solid var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--fg);}",
       ".ftw-diag-job-spinner{display:inline-block;width:22px;height:22px;border:2px solid var(--line);border-top-color:var(--accent-e);border-radius:50%;animation:ftwDiagSpin 0.9s linear infinite;margin-bottom:10px;}",
@@ -132,7 +132,7 @@
       ".ftw-diag-job-title{font-family:var(--mono);font-size:0.85rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--accent-e);margin-bottom:8px;}",
       ".ftw-diag-job-msg{font-family:var(--sans);font-size:0.9rem;color:var(--fg);margin-bottom:6px;}",
       ".ftw-diag-job-meta{font-family:var(--mono);font-size:0.78rem;color:var(--fg-dim);}",
-      ".ftw-diag-job-error{color:var(--red-e);font-family:var(--mono);font-size:0.82rem;margin-top:10px;}",
+      ".ftw-diag-job-error{color:var(--alarm);font-family:var(--mono);font-size:0.82rem;margin-top:10px;}",
       ".ftw-diag-job-actions{display:flex;justify-content:center;gap:8px;margin-top:14px;}",
       ".ftw-diag-review{position:fixed;inset:0;background:rgba(0,0,0,0.68);z-index:9200;display:flex;align-items:center;justify-content:center;}",
       ".ftw-diag-review-card{width:min(680px,94vw);max-height:90vh;overflow:auto;background:var(--ink-raised);border:1px solid var(--line);border-radius:10px;padding:18px;color:var(--fg);}",

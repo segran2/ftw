@@ -117,7 +117,7 @@ export function updateMigrationBanner(health) {
     banner.className = "storage-banner";
     banner.setAttribute("aria-label", "History import");
     banner.style.cssText = "display:block;text-align:left;padding:16px 24px";
-    banner.innerHTML = '<strong data-field="title" role="status"></strong><p data-field="description"></p><p data-field="step"></p><progress aria-label="History import progress" style="width:min(100%,420px);accent-color:var(--amber)"></progress><p data-field="metrics"></p><p data-field="sizeNote"></p><p data-field="details"></p><p data-field="coverage"></p><p data-field="activity"></p><p data-field="error"></p><p data-field="guidance"></p>';
+    banner.innerHTML = '<strong data-field="title" role="status"></strong><p data-field="description"></p><p data-field="step"></p><progress aria-label="History import progress" style="width:min(100%,420px);accent-color:var(--accent-e)"></progress><p data-field="metrics"></p><p data-field="sizeNote"></p><p data-field="details"></p><p data-field="coverage"></p><p data-field="activity"></p><p data-field="error"></p><p data-field="guidance"></p>';
     main.parentNode.insertBefore(banner, main);
   }
   for (const key of ["title", "description", "step", "metrics", "sizeNote", "details", "coverage", "activity", "error", "guidance"]) {

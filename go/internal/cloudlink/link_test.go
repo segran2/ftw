@@ -198,6 +198,8 @@ type fakeService struct {
 	// that is stopping.
 	wrongShard      string
 	restartBeforeOK bool
+	// beforeWebSocket, when set, runs before each WebSocket upgrade.
+	beforeWebSocket func()
 
 	wmu   sync.Mutex
 	mu    sync.Mutex
@@ -266,6 +268,12 @@ func (s *fakeService) write(conn uplinkConn, key *ecdsa.PrivateKey, home, t stri
 }
 
 func (s *fakeService) handle(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	hold := s.beforeWebSocket
+	s.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
 	conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 	if err != nil {
 		return

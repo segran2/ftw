@@ -1,9 +1,7 @@
 package ocpp
 
 import (
-	"fmt"
 	"math"
-	"sync"
 	"testing"
 	"time"
 
@@ -26,14 +24,10 @@ func nearly(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 // the ones the CSMS pushes.
 func connectStationForNeeds(t *testing.T, srv *Server, port int, id string) ocpp201.ChargingStation {
 	t.Helper()
-	cs := ocpp201.NewChargingStation(id, nil, nil)
-	cs.SetSmartChargingHandler(newFakeStationV201())
-
-	if err := cs.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	cs, _, err := dialChargingStation201(t, wsURL(port), id, func(cs ocpp201.ChargingStation) { cs.SetSmartChargingHandler(newFakeStationV201()) })
+	if err != nil {
 		t.Fatalf("charging station connect: %v", err)
 	}
-	var once sync.Once
-	stopAfterServer(t, srv, func() { once.Do(cs.Stop) }, cs.IsConnected)
 
 	if _, err := cs.BootNotification(provisioning.BootReasonPowerUp, "Dawn", "Charge Amps"); err != nil {
 		t.Fatalf("boot: %v", err)

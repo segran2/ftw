@@ -44,7 +44,7 @@ const DEFAULT_ACCENT = {
   load:          "var(--fg)",
   pv:            "var(--amber)",
   bat_charged:   "var(--cyan)",
-  bat_discharged:"var(--cyan-dim, var(--cyan))",
+  bat_discharged:"var(--energy-gives)",
 };
 
 // Several history cards often flip Week/Month together. Share the
@@ -177,7 +177,7 @@ class FtwHistoryCard extends FtwElement {
       cursor: pointer;
       transition: color 220ms ease;
     }
-    .toggle button.active { color: #0a0a0a; }
+    .toggle button.active { color: var(--on-accent); }
     .toggle button:not(.active):hover { color: var(--fg); }
     .toggle button:focus-visible {
       outline: 1px solid var(--accent-e);

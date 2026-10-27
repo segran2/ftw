@@ -215,7 +215,8 @@ func (s *simSite) step() {
 	}
 	if s.downUntil.IsZero() {
 		if m := tick.Meter; m != nil {
-			s.emit("meter", telemetry.DerMeter, m.W, nil, map[string]any{"l1_a": m.PhaseA[0], "l2_a": m.PhaseA[1], "l3_a": m.PhaseA[2]})
+			s.emit("meter", telemetry.DerMeter, m.W, nil, map[string]any{"l1_a": m.PhaseA[0], "l2_a": m.PhaseA[1], "l3_a": m.PhaseA[2],
+				"l1_w": m.PhaseW[0], "l2_w": m.PhaseW[1], "l3_w": m.PhaseW[2]})
 		}
 		if b := tick.Battery; b != nil {
 			s.emit("battery", telemetry.DerBattery, b.W, &b.SoC, nil)
@@ -360,7 +361,9 @@ func (s *simSite) check() {
 		s.fail("over Core's limit for more than %v (heat %.1f A, limit %.0f A)", allow, math.Sqrt(max(s.heat[0], s.heat[1], s.heat[2])), limitA)
 	}
 	// (b) With the meter on schedule, room for the car's minimum and a car
-	// that asks, the car draws within a minute plus the charger's delay.
+	// that asks, the car draws within a minute plus the charger's delay
+	// and the battery-command settling window. A battery raise may still
+	// occupy that window even after the physical meter shows it.
 	if !s.wantsCharge() {
 		s.needSince = time.Time{}
 	} else if s.needSince.IsZero() {
@@ -368,7 +371,7 @@ func (s *simSite) check() {
 	}
 	if !s.needSince.IsZero() && p.EVSE.DrawW <= 0 {
 		s.idleWithRoom += sitesim.Step
-		if wait := time.Minute + p.EVSE.Delay; now.Sub(s.needSince) > wait {
+		if wait := time.Minute + p.EVSE.Delay + evSettle; now.Sub(s.needSince) > wait {
 			s.fail("the car is idle after %v with room for it", wait)
 		}
 	}
@@ -385,6 +388,11 @@ func (s *simSite) check() {
 func (s *simSite) wantsCharge() bool {
 	p, e := s.p, s.p.EVSE
 	if p.Car == nil || !p.Car.Plugged || p.Offline("evse") || !s.downUntil.IsZero() || p.Now.Sub(s.meterAt) > max(p.Meter.Every, sitesim.Step)+sitesim.Step {
+		return false
+	}
+	// After a real overload, an idle car must wait for the fuse to cool.
+	// Its recovery deadline starts when that heat no longer blocks a start.
+	if e.DrawW <= 0 && max(s.heat[0], s.heat[1], s.heat[2]) > math.Pow(p.Fuse.RatingA-evPhaseMarginA, 2) {
 		return false
 	}
 	phases := min(e.Phases, p.Car.Phases)
@@ -495,6 +503,49 @@ func planEV(w float64) loadpoint.PlanFunc {
 	}
 }
 
+// homeBoxNightPlan is the home box's plan for the car on 25 Oct 2026: its
+// on-power and the energy each quarter gives it.
+func homeBoxNightPlan(now time.Time) (loadpoint.Directive, bool) {
+	slot, evW, onW := now.Truncate(15*time.Minute), 10350.0, 10350.0
+	if slot.Minute() == 45 {
+		evW, onW = 8395, 8970
+	}
+	return loadpoint.Directive{SlotStart: slot, SlotEnd: slot.Add(15 * time.Minute),
+		LoadpointEnergyWh: map[string]float64{"garage": evW / 4}, LoadpointMaxPowerW: map[string]float64{"garage": onW}}, true
+}
+
+// homeBoxNight is the home box on 25 Oct 2026 from 02:29: a 3x20 A site
+// whose mains runs at volts while Core reckons with 230 V, an Easee that
+// answers in 8 s, a 9.6 kWh battery and the night's plan. The car must
+// charge through 02:45 and run the plan's 13 A beside the battery's 2091 W.
+func homeBoxNight(name string, volts float64) simScenario {
+	return simScenario{name: name, start: time.Date(2026, 10, 26, 2, 29, 0, 0, time.Local), run: 21 * time.Minute,
+		plant: func(p *sitesim.Plant) {
+			p.Fuse.RatingA, p.Voltage, p.HouseW = 20, volts, houseA(2.5, 1.3, 1.2)
+			p.EVSE.Delay, p.EVSE.ReadbackLag = 8*time.Second, 0
+			p.Battery = &sitesim.Battery{Phases: 3, MaxChargeW: 5000, MaxDischargeW: 5000, CapacityWh: 9600, SoC: .21, Latency: 8 * time.Second}
+		},
+		plan: homeBoxNightPlan,
+		setup: func(s *simSite) {
+			s.every, s.state.SiteFuseVoltage = 3*time.Second, 230
+			s.ctrl.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: 20, Voltage: 230, PhaseCnt: 3})
+			s.state.Mode, s.state.UseEnergyDispatch = ModePlannerArbitrage, true
+			s.state.SlotDirective = func(now time.Time) (SlotDirective, bool) {
+				slot, w := now.Truncate(15*time.Minute), 711.0
+				if slot.Minute() == 45 {
+					w = 2091
+				}
+				return SlotDirective{SlotStart: slot, SlotEnd: slot.Add(15 * time.Minute), BatteryEnergyWh: w / 4, Strategy: "arbitrage"}, true
+			}
+		},
+		expect: []simExpect{{21*time.Minute - time.Second, func(s *simSite) error {
+			if s.p.EVSE.OfferA != 13 || s.p.EVSE.DrawW <= 0 || math.Abs(s.p.Battery.W-2091) > 100 {
+				return fmt.Errorf("at 02:50: car offered %.0f A and draws %.0f W, battery %.0f W; want the plan's 13 A and 2091 W", s.p.EVSE.OfferA, s.p.EVSE.DrawW, s.p.Battery.W)
+			}
+			return nil
+		}}}}
+}
+
 // planBatteryCharge has the plan charge the battery at w for the hour.
 func planBatteryCharge(w float64) func(*simSite) {
 	return func(s *simSite) {
@@ -554,9 +605,9 @@ func simScenarios() []simScenario {
 		}
 	}
 	return []simScenario{
-		{name: "export start", known: "export counted as import, fuse_heat.go:120", run: 5 * time.Minute,
+		{name: "export start", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) { p.HouseW, p.PVW = houseA(2, 2, 2), -22*690 }},
-		{name: "export start, unsigned phase currents", known: "export counted as import, fuse_heat.go:120", run: 5 * time.Minute,
+		{name: "export start, unsigned phase currents", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) { p.HouseW, p.PVW, p.Meter.Unsigned = houseA(2, 2, 2), -22*690, true }},
 		{name: "charger's own load balancer", known: "a cut comes off an offer the car does not draw, ev_fuse_budget.go:172", run: 20 * time.Minute,
 			plant: func(p *sitesim.Plant) {
@@ -602,7 +653,7 @@ func simScenarios() []simScenario {
 			plant: surplus, lp: surplusPhase("")},
 		{name: "phase mode auto, 9 kW surplus", run: 5 * time.Minute, surplus: true,
 			plant: surplus, lp: surplusPhase("auto")},
-		{name: "9 kW surplus, readback 10 s late", known: "surplus adds back the charger's late readback, surplus_reserve.go:128", run: 5 * time.Minute, surplus: true,
+		{name: "9 kW surplus, readback 10 s late", run: 5 * time.Minute, surplus: true,
 			plant: func(p *sitesim.Plant) { surplus(p); p.EVSE.ReadbackLag = 10 * time.Second }, lp: surplusPhase("3p")},
 		{name: "surplus_unlock_bat_soc saved, Charge now", run: 5 * time.Minute,
 			plant: func(p *sitesim.Plant) {
@@ -661,6 +712,13 @@ func simScenarios() []simScenario {
 					return nil
 				}},
 			}},
+		// The home box, 25 Oct 2026, v0.155.1-beta.1: the car drew 10386 W of
+		// the plan's 10350 W and spent the quarter's energy 3 s early. Core
+		// stopped it; at 02:45 the plan wanted 8970 W with the battery at
+		// 2091 W, but the start test read the car's own current on L1 and kept
+		// it off for 84 s. At 237 V the energy runs out 27 s early.
+		homeBoxNight("home box night, quarter's energy spent 3 s early", 230.8),
+		homeBoxNight("home box night at 237 V, energy spent 27 s early", 237),
 		// A one-phase car (a plug-in hybrid) on the field night's table: the
 		// plan's 4.8 kW three-phase order is 7 A a phase, which the car takes
 		// on L1 alone, 1.6 kW. Once the meter shows it, the order is the

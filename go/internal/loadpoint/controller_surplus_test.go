@@ -8,7 +8,7 @@ import (
 // surplusTestConfig returns a loadpoint config typical for the
 // surplus_only tests: 3Φ-eligible steps at 4140 W and 6900 W (Easee 6 A
 // and 10 A on three phases at 230 V), 1Φ-eligible at 1380 W (6 A on one
-// phase). The default phase split is 3680 W, so {1380} is 1Φ-only and
+// phase). Three phases start at 6 A each, so {1380} is 1Φ-only and
 // {4140, 6900} are 3Φ-eligible.
 func surplusTestConfig() Config {
 	return Config{
@@ -342,7 +342,7 @@ func TestPickSurplusSteps_ThreePhaseOnlyNeverLocks1P(t *testing.T) {
 	cfg := surplusTestConfig()
 	cfg.PhaseMode = "3p"
 
-	steps3 := surplus3PhaseSteps(cfg)
+	steps3 := surplus3PhaseSteps(cfg, SiteFuse{})
 
 	// Forecast is bad — an "auto" loadpoint would lock 1Φ here.
 	c.SetPeakRemainingSurplusW(func() (float64, bool) { return 1000, true })
@@ -396,7 +396,7 @@ func TestPickSurplusSteps_NearTermDwell(t *testing.T) {
 	})
 
 	day1 := time.Date(2026, 5, 3, 9, 0, 0, 0, time.Local)
-	steps3 := surplus3PhaseSteps(cfg)
+	steps3 := surplus3PhaseSteps(cfg, SiteFuse{})
 	minStep3 := smallestNonZero(steps3)
 
 	// First call — near-term forecast comfortably above minStep3 → 3Φ-only.

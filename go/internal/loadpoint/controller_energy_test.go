@@ -96,6 +96,78 @@ func TestDutyPlanCommandsOnPowerThenStopsAtEnergyBudget(t *testing.T) {
 	}
 }
 
+// A duty slot runs its on-power for the plan's on-time, its energy at that
+// power. The home box on 25 Oct 2026: the plan gave the car 10350 W for the
+// whole quarter, the mains ran at 230.8 V and the car drew 10386 W, so the
+// energy ran out 3 s before the quarter ended. The stop reached the charger
+// in the next quarter, which wanted the car too.
+func TestDutySlotRunsItsOnTime(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		from           int     // seconds into the quarter the plan's interval starts, as after a replan
+		onS            float64 // the plan's on-time at 10350 W from then
+		draw           float64 // what the car draws per watt ordered
+		capFrom, capTo int     // the fuse cap is capW in [capFrom, capTo)
+		capW           float64
+		stopAt         int     // the tick the order goes to 0 W; -1: never
+		finalW         float64 // the order at the quarter's last tick, when it never stops
+	}{
+		{name: "a full quarter at 230.8 V (the home box)", onS: 900, draw: 230.8 / 230, stopAt: -1, finalW: 10350},
+		{name: "a full quarter at 239 V", onS: 900, draw: 239.0 / 230, stopAt: -1, finalW: 10350},
+		{name: "replanned at 5 minutes, 239 V", from: 300, onS: 600, draw: 239.0 / 230, stopAt: -1, finalW: 10350},
+		{name: "nine tenths, the car draws 4 % more", onS: 810, draw: 1.04, stopAt: 810},
+		{name: "nine tenths, the car draws 5 % less", onS: 810, draw: .95, stopAt: 855},
+		{name: "an off-time of 15 s", onS: 885, draw: 1, stopAt: -1, finalW: 10350},
+		{name: "an off-time of 20 s", onS: 880, draw: 1, stopAt: 882},
+		{name: "an off-time of 25 s, the car draws 2 % more", onS: 875, draw: 1.02, stopAt: 876},
+		{name: "no energy", onS: 0, draw: 1, stopAt: 0},
+		{name: "a fuse cap of 5000 W in the last minute", onS: 900, draw: 230.8 / 230, capFrom: 840, capTo: 900, capW: 5000, stopAt: -1, finalW: 4140},
+		{name: "a fuse stop once the energy is spent", onS: 810, draw: 1.04, capFrom: 783, capTo: 795, stopAt: 783},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			quarter := time.Date(2026, 10, 25, 1, 30, 0, 0, time.UTC)
+			cfg := Config{ID: "garage", DriverName: "easee", MinChargeW: 4140, MaxChargeW: 11040, AllowedStepsW: []float64{0, 4140, 8970, 10350}}
+			budgetWh := 10350 * tc.onS / 3600
+			dir := &Directive{SlotStart: quarter.Add(time.Duration(tc.from) * time.Second), SlotEnd: quarter.Add(15 * time.Minute),
+				LoadpointEnergyWh: map[string]float64{"garage": budgetWh}, LoadpointMaxPowerW: map[string]float64{"garage": 10350}}
+			samples := map[string]EVSample{"easee": {Connected: true, RequestActive: true, SessionWh: 1000}}
+			sender := &fakeSender{}
+			c := newTestController(t, []Config{cfg}, dir, samples, sender)
+			var s int
+			c.SetFuseEVMax(func() (float64, bool) {
+				if s >= tc.capFrom && s < tc.capTo {
+					return tc.capW, true
+				}
+				return 1e9, true
+			})
+			var delivered, drawW, cmdW float64
+			stoppedAt := -1
+			for s = tc.from; s < 900; s += 3 {
+				now := quarter.Add(time.Duration(s) * time.Second)
+				delivered += drawW * 3 / 3600
+				sample := samples["easee"]
+				sample.PowerW, sample.PowerAt, sample.SessionWh, sample.EnergyAt = drawW, now, 1000+delivered, now
+				samples["easee"] = sample
+				c.Tick(context.Background(), now)
+				cmd, ok := lastSetCurrent(sender.calls)
+				if !ok {
+					t.Fatal("missing current command")
+				}
+				if stoppedAt >= 0 && cmd.power > 0 {
+					t.Fatalf("started again at %ds after stopping at %ds", s, stoppedAt)
+				}
+				if stoppedAt < 0 && cmd.power == 0 {
+					stoppedAt = s
+				}
+				cmdW, drawW = cmd.power, cmd.power*tc.draw
+			}
+			if stoppedAt != tc.stopAt || tc.stopAt < 0 && cmdW != tc.finalW {
+				t.Fatalf("stopped at %ds (want %d), last order %.0f W (want %.0f); %.1f of %.1f Wh delivered", stoppedAt, tc.stopAt, cmdW, tc.finalW, delivered, budgetWh)
+			}
+		})
+	}
+}
+
 func TestDutyDispatchStopsForUnavailablePowerAndKeepsSpentBudget(t *testing.T) {
 	start := time.Now().Truncate(time.Minute)
 	cfg := Config{ID: "garage", DriverName: "easee", MinChargeW: 4140, MaxChargeW: 11000}

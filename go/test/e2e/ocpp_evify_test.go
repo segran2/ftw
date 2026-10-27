@@ -31,7 +31,8 @@ func evifyWaitBound(t *testing.T, port int) {
 
 func evifyStartCS(t *testing.T, approved []string) (url16, url201 string, srv *ocpp.Server) {
 	t.Helper()
-	p16, p201 := freePort(t), freePort(t)
+	ports := freePorts(t, 2)
+	p16, p201 := ports[0], ports[1]
 	cfg := &ocpp.Config{
 		Enabled:            true,
 		Bind:               "127.0.0.1",
@@ -156,7 +157,8 @@ func TestEvifyOCPPInventoryE2E(t *testing.T) {
 	}
 
 	tel := telemetry.NewStore()
-	p16, p201 := freePort(t), freePort(t)
+	ports := freePorts(t, 2)
+	p16, p201 := ports[0], ports[1]
 	srv, err := ocpp.Start(context.Background(), &ocpp.Config{
 		Enabled:            true,
 		Bind:               "127.0.0.1",

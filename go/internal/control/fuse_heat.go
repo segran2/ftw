@@ -58,9 +58,10 @@ func (h *fuseHeat) step(at time.Time, amps []float64) {
 	copy(h.amps[:], amps)
 }
 
-// overA is how far the phases the budget no longer covers sit above limitA
-// on this reading: a phase whose filtered current is over limitA, or one
-// above instantA. Zero while the budget covers every phase.
+// overA is how far the importing phases the budget no longer covers sit
+// above limitA on this reading: a phase whose filtered current is over
+// limitA, or one above instantA. Zero while the budget covers every phase.
+// An exporting phase is never over: less EV load would raise its export.
 func (h *fuseHeat) overA(amps []float64, limitA, instantA float64) float64 {
 	over := 0.0
 	for i, a := range amps {
@@ -71,14 +72,36 @@ func (h *fuseHeat) overA(amps []float64, limitA, instantA float64) float64 {
 	return over
 }
 
-// levelA is the highest phase current, taking each phase at the higher of
-// the reading and its heat, plus what we sent that it may not show yet.
-// Rises and starts read it, so a rise never spends heat the last minute has
-// already used, nor room an earlier rise will take.
+// levelA is the highest phase current, with its direction, plus what we
+// sent that it may not show yet. An importing phase counts at the higher of
+// the reading and its heat; an exporting one at its reading, as new load
+// lowers its current. A running pool's rises read it, so a rise never
+// spends heat the last minute has already used, nor room an earlier rise
+// will take. An idle start reads startLevelA.
 func (h *fuseHeat) levelA(amps []float64, pendingA [3]float64) float64 {
-	level := 0.0
+	level := math.Inf(-1)
 	for i, a := range amps {
-		level = math.Max(level, math.Max(a, math.Sqrt(h.sq[i]))+pendingA[i])
+		if a >= 0 {
+			a = math.Max(a, math.Sqrt(h.sq[i]))
+		}
+		level = math.Max(level, a+pendingA[i])
+	}
+	return level
+}
+
+// startLevelA is the highest phase current as an idle start reads it: the
+// reading plus what we sent that it may not show yet. A phase's heat counts
+// only while it is over limitA, so a car that just stopped is not counted
+// twice, in its heat and in the start it asks for, while a real overage
+// still blocks the start until the filter has cooled under the limit. An
+// exporting phase counts at its reading.
+func (h *fuseHeat) startLevelA(amps []float64, pendingA [3]float64, limitA float64) float64 {
+	level := math.Inf(-1)
+	for i, a := range amps {
+		if a >= 0 && h.sq[i] > limitA*limitA { // As overA reads it.
+			a = math.Max(a, math.Sqrt(h.sq[i]))
+		}
+		level = math.Max(level, a+pendingA[i])
 	}
 	return level
 }
@@ -90,24 +113,33 @@ func (h *fuseHeat) worstA() float64 {
 
 // stepFuseHeat folds each new site reading into the model, whether or not a
 // car is plugged in.
-func (s *State) stepFuseHeat(meter *telemetry.DerReading) {
+func (s *State) stepFuseHeat(meter *telemetry.DerReading, totalW float64) {
 	if s.fuseHeat.set && !meter.UpdatedAt.After(s.fuseHeat.at) {
 		return
 	}
-	if amps, _, valid := phaseCurrentsA(meter, s); valid {
+	if amps, _, valid := phaseCurrentsA(meter, s, totalW); valid {
 		s.fuseHeat.step(meter.UpdatedAt, amps)
 	}
 }
 
-// phaseCurrentsA reads the site's configured phases as magnitudes. present
-// is false when the meter reports no phase currents; valid is false when
-// they cannot be used.
-func phaseCurrentsA(meter *telemetry.DerReading, state *State) (amps []float64, present, valid bool) {
+// phaseCurrentsA reads the site's configured phases, import positive. A
+// phase's direction is its power's sign in the same reading: P1 and many
+// meters report current as a magnitude. A phase exports only when its power
+// says so clearly, beyond a quarter of what its current could carry, and
+// the phases' powers add up to the reading's total. Otherwise its current
+// counts as import, the safe side: a phase near 0 W, a reactive phase, a
+// meter without phase power, or a driver whose phase power has the wrong
+// sign. totalW is the same reading's site total. present is false when the
+// meter reports no phase currents; valid is false when they cannot be used.
+func phaseCurrentsA(meter *telemetry.DerReading, state *State, totalW float64) (amps []float64, present, valid bool) {
 	// DER data uses snake case; separate fields retain absent-vs-zero.
 	var data struct {
-		L1 *float64 `json:"l1_a"`
-		L2 *float64 `json:"l2_a"`
-		L3 *float64 `json:"l3_a"`
+		L1  *float64 `json:"l1_a"`
+		L2  *float64 `json:"l2_a"`
+		L3  *float64 `json:"l3_a"`
+		L1W *float64 `json:"l1_w"`
+		L2W *float64 `json:"l2_w"`
+		L3W *float64 `json:"l3_w"`
 	}
 	if json.Unmarshal(meter.Data, &data) != nil || (data.L1 == nil && data.L2 == nil && data.L3 == nil) {
 		return nil, false, false
@@ -115,13 +147,36 @@ func phaseCurrentsA(meter *telemetry.DerReading, state *State) (amps []float64, 
 	if !finiteFuseValue(state.SiteFuseAmps) || !finiteFuseValue(state.SiteFuseVoltage) || state.SiteFuseAmps <= 0 || state.SiteFuseVoltage <= 0 || state.SiteFusePhases < 1 || state.SiteFusePhases > 3 {
 		return nil, true, false
 	}
-	for _, a := range []*float64{data.L1, data.L2, data.L3}[:state.SiteFusePhases] {
+	powers := []*float64{data.L1W, data.L2W, data.L3W}[:state.SiteFusePhases]
+	signs := phasePowersAddUp(powers, totalW)
+	for i, a := range []*float64{data.L1, data.L2, data.L3}[:state.SiteFusePhases] {
 		if a == nil || !finiteFuseValue(*a) {
 			return nil, true, false
 		}
-		amps = append(amps, math.Abs(*a))
+		signed := math.Abs(*a)
+		if w := powers[i]; signs && *w < -math.Max(exportSignMinW, signed*state.SiteFuseVoltage/4) {
+			signed = -signed
+		}
+		amps = append(amps, signed)
 	}
 	return amps, true, true
+}
+
+// exportSignMinW is the least export a phase's power must show before its
+// current counts as export.
+const exportSignMinW = 25.0
+
+// phasePowersAddUp reports whether every phase power is present and their
+// sum is the reading's total, within a tenth of the phases' power or 250 W.
+func phasePowersAddUp(powers []*float64, totalW float64) bool {
+	var sum, abs float64
+	for _, w := range powers {
+		if w == nil || !finiteFuseValue(*w) {
+			return false
+		}
+		sum, abs = sum+*w, abs+math.Abs(*w)
+	}
+	return finiteFuseValue(totalW) && math.Abs(sum-totalW) <= math.Max(250, abs/10)
 }
 
 // SitePhases is the site meter's last reading of its phase currents, for
@@ -132,10 +187,11 @@ func SitePhases(store *telemetry.Store, state *State) (loadpoint.SitePhases, boo
 		return loadpoint.SitePhases{}, false
 	}
 	meter := store.Get(state.SiteMeterDriver, telemetry.DerMeter)
-	if meter == nil {
+	totalW, at, online := store.OnlineMeterW(state.SiteMeterDriver)
+	if meter == nil || !online || !at.Equal(meter.UpdatedAt) { // One reading's phases and total.
 		return loadpoint.SitePhases{}, false
 	}
-	amps, _, valid := phaseCurrentsA(meter, state)
+	amps, _, valid := phaseCurrentsA(meter, state, totalW)
 	if !valid || len(amps) != 3 {
 		return loadpoint.SitePhases{}, false
 	}

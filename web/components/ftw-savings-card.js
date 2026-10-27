@@ -188,8 +188,8 @@ class FtwSavingsCard extends FtwElement {
       display: block;
       overflow: visible;
     }
-    svg.spark .bar-pos { fill: var(--green-e); }
-    svg.spark .bar-neg { fill: var(--red-e); }
+    svg.spark .bar-pos { fill: var(--fg-dim); }
+    svg.spark .bar-neg { fill: var(--fg-muted); }
     svg.spark .baseline {
       stroke: var(--line);
       stroke-width: 1;
@@ -324,8 +324,8 @@ class FtwSavingsCard extends FtwElement {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    :host([compact]) .compact-value.is-positive { color: var(--green-e); }
-    :host([compact]) .compact-value.is-negative { color: var(--red-e); }
+    :host([compact]) .compact-value.is-positive,
+    :host([compact]) .compact-value.is-negative { color: var(--fg); }
     :host([compact]) .compact-coverage-note:not([hidden]) {
       display: block;
       color: var(--fg-muted);
@@ -779,12 +779,12 @@ class FtwSavingsCard extends FtwElement {
       pctEl.textContent = "";
     }
 
-    // Color: green when saved>0, red when saved<0, neutral within tiny
-    // dead zone (avoids flicker when the running total bobs across 0).
+    // Money is ink, not a state: full ink when saved or lost, dim within a
+    // tiny dead zone (avoids flicker when the running total bobs across 0).
     const deadZoneSek = 0.5;
     const color = Math.abs(savedSek) < deadZoneSek
       ? "var(--fg-dim)"
-      : (savedSek > 0 ? "var(--green-e)" : "var(--red-e)");
+      : "var(--fg)";
     this.style.setProperty('--ftw-savings-color', color);
 
     // Sub-line: actual + no-PV/no-battery baseline in SEK. Gives the

@@ -145,6 +145,15 @@ func (s *Store) durableConfigWriteContext(parent context.Context, write func(*sq
 		return err
 	}
 	defer tx.Rollback()
+	// Take the write lock before write reads anything. SQLite does not wait
+	// out busy_timeout for a transaction that read first and then writes: it
+	// returns SQLITE_BUSY at once while another connection is writing, since
+	// waiting there could deadlock. SaveDriverSecret and SaveConfiguration
+	// both read first, so a rotated OAuth token was refused by any
+	// concurrent write. The statement changes no row.
+	if _, err := tx.ExecContext(ctx, `UPDATE config SET value = value WHERE 0`); err != nil {
+		return err
+	}
 	err = write(tx)
 	if err == nil {
 		err = tx.Commit()

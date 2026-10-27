@@ -20,6 +20,7 @@ var provenance = map[string]struct {
 	catalog []string
 	sources []string
 }{
+	"s18-16":    {nil, []string{"https://github.com/srcfl/ftw/issues/1868"}},
 	"s0-25":     {[]string{"home-070", "ocpp-011", "ocpp-013", "ui-052"}, []string{"https://github.com/srcfl/ftw/pull/1779", "https://github.com/srcfl/ftw/pull/1790"}},
 	"s0b-25":    {[]string{"home-070", "ocpp-011", "ocpp-013", "ui-052"}, []string{"https://github.com/srcfl/ftw/pull/1790"}},
 	"s1-16":     {nil, []string{"simulator test before beta 0.155.0, 21 Oct 2026"}},
@@ -49,6 +50,8 @@ var provenance = map[string]struct {
 	"s15c-25":   {nil, []string{"https://github.com/srcfl/ftw/pull/1804", "release blocker 22 Oct 2026: a one-phase charger gets 0 W under Charge now (phase mode auto)"}},
 	"s15bat-16": {nil, []string{"https://github.com/srcfl/ftw/pull/1805", "release blocker 22 Oct 2026: a one-phase charger never starts while Core raises its battery"}},
 	"s15p-25":   {nil, []string{"https://github.com/srcfl/ftw/pull/1804", "release blocker 22 Oct 2026: a one-phase charger, planned charging"}},
+	"s16-25":    {nil, []string{"https://github.com/srcfl/ftw/pull/1828", "help report 25 Oct 2026: an idle car held at 0 W for an hour under a 4.5 kW import ceiling"}},
+	"s17-25":    {nil, []string{"https://github.com/srcfl/ftw/pull/1814", "field report 23 Oct 2026, v0.155.1-beta.1: two equal Pixii batteries take turns"}},
 }
 
 func TestEveryScenarioSaysWhereItComesFrom(t *testing.T) {

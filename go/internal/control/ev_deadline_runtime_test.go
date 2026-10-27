@@ -202,3 +202,90 @@ func TestJoinedMixedPhaseNoCreditBeforeMeasuredReduction(t *testing.T) {
 	}
 	t.Logf("%d real sends across6 ticks: final1p %.0fW +3p %.0fW, worst phase%.2fA", sends, actualA, actualB, actualA/230+actualB/690)
 }
+
+// Without a plan, a car whose own charger takes less than a stepless
+// charger's minimum (a 3.7 kW plug-in hybrid on an 11 or 22 kW charger) is
+// ordered that minimum, as the plan orders it: never 0 W because the car's
+// own maximum is lower. On a table with one-phase and three-phase levels it
+// is ordered the lowest three-phase level, not a one-phase level the
+// three-phase order cannot run (review of #1807).
+func TestJoinedNoPlanGoalSmallCarGetsChargerMinimum(t *testing.T) {
+	ctx := context.Background()
+	mixed := []float64{0}
+	for _, phases := range []float64{1, 3} {
+		for a := 6.0; a <= 16; a++ {
+			mixed = append(mixed, a*230*phases)
+		}
+	}
+	for _, ch := range []struct {
+		name       string
+		mode       string
+		minW, maxW float64
+		steps      []float64
+		carMaxW    float64
+	}{
+		{"11 kW", "", 4140, 11040, nil, 3680},
+		{"22 kW", "", 4140, 22080, nil, 3680},
+		{"mixed table", "", 1380, 11040, mixed, 3680},
+		{"mixed table, auto", "auto", 1380, 11040, mixed, 3680},
+		{"mixed table, 3p", "3p", 1380, 11040, mixed, 3680},
+		// The charger's minimum above the car's maximum, and that above
+		// the lowest one-phase level: the car's own limits leave no level.
+		{"mixed table, minimum 2,000 W, a 1.5 kW car", "", 2000, 11040, mixed, 1500},
+	} {
+		now := time.Now()
+		cfg := loadpoint.Config{ID: "garage", DriverName: "charger", VehicleCapacityWh: 15000, PluginSoC: .3, PhaseMode: ch.mode,
+			MinChargeW: ch.minW, MaxChargeW: ch.maxW, AllowedStepsW: ch.steps}
+		mgr := loadpoint.NewManager()
+		mgr.Load([]loadpoint.Config{cfg})
+		mgr.Observe(cfg.ID, true, 0, 0, true)
+		if !mgr.SetCarBinding(cfg.ID, loadpoint.CarBinding{ID: "phev", MaxW: ch.carMaxW}) ||
+			!mgr.SetCurrentSoC(cfg.ID, .3) || !mgr.SetTarget(cfg.ID, .8, now.Add(3*time.Hour)) {
+			t.Fatal("goal fixture rejected")
+		}
+		svc := &mpc.Service{LoadpointStates: mgr.States}
+		tel := telemetry.NewStore()
+		phaseA := 1000.0 / (3 * 230)
+		meterData, _ := json.Marshal(map[string]float64{"l1_a": phaseA, "l2_a": phaseA, "l3_a": phaseA})
+		tel.Update("meter", telemetry.DerMeter, 1000, nil, meterData)
+		tel.RecordDriverSuccess("meter")
+		tel.Update(cfg.DriverName, telemetry.DerEV, 0, nil, json.RawMessage(`{"connected":true,"request_active":true}`))
+		tel.RecordDriverSuccess(cfg.DriverName)
+		st := NewState(0, 0, "meter")
+		st.Mode = ModePlannerArbitrage
+		st.UseEnergyDispatch = true
+		st.SiteFuseAmps = 25
+		st.SiteFuseVoltage = 230
+		st.SiteFusePhases = 3
+		var commands []float64
+		controller := loadpoint.NewController(mgr,
+			func(at time.Time) (loadpoint.Directive, bool) {
+				d, ok := svc.SlotDirectiveAt(at)
+				return d.LoadpointDirective(), ok
+			},
+			func(string) (loadpoint.EVSample, bool) {
+				return loadpoint.EVSample{Connected: true, RequestActive: true, PowerW: 0, PowerAt: now}, true
+			},
+			func(_ context.Context, _ string, p []byte) error {
+				var cmd struct {
+					Action string  `json:"action"`
+					PowerW float64 `json:"power_w"`
+				}
+				if err := json.Unmarshal(p, &cmd); err != nil {
+					return err
+				}
+				if cmd.Action == "ev_set_current" {
+					commands = append(commands, cmd.PowerW)
+				}
+				return nil
+			})
+		controller.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: 25, Voltage: 230, PhaseCnt: 3})
+		svc.PlanningLimits = controller.PlanningLimits // as main.go wires it
+		controller.SetFuseEVMax(func() (float64, bool) { return EVFuseBudget(tel, st, mgr.States(), controller.FuseConfigs(), 17250) })
+		controller.SetFusePhaseRoomA(func() (float64, bool) { return EVFusePhaseRoomA(st) })
+		controller.TickWithDispatch(ctx, now, true)
+		if len(commands) == 0 || commands[len(commands)-1] != 4140 {
+			t.Errorf("%s: orders %v, want 4140 W", ch.name, commands)
+		}
+	}
+}

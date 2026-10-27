@@ -65,8 +65,8 @@ type Config struct {
 
 	// PhaseSplitW is the wantW threshold below which "auto" picks 1Φ.
 	// Zero defaults to 3680 W — the ceiling a 16 A fuse can sustain
-	// on a single phase. Also used to classify AllowedStepsW entries:
-	// steps ≤ split are 1Φ-eligible, > split are 3Φ-eligible.
+	// on a single phase. It does not classify AllowedStepsW: planned and
+	// surplus charging count a step as 3Φ from 6 A on each phase.
 	PhaseSplitW float64 `yaml:"phase_split_w,omitempty" json:"phase_split_w,omitempty"`
 
 	// MinPhaseHoldS is the minimum dwell time before the controller

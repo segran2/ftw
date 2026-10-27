@@ -265,6 +265,14 @@ type stackSpec struct {
 	// batteryDelayS is how long the battery takes to follow an EMS write;
 	// 0 leaves the model's (2 s for sungrow).
 	batteryDelayS float64
+	// soc2Pct adds a second hybrid with an equal 10 kWh battery at this
+	// charge; 0 leaves one.
+	soc2Pct float64
+	// engine is the planner's: core or energyplan. Empty takes
+	// FTW_SITE_ENGINE, else core.
+	engine string
+	// horizonH is the planner's horizon_hours; 0 leaves Core's 48 h.
+	horizonH int
 }
 
 type stack struct {
@@ -315,6 +323,11 @@ func (st *stack) houseSpec() houseSpec {
 	if st.spec.batteryDelayS > 0 {
 		h.Devices[0].CommandResponseS = f64(st.spec.batteryDelayS)
 	}
+	if st.spec.soc2Pct > 0 {
+		second := h.Devices[0]
+		second.ID, second.SoCPct = "inverter2", f64(st.spec.soc2Pct)
+		h.Devices = append(h.Devices, second)
+	}
 	for i, c := range st.spec.chargers {
 		var delay *float64
 		if st.spec.random == nil {
@@ -363,6 +376,17 @@ func (st *stack) up() error {
 	var err error
 	if st.cfg, err = st.ftwConfig(); err != nil {
 		return err
+	}
+	if st.engine() == "energyplan" {
+		// FTW looks for the worker beside its binary or under its working
+		// directory; a box has it in its image.
+		bundle := filepath.Join(st.rundir, "optimizer", "native")
+		if err := os.MkdirAll(bundle, 0o755); err != nil {
+			return err
+		}
+		if err := os.Symlink(filepath.Join(st.env.root, "optimizer", "native", "bundle"), filepath.Join(bundle, "bundle")); err != nil {
+			return err
+		}
 	}
 	if err := st.startFTW(); err != nil {
 		return err
@@ -484,6 +508,17 @@ func (r *recorder) run() {
 
 var lpIDs = []string{"garage", "carport"}
 
+// engine is the planner this run uses.
+func (st *stack) engine() string {
+	if st.spec.engine != "" {
+		return st.spec.engine
+	}
+	if e := os.Getenv("FTW_SITE_ENGINE"); e != "" {
+		return e
+	}
+	return "core"
+}
+
 func (st *stack) ftwConfig() (string, error) {
 	var lps []map[string]any
 	for i := range st.spec.chargers {
@@ -525,8 +560,15 @@ func (st *stack) ftwConfig() (string, error) {
 		// A real box plans. A box without a planner runs Self, where the
 		// battery chases the raw meter and covers the car (dispatch.go),
 		// which hides the stress on the fuse.
-		"planner": map[string]any{"enabled": true, "engine": "core", "mode": "self_consumption"},
+		"planner": map[string]any{"enabled": true, "engine": st.engine(), "mode": "self_consumption"},
 		"price":   map[string]any{"provider": "elprisetjustnu", "zone": "SE3"},
+	}
+	if st.spec.horizonH > 0 {
+		cfg["planner"].(map[string]any)["horizon_hours"] = st.spec.horizonH
+	}
+	if st.spec.soc2Pct > 0 {
+		cfg["drivers"] = append(cfg["drivers"].([]map[string]any),
+			map[string]any{"name": "sungrow2", "lua": "drivers/sungrow.lua", "battery_capacity_wh": 10000, "capabilities": modbus("inverter2")})
 	}
 	path := filepath.Join(st.rundir, "config.yaml")
 	b, err := json.MarshalIndent(cfg, "", "  ") // JSON is valid YAML

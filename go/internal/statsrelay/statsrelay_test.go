@@ -167,7 +167,7 @@ func TestSharedFixtureClockStillRejectsExpiredOrFutureEnvelopes(t *testing.T) {
 	for _, delta := range []time.Duration{0, -24 * time.Hour, -48 * time.Hour, 24 * time.Hour} {
 		t.Run(delta.String(), func(t *testing.T) {
 			_, gw, relay := statsrelaytest.New(t, at)
-			client := statsrelay.NewWithClock(relay.URL, gw.Key, nil, func() time.Time { return at.Add(delta) })
+			client := statsrelay.New(relay.URL, gw.Key, nil).WithClock(func() time.Time { return at.Add(delta) })
 			err := client.Send(context.Background(), body)
 			accepted := delta == 0 || delta == -24*time.Hour
 			if accepted && err != nil {

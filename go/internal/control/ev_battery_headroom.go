@@ -8,7 +8,8 @@ import (
 
 // clampEVBatteryHeadroom keeps optional battery charge out of room an EV
 // still needs. It reads only the site meter and our own commands; no charger
-// or battery reading takes part. The EV still needs its demand less the
+// reading takes part, and a battery's own reading only bounds how much of a
+// discharge we ordered it may keep. The EV still needs its demand less the
 // lowest offer of the last evSettle, which the meter surely shows.
 func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, state *State, fuseMaxW float64) []DispatchTarget {
 	if store == nil || state == nil || len(targets) == 0 || fuseMaxW <= 0 {
@@ -33,10 +34,15 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 	}
 	needW := math.Max(0, demandW-offeredW)
 	meter := store.Get(state.SiteMeterDriver, telemetry.DerMeter)
-	if meter == nil || !finiteFuseValue(meter.RawW) || !finiteFuseValue(fuseMaxW) {
+	if meter == nil {
+		return floorPositiveEVBatteryTargets(targets)
+	}
+	gridW := meter.RawW
+	if !finiteFuseValue(gridW) || !finiteFuseValue(fuseMaxW) {
 		return floorPositiveEVBatteryTargets(targets)
 	}
 	latest := make(map[string]float64, len(targets))
+	lowest := make(map[string]float64, len(targets))
 	targeted := make(map[string]bool, len(targets))
 	for _, target := range targets {
 		if targeted[target.Driver] {
@@ -45,22 +51,35 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 		targeted[target.Driver] = true
 		if _, _, last, sent := state.batteryCommands[target.Driver].span(now); sent {
 			latest[target.Driver] = last
+			// Only a discharge we ordered can be kept; a battery we have
+			// not ordered keeps nothing.
+			if r := store.Get(target.Driver, telemetry.DerBattery); r != nil {
+				lowest[target.Driver], _ = fuseTargetBounds(r, state.DriverLimits[target.Driver])
+			}
 		} else {
 			// Without a recent order it may be discharging and stop.
 			latest[target.Driver] = -state.DriverLimits[target.Driver].dischargeCap()
 		}
 	}
-	// Battery charge stays under the level the EV may rise to.
-	spare := state.importRiseCeilingW(fuseMaxW) - meter.RawW - needW
+	// Battery charge stays under the level the EV may rise to. Ending a
+	// discharge needs room past our own raises the meter may not show, the
+	// EV's included, not past what the car still wants.
+	riseW := math.Max(0, state.EVCommandedW-offeredW)
+	ceilingW := state.importRiseCeilingW(fuseMaxW) - gridW
+	spare, releaseSpare := ceilingW-needW, ceilingW-riseW
 	// During measured export overflow, the existing fuse pipeline may
-	// require charge to reduce export. Magnitudes alone cannot label that
-	// worst phase as import; leave this direction to the existing guard.
-	if meter.RawW >= -state.effectiveExportCeilingW(fuseMaxW) && state.SiteFuseVoltage > 0 {
-		if phaseSpare, known := evBatteryPhaseSpareW(meter, state, needW/(state.SiteFuseVoltage*phases)); known {
+	// require charge to reduce export; leave that direction to it. The
+	// phases carry their direction (phaseCurrentsA): the worst phase is the
+	// one importing most, and an exporting phase leaves the charge more room.
+	if gridW >= -state.effectiveExportCeilingW(fuseMaxW) && state.SiteFuseVoltage > 0 {
+		if phaseSpare, known := evBatteryPhaseSpareW(meter, state, gridW, needW/(state.SiteFuseVoltage*phases)); known {
 			spare = math.Min(spare, phaseSpare)
 		}
+		if phaseSpare, known := evBatteryPhaseSpareW(meter, state, gridW, riseW/(state.SiteFuseVoltage*phases)); known {
+			releaseSpare = math.Min(releaseSpare, phaseSpare)
+		}
 	}
-	out := capBatteryCharge(targets, latest, state.pendingBatteryCommandsW(now), spare)
+	out := capBatteryCharge(targets, latest, lowest, state.pendingBatteryCommandsW(now), spare, releaseSpare)
 	// Charge needed to bring measured export inside its hard ceiling is
 	// not optional. Preserve that part of the already validated offer;
 	// this stage never invents or increases an original battery command.
@@ -69,7 +88,7 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 		offeredCharge += math.Max(0, targets[i].TargetW)
 		finalCharge += math.Max(0, out[i].TargetW)
 	}
-	exportFloor := math.Min(offeredCharge, math.Max(0, -meter.RawW-state.effectiveExportCeilingW(fuseMaxW)))
+	exportFloor := math.Min(offeredCharge, math.Max(0, -gridW-state.effectiveExportCeilingW(fuseMaxW)))
 	if exportFloor > finalCharge && offeredCharge > finalCharge {
 		scale := (exportFloor - finalCharge) / (offeredCharge - finalCharge)
 		for i := range out {
@@ -84,18 +103,21 @@ func clampEVBatteryHeadroom(targets []DispatchTarget, store *telemetry.Store, st
 // capBatteryCharge keeps each battery's latest order: holding it is never an
 // increase. A shortfall of measured room takes positive charge back; new
 // charge needs room left after our increases the meter may not show yet. A
-// reduction this tick funds nothing, as the meter does not show it, and only
-// positive targets change.
-func capBatteryCharge(targets []DispatchTarget, latest map[string]float64, pendingW, spare float64) []DispatchTarget {
+// reduction this tick funds nothing, as the meter does not show it. Ending a
+// discharge is our increase too: the part releaseSpare, less our unshown
+// increases, cannot take stays as discharge, never below lowest, the lowest
+// order each battery's bounds allow (0 W without a reading).
+func capBatteryCharge(targets []DispatchTarget, latest, lowest map[string]float64, pendingW, spare, releaseSpare float64) []DispatchTarget {
 	if !finiteFuseValue(spare) || !finiteFuseValue(pendingW) {
 		return floorPositiveEVBatteryTargets(targets)
 	}
 	out := append([]DispatchTarget(nil), targets...)
 	holds := make([]float64, len(out))
-	var holdW, increaseW float64
+	var holdW, increaseW, lostW float64
 	for i, target := range out {
 		last := latest[target.Driver]
-		spare -= math.Max(0, math.Min(0, target.TargetW)-math.Min(0, last)) // Lost discharge.
+		lost := math.Max(0, math.Min(0, target.TargetW)-math.Min(0, last)) // Lost discharge.
+		spare, lostW = spare-lost, lostW+lost
 		if target.TargetW > 0 {
 			holds[i] = math.Min(target.TargetW, math.Max(0, last))
 			holdW += holds[i]
@@ -118,11 +140,35 @@ func capBatteryCharge(targets []DispatchTarget, latest map[string]float64, pendi
 			out[i].TargetW, out[i].Clamped = capped, true
 		}
 	}
+	return keepEndingDischarge(out, latest, lowest, lostW+pendingW-releaseSpare-holdW*(1-holdScale))
+}
+
+// keepEndingDischarge keeps shortW of the discharge this tick's targets end,
+// shared by how much each battery can keep: down to its latest order, never
+// below its lowest.
+func keepEndingDischarge(out []DispatchTarget, latest, lowest map[string]float64, shortW float64) []DispatchTarget {
+	keep := make([]float64, len(out))
+	var keepW float64
+	for i, target := range out {
+		if last := latest[target.Driver]; last < 0 {
+			keep[i] = math.Max(0, math.Min(0, target.TargetW)-math.Max(last, lowest[target.Driver]))
+			keepW += keep[i]
+		}
+	}
+	if !(shortW > 0) || keepW <= 0 {
+		return out
+	}
+	share := math.Min(1, shortW/keepW)
+	for i := range out {
+		if keep[i] > 0 {
+			out[i].TargetW, out[i].Clamped = math.Min(0, out[i].TargetW)-keep[i]*share, true
+		}
+	}
 	return out
 }
 
-func evBatteryPhaseSpareW(meter *telemetry.DerReading, state *State, evIncreaseA float64) (float64, bool) {
-	worst, present, valid := worstPhaseA(meter, state)
+func evBatteryPhaseSpareW(meter *telemetry.DerReading, state *State, gridW, evIncreaseA float64) (float64, bool) {
+	worst, present, valid := worstPhaseA(meter, state, gridW)
 	if !present {
 		return 0, false
 	}
