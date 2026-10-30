@@ -130,8 +130,17 @@ function sentence(row) {
   }
 }
 
+function reportedChargerReason(row) {
+  return row.kind === 'ev' && row.readings_fresh === true && typeof row.device_reason === 'string'
+    ? row.device_reason.trim() : '';
+}
+
 function nextStep(row) {
   const name = noun(row);
+  const reported = reportedChargerReason(row);
+  if (reported && ['no_power_response', 'power_below_target', 'offered_current_lower', 'device_limit'].includes(row.reason)) {
+    return `The charger reports: ${reported}.`;
+  }
   switch (row.reason) {
     case 'power_below_target': case 'power_above_target': case 'power_wrong_direction':
     case 'no_power_response': case 'power_while_idle':
@@ -159,7 +168,7 @@ function proofLine(row) {
 // can act, the next step. Tone follows Core's severity and status.
 export function controlStatus(row, live = true) {
   if (!live) return {title: 'Status not current', text: 'FTW has not reported for a while.', proof: '', next: 'Waiting for a fresh report.', tone: 'stale'};
-  const headroom = row.kind === 'ev' && row.reason === 'power_below_target' && row.readings_fresh && row.site_headroom?.evidence === 'calculated' ? row.site_headroom : null;
+  const headroom = row.kind === 'ev' && row.reason === 'power_below_target' && row.readings_fresh && !reportedChargerReason(row) && row.site_headroom?.evidence === 'calculated' ? row.site_headroom : null;
   if (headroom && [headroom.fuse_a, headroom.margin_a, headroom.projected_max_a, headroom.battery_charge_w].every(num)) {
     const battery = headroom.battery_charge_w > 100 ? ` The home battery is charging at ${controlPower(headroom.battery_charge_w)}.` : '';
     const current = value => `${Number(value.toFixed(1))} A`;
