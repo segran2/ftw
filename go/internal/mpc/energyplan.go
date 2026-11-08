@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// EnergyplanOptimizer runs the compiled worker on Core's downside forecast.
+// EnergyplanOptimizer runs the compiled worker on the forecast Core selects.
 // Source and builds belong to the private Energyplan repository.
 type EnergyplanOptimizer struct {
 	*ExternalOptimizer
@@ -28,38 +28,57 @@ func NewEnergyplanOptimizer(binary string) (*EnergyplanOptimizer, error) {
 
 const (
 	energyplanSmallBudget = 500 * time.Millisecond
+	// With a car plugged in, a Raspberry Pi 4 needs about 0.6-0.7 s before
+	// the planner can improve on its first plan; at 0.5 s it stopped just
+	// short and published plans about 11% above the proven optimum.
+	energyplanEVBudget    = 1500 * time.Millisecond
 	energyplanFleetBudget = 5 * time.Second
 	// Leave time for ValidatePlan and publication before firstSlotExpired.
 	energyplanPublishMargin = 50 * time.Millisecond
+	// A worker that spends its whole budget must still answer before the
+	// call's deadline: 5 % of the time to it, at least this.
+	energyplanReplyMargin = 30 * time.Millisecond
 )
 
 func energyplanTimeBudget(slots []Slot, p Params) time.Duration {
+	return energyplanBudget(slots, p, false)
+}
+
+// energyplanBudget is the solve budget; hours says the request carries
+// hourly import caps.
+func energyplanBudget(slots []Slot, p Params, hours bool) time.Duration {
 	batteries := len(p.Storages)
 	if batteries == 0 && p.CapacityWh > 0 {
 		batteries = 1
 	}
 	assets := 3*batteries + 2*len(p.activeLoadpoints())
-	// Core already adjusts PV to one downside horizon. That margin does not
-	// add worker scenarios or change this model's size.
+	// Core sends the point forecast and its caution forecast as separate
+	// requests of this size. Caution adds no worker scenarios.
 	budget := energyplanSmallBudget
+	if len(p.activeLoadpoints()) > 0 {
+		budget = energyplanEVBudget
+	}
 	// 1 battery + 1 EV is 5 "assets". A 193-slot villa with demand charges
-	// routes to fleet MILP; 193*6 would leave it on the 500 ms budget.
-	if len(slots)*assets >= 193*5 || p.PVCurtailment.MinW > 0 || len(p.DemandCharges) > 0 {
+	// routes to fleet MILP; 193*6 would leave it on the 500 ms budget. The
+	// hourly import caps route there too.
+	if len(slots)*assets >= 193*5 || p.PVCurtailment.MinW > 0 || len(p.DemandCharges) > 0 || hours {
 		budget = energyplanFleetBudget
 	}
-	remaining := remainingFirstSlot(slots)
-	if remaining < energyplanSmallBudget {
-		return 0
-	}
-	available := remaining - energyplanPublishMargin
-	if available < budget {
-		return available
-	}
-	return budget
+	return min(budget, energyplanSolveTime(remainingFirstSlot(slots)-energyplanPublishMargin))
 }
 
-// Optimize solves the slots Service has already moved to the PV downside, so
-// the worker never adds a second risk margin.
+// energyplanSolveTime is the longest limit a worker can use and still answer
+// before a call deadline toDeadline away. It is zero below Core's no-call
+// threshold: less than energyplanSmallBudget left in the first slot.
+func energyplanSolveTime(toDeadline time.Duration) time.Duration {
+	if toDeadline < energyplanSmallBudget-energyplanPublishMargin {
+		return 0
+	}
+	return toDeadline - max(toDeadline/20, energyplanReplyMargin)
+}
+
+// Optimize solves the slots Service selects, including point and caution
+// attempts. The worker never adds a second risk margin.
 func (o *EnergyplanOptimizer) Optimize(ctx context.Context, slots []Slot, p Params) (Plan, error) {
 	budget := energyplanTimeBudget(slots, p)
 	if budget <= 0 {

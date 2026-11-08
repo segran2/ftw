@@ -42,35 +42,57 @@ func (s *Store) archiveTransaction(ctx context.Context, prepare, write func(cont
 	}
 }
 
-func (s *Store) tryArchiveBatch(parent context.Context, prepare, write func(context.Context, *sql.Tx) error) error {
+func (s *Store) tryArchiveBatch(parent context.Context, prepare, write func(context.Context, *sql.Tx) error) (err error) {
+	timing := newHistoryWriteTiming("connection")
 	conn, err := s.history.Conn(parent)
 	if err != nil {
-		return err
+		return timing.failure(err)
 	}
-	defer conn.Close()
 	var busyMS int
+	var tx *sql.Tx
+	var restoreBusy, viewLocked, writerLocked bool
+	defer func() {
+		// Capture the operation before rollback, busy-timeout restoration and
+		// connection close. Those cleanup steps keep their existing order.
+		err = timing.failure(err)
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		if restoreBusy {
+			restore, done := context.WithTimeout(context.Background(), time.Second)
+			if _, err := conn.ExecContext(restore, fmt.Sprintf("PRAGMA busy_timeout=%d", busyMS)); err != nil {
+				// Never lend changed lock behaviour to live work.
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			}
+			done()
+		}
+		// ErrTxDone can precede SQLite's automatic rollback. Close waits
+		// for that rollback before another live or archive writer can enter.
+		_ = conn.Close()
+		if writerLocked {
+			s.historyWriteMu.Unlock()
+		}
+		if viewLocked {
+			s.archiveViewMu.Unlock()
+		}
+	}()
+	timing.next("busy_timeout")
 	if err := conn.QueryRowContext(parent, `PRAGMA busy_timeout`).Scan(&busyMS); err != nil {
 		return err
 	}
-	defer func() {
-		restore, done := context.WithTimeout(context.Background(), time.Second)
-		defer done()
-		if _, err := conn.ExecContext(restore, fmt.Sprintf("PRAGMA busy_timeout=%d", busyMS)); err != nil {
-			// Never lend a connection with changed lock behaviour to live work.
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
-	}()
+	restoreBusy = true
 	if _, err := conn.ExecContext(parent, `PRAGMA busy_timeout=0`); err != nil {
 		return err
 	}
 	txCtx, cancelTx := context.WithCancel(parent)
 	defer cancelTx()
-	tx, err := conn.BeginTx(txCtx, nil)
+	timing.next("begin")
+	tx, err = conn.BeginTx(txCtx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
 	if prepare != nil {
+		timing.next("prepare")
 		readCtx, cancel := context.WithTimeout(parent, 30*time.Second)
 		err := prepare(readCtx, tx)
 		cancel()
@@ -86,17 +108,21 @@ func (s *Store) tryArchiveBatch(parent context.Context, prepare, write func(cont
 	defer stopDeadline()
 	// Readers may postpone archive writes, but must never make an archive
 	// operation wait while holding the live writer mutex.
+	timing.next("archive_view_lock")
 	if err := lockContext(ctx, s.archiveViewMu.TryLock); err != nil {
 		return err
 	}
-	defer s.archiveViewMu.Unlock()
+	viewLocked = true
+	timing.next("writer_lock")
 	if err := lockContext(ctx, s.historyWriteMu.TryLock); err != nil {
 		return err
 	}
-	defer s.historyWriteMu.Unlock()
+	writerLocked = true
+	timing.next("write")
 	if err := write(ctx, tx); err != nil {
 		return err
 	}
+	timing.next("commit")
 	err = tx.Commit()
 	if err != nil && ctx.Err() != nil {
 		return ctx.Err()

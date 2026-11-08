@@ -68,6 +68,19 @@ Read [docs/architecture.md](docs/architecture.md) for the system map and
 - Every clamp protects a quantified hardware or control risk.
 - Persistent device state is keyed by stable hardware identity, not a YAML name.
 - Database queries stay in [`go/internal/state`](go/internal/state).
+- Lane 0 frames have a fixed length; the padding is a privacy control. Over
+  the relay they keep a fixed cadence. Through FTW Cloud a frame goes on
+  every arrival, each finished driver poll whether or not a value moved,
+  plus a beat when none has gone for the subscribed period, so the timing
+  shows the poll rhythm and never which reading moved (Fredrik, 16 October
+  2026). The proposed FTW Cloud uplink is not padded, so it sends lane 1
+  frames without the bulk buckets and never lane 0. A phone's own session
+  rides inside it as `tun`, with its lane 0 padding intact.
+- FTW Cloud may hold a readable copy of what the owner enabled. It carries the
+  phones' sessions with the box as ciphertext it cannot read or forge, and it
+  never chooses actions; the box judges what arrives as it does over the
+  relay. See [ADR 0008](docs/adr/0008-ftw-cloud.md), proposed, and the
+  tunnel in [docs/protocol-cloud.md](docs/protocol-cloud.md).
 
 ## Drivers
 
@@ -187,12 +200,20 @@ Native 0.x path:
    week, with no open `release-blocker`.
 4. Dispatch the same workflow for `v0.X.Y` stable, naming the tested beta.
    The workflow checks the source commit and release assets, and keeps GitHub
-   `releases/latest` on the old 2.x line.
+   `releases/latest` on the old 2.x line. Newer betas may ship while the
+   sites test the candidate; the workflow refuses a stable only when a newer
+   stable exists. Beta boxes still take the highest release, so a late stable
+   does not hide a newer beta.
 5. Promote the signed driver channel for installs that read `drivers-stable`:
    `gh workflow run ftw-drivers-release.yml -R srcfl/device-drivers --ref main -f channel=stable`.
    It promotes the driver commit already published as `drivers-beta`. If it
    refuses because `main` has moved past `drivers-beta`, publish beta first
    (`-f channel=beta`), then promote.
+
+The workflow runs only from `master`, and a beta tag must match
+`package.json` there. So there is no patch branch for an older line: fix a
+stable on `master`, publish the next beta and promote it by the steps above.
+The site check starts again with that beta.
 
 The old lines are retired: no further 2.x or 3.x releases, including safety
 hotfixes or betas. All new Core releases use the new 0.x path. Do not recommend

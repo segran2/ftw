@@ -70,14 +70,22 @@ func findLuaDriver(t *testing.T, name string) string {
 	return p
 }
 
-func freePort(t *testing.T) int {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+// freePorts returns n ports the kernel just allocated. Every listener stays
+// open until all n are chosen: a port released before the next is taken can
+// come back from that next call, and two servers then share one port
+// (run 39753181920: the status poll reached the Modbus simulator).
+func freePorts(t *testing.T, n int) []int {
+	t.Helper()
+	ports := make([]int, 0, n)
+	for range n {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
+	return ports
 }
 
 // stack holds all the pieces we're testing together.
@@ -135,9 +143,8 @@ func setupStack(t *testing.T) *stack {
 		stopCtl:  make(chan struct{}),
 	}
 
-	s.mqttPort = freePort(t)
-	s.modbusPort = freePort(t)
-	s.apiPort = freePort(t)
+	ports := freePorts(t, 3)
+	s.mqttPort, s.modbusPort, s.apiPort = ports[0], ports[1], ports[2]
 
 	// ---- Start MQTT broker + Ferroamp sim ----
 	mb := mqttserver.New(&mqttserver.Options{InlineClient: true})

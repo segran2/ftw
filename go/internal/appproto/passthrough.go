@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
@@ -86,13 +87,31 @@ type APIGateway interface {
 // GrantReader is this session's enrolment, as it stands right now.
 //
 // Read on every privileged request rather than at the handshake, because a
-// socket outlives a revoke and it outlives a role change too. One string and
-// one integer behind a mutex that is already there.
+// socket outlives a revoke and it outlives a role change too. A few strings
+// and one integer behind a mutex that is already there.
 type GrantReader interface {
-	// Grant is what the enrolment currently carries: the role it holds and
-	// the epoch that answer was written under. ok is false when the device is
-	// no longer enrolled at all — a revoke is an absence, not a stale number.
-	Grant() (role string, epoch uint64, ok bool)
+	// Grant is what the enrolment currently carries. ok is false when the
+	// device is no longer enrolled at all — a revoke is an absence, not a
+	// stale number.
+	Grant() (Enrolment, bool)
+}
+
+// Enrolment is one device's grant as the box holds it this second.
+type Enrolment struct {
+	// Role is the registry role the device holds.
+	Role string
+	// Epoch is the version of the grant this answer was written under.
+	Epoch uint64
+	// ParentRole is the role held now by the phone that added a watch, and
+	// empty for a phone. A watch carries only what both roles carry.
+	ParentRole string
+	// Root is the subject whose command ids this device spends: empty for a
+	// phone, which spends its own, and the parent phone's for a watch. One
+	// intent sent by the watch and by its phone then acts once.
+	Root string
+	// Agent is an agent row's grant now, nil for a phone or a watch. For an
+	// agent, ParentRole is the role its approver holds now.
+	Agent *AgentGrant
 }
 
 // --------------------------------------------------------------------------
@@ -138,10 +157,19 @@ func (h *Handler) onAPIReq(env Envelope) error {
 		})
 	}
 
+	// The slot comes back just before the answer's last frame goes out, not
+	// after it. The app asks again the moment an answer ends; freed after the
+	// frame, the box could refuse that as busy, and the view that lost the
+	// race would wait out a backoff. Any other path (a revoke, a failed send,
+	// an answer refused while its handler still runs) frees the slot when
+	// this goroutine ends, and the Once stops that from freeing a later
+	// request's slot.
 	id := *env.ID
 	go func() {
-		defer h.apiBusy.Store(false)
-		if err := h.serveAPI(id, req); err != nil {
+		var once sync.Once
+		free := func() { once.Do(func() { h.apiBusy.Store(false) }) }
+		defer free()
+		if err := h.serveAPI(id, req, free); err != nil {
 			h.log.Warn("api passthrough failed", "err", err)
 		}
 	}()
@@ -182,7 +210,9 @@ func badAPIRequest(req APIReq) string {
 // Serving it
 // --------------------------------------------------------------------------
 
-func (h *Handler) serveAPI(id uint32, req APIReq) error {
+// free hands the one-at-a-time slot back. serveAPI calls it just before the
+// last frame of an answer, and only once the handler has returned.
+func (h *Handler) serveAPI(id uint32, req APIReq, free func()) error {
 	ctx, cancel := context.WithTimeout(h.ctx, apiHandlerTimeout)
 	defer cancel()
 
@@ -207,6 +237,7 @@ func (h *Handler) serveAPI(id uint32, req APIReq) error {
 		h.log.Info("api passthrough refused",
 			"subject", caller.Subject, "method", req.Method, "path", req.Path,
 			"tier", facts.Tier, "code", refusal.Code)
+		free()
 		return h.sendError(&id, *refusal)
 	}
 
@@ -223,7 +254,7 @@ func (h *Handler) serveAPI(id uint32, req APIReq) error {
 		max = req.MaxBytes
 	}
 	writer := &apiWriter{
-		h: h, id: id, ctx: ctx, max: max, header: http.Header{},
+		h: h, id: id, ctx: ctx, max: max, free: free, header: http.Header{},
 		buf: make([]byte, 0, APIChunkBytes),
 	}
 	h.serveHandler(writer, request)
@@ -439,12 +470,17 @@ func buildAPIRequest(ctx context.Context, caller apiauth.Caller, req APIReq) *ht
 
 // apiWriter turns an http.ResponseWriter into api.head, api.chunk and api.end.
 type apiWriter struct {
-	h   *Handler
-	id  uint32
-	ctx context.Context
-	max int64
+	h    *Handler
+	id   uint32
+	ctx  context.Context
+	max  int64
+	free func()
+	// recheck is set only for a scoped diagnostic read. It runs before
+	// each response frame so a narrowed grant stops a read in flight.
+	recheck func() *ErrorBody
 
 	header    http.Header
+	status    int
 	buf       []byte
 	seq       uint32
 	written   int64
@@ -459,6 +495,9 @@ func (w *apiWriter) Header() http.Header { return w.header }
 
 func (w *apiWriter) WriteHeader(status int) {
 	if w.wroteHead || w.refused {
+		return
+	}
+	if w.checkGrant() != nil {
 		return
 	}
 	if w.ctx.Err() != nil {
@@ -485,6 +524,7 @@ func (w *apiWriter) WriteHeader(status int) {
 	}
 
 	w.wroteHead = true
+	w.status = status
 	w.sendErr = w.h.sendBulk(MsgAPIHead, &w.id, APIHeadMsg{
 		Status:  status,
 		Headers: carriedHeaders(w.header),
@@ -541,6 +581,9 @@ func (w *apiWriter) Write(p []byte) (int, error) {
 }
 
 func (w *apiWriter) flush(n int) error {
+	if err := w.checkGrant(); err != nil {
+		return err
+	}
 	chunk := APIChunk{Seq: w.seq, Data: w.buf[:n]}
 	w.seq++
 	if err := w.h.sendBulk(MsgAPIChunk, &w.id, chunk); err != nil {
@@ -548,6 +591,21 @@ func (w *apiWriter) flush(n int) error {
 	}
 	copy(w.buf, w.buf[n:])
 	w.buf = w.buf[:len(w.buf)-n]
+	return nil
+}
+
+func (w *apiWriter) checkGrant() error {
+	if w.recheck == nil {
+		return nil
+	}
+	if refusal := w.recheck(); refusal != nil {
+		w.refused = true
+		w.sendErr = w.h.sendError(&w.id, *refusal)
+		if w.sendErr != nil {
+			return w.sendErr
+		}
+		return errAPIStopped
+	}
 	return nil
 }
 
@@ -577,6 +635,7 @@ func (w *apiWriter) finish() error {
 			if w.panicked {
 				reason = "handler"
 			}
+			w.free()
 			return w.h.sendError(&w.id, ErrorBody{
 				Code:      ErrUnavailable,
 				Retryable: ErrorRetryable[ErrUnavailable],
@@ -600,6 +659,7 @@ func (w *apiWriter) finish() error {
 	// middle. The app is committed to the status by then, so the only honest
 	// thing left to say is that this is not the whole of it.
 	truncated := w.truncated || w.ctx.Err() != nil || w.panicked
+	w.free()
 	return w.h.sendBulk(MsgAPIEnd, &w.id, APIEnd{Bytes: w.written, Truncated: truncated})
 }
 

@@ -2,7 +2,6 @@ package ocpp
 
 import (
 	"encoding/json"
-	"fmt"
 	"testing"
 	"time"
 
@@ -49,24 +48,26 @@ func (h bootTrigger201) OnTriggerMessage(req *remotecontrol.TriggerMessageReques
 func connectIdentityCharger(t *testing.T, version Version, port int, unsupported bool) (stop func(), boot func(string) error, requested <-chan string) {
 	t.Helper()
 	requests := make(chan string, 10)
-	url := fmt.Sprintf("ws://127.0.0.1:%d", port)
+	url := wsURL(port)
 	if version == Version201 {
-		cp := ocpp201.NewChargingStation("garage", nil, nil)
-		cp.SetRemoteControlHandler(bootTrigger201{requested: requests, unsupported: unsupported})
-		if err := cp.Start(url); err != nil {
+		cp, stop, err := dialChargingStation201(t, url, "garage", func(cp ocpp201.ChargingStation) {
+			cp.SetRemoteControlHandler(bootTrigger201{requested: requests, unsupported: unsupported})
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-		return cp.Stop, func(serial string) error {
+		return stop, func(serial string) error {
 			_, err := cp.BootNotification(provisioning.BootReasonTriggered, "Home", "Easee", func(req *provisioning.BootNotificationRequest) { req.ChargingStation.SerialNumber = serial })
 			return err
 		}, requests
 	}
-	cp := ocpp16.NewChargePoint("garage", nil, nil)
-	cp.SetRemoteTriggerHandler(bootTrigger16{requests, unsupported})
-	if err := cp.Start(url); err != nil {
+	cp, stop, err := dialChargePoint16(t, url, "garage", nil, func(cp ocpp16.ChargePoint) {
+		cp.SetRemoteTriggerHandler(bootTrigger16{requests, unsupported})
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	return cp.Stop, func(serial string) error {
+	return stop, func(serial string) error {
 		_, err := cp.BootNotification("Home", "Easee", func(req *core.BootNotificationRequest) { req.ChargePointSerialNumber = serial })
 		return err
 	}, requests
@@ -163,31 +164,37 @@ func TestIdentityProbeTimeoutAndReconnectAreBounded(t *testing.T) {
 	h := NewHandler(telemetry.NewStore(), 60)
 	t.Cleanup(h.stopIdentityProbes)
 	h.SetApprovedIDs([]string{"garage"})
-	h.identityProbeTiming = identityProbeTiming{time.Millisecond, 5 * time.Millisecond, 30 * time.Millisecond}
+	const interval = 50 * time.Millisecond
+	// The first request waits an hour for its answer, so no timer can send
+	// another before the reconnect below, however late this goroutine runs.
+	h.identityProbeTiming = identityProbeTiming{time.Millisecond, time.Hour, interval}
 	requests := make(chan time.Time, 10)
 	h.identityProbe = func(_ string, _ Version, done func(error)) error { requests <- time.Now(); done(nil); return nil }
-	h.OnConnect("garage")
-	var first time.Time
-	select {
-	case first = <-requests:
-	case <-time.After(time.Second):
-		t.Fatal("initial identity request missing")
-	}
-	h.OnDisconnect("garage")
+	// Each request may go no sooner than one interval after the one before,
+	// so the kth after the first goes at least k intervals after the first
+	// connect. Only that lower bound is checked: a loaded machine delays
+	// requests, it cannot bring them forward.
+	connected := time.Now()
 	h.OnConnect("garage")
 	select {
 	case <-requests:
-		t.Fatal("reconnect bypassed rate limit")
-	case <-time.After(10 * time.Millisecond):
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial identity request missing")
 	}
-	for i := 0; i < maxIdentityProbeAttempts; i++ {
+	// A reconnect starts a fresh set of attempts but keeps the rate limit.
+	// From here each request times out after 5 ms.
+	h.mu.Lock()
+	h.identityProbeTiming.timeout = 5 * time.Millisecond
+	h.mu.Unlock()
+	h.OnDisconnect("garage")
+	h.OnConnect("garage")
+	for k := 1; k <= maxIdentityProbeAttempts; k++ {
 		select {
-		case next := <-requests:
-			if next.Sub(first) < 25*time.Millisecond {
-				t.Fatal("retry bypassed interval")
+		case at := <-requests:
+			if early := at.Sub(connected); early < time.Duration(k)*interval {
+				t.Fatalf("request %d after the first went %v after connect, before the rate limit allowed", k, early)
 			}
-			first = next
-		case <-time.After(time.Second):
+		case <-time.After(5 * time.Second):
 			t.Fatal("bounded retry missing")
 		}
 	}
@@ -200,13 +207,34 @@ func TestIdentityProbeTimeoutAndReconnectAreBounded(t *testing.T) {
 		t.Fatal("retried beyond limit")
 	case <-time.After(45 * time.Millisecond):
 	}
+
+	// Stopping cancels a pending probe and schedules no new one. The grace
+	// is long so that the pending probe cannot fire before the stop.
+	h.mu.Lock()
+	h.identityProbeTiming.grace = time.Hour
+	h.mu.Unlock()
 	h.OnDisconnect("garage")
 	h.OnConnect("garage")
+	h.mu.Lock()
+	pending, epoch := h.chargers["garage"].identityProbeTimer != nil, h.chargers["garage"].identityProbeEpoch
+	h.mu.Unlock()
+	if !pending {
+		t.Fatal("reconnect scheduled no identity probe")
+	}
 	h.stopIdentityProbes()
+	h.requestIdentity("garage", epoch) // a timer that fired as the server stopped
+	h.OnDisconnect("garage")
+	h.OnConnect("garage")
+	h.mu.Lock()
+	pending = h.chargers["garage"].identityProbeTimer != nil
+	h.mu.Unlock()
+	if pending {
+		t.Fatal("probe scheduled after server stop")
+	}
 	select {
 	case <-requests:
 		t.Fatal("probe outlived server stop")
-	case <-time.After(45 * time.Millisecond):
+	default:
 	}
 }
 
@@ -249,16 +277,31 @@ func TestAdoptionStartsIdentityProbeWithoutReconnect(t *testing.T) {
 func TestIdentityProbeRevocationCancelsPendingRequest(t *testing.T) {
 	h := NewHandler(telemetry.NewStore(), 60)
 	t.Cleanup(h.stopIdentityProbes)
-	h.identityProbeTiming = identityProbeTiming{20 * time.Millisecond, time.Second, time.Minute}
+	// The grace is long so that the pending probe cannot fire before the
+	// revocation, however late this goroutine runs.
+	h.identityProbeTiming = identityProbeTiming{time.Hour, time.Second, time.Minute}
 	requested := make(chan struct{}, 1)
 	h.identityProbe = func(string, Version, func(error)) error { requested <- struct{}{}; return nil }
 	h.SetApprovedIDs([]string{"garage"})
 	h.OnConnect("garage")
+	h.mu.Lock()
+	pending, epoch := h.chargers["garage"].identityProbeTimer != nil, h.chargers["garage"].identityProbeEpoch
+	h.mu.Unlock()
+	if !pending {
+		t.Fatal("connect scheduled no identity probe")
+	}
 	h.SetApprovedIDs(nil)
+	h.mu.Lock()
+	pending = h.chargers["garage"].identityProbeTimer != nil
+	h.mu.Unlock()
+	if pending {
+		t.Fatal("revocation left the identity probe pending")
+	}
+	h.requestIdentity("garage", epoch) // a timer that fired as the charger was revoked
 	select {
 	case <-requested:
 		t.Fatal("revoked charger received probe")
-	case <-time.After(40 * time.Millisecond):
+	default:
 	}
 }
 

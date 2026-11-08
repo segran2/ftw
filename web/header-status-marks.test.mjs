@@ -188,10 +188,10 @@ describe("header status marks", () => {
 
   it("takes its three colours from the themed palette, not hardcoded hex", () => {
     const styles = new FtwUpdateBadge()._styles();
-    assert.match(styles, /\.mark\.update \{[^}]*color: var\(--cyan/);
-    assert.match(styles, /\.mark\.warning \{[^}]*color: var\(--amber/);
-    assert.match(styles, /\.mark\.ok \{[^}]*color: var\(--green-e/);
-    assert.match(styles, /\.mark\.offline \{[^}]*color: var\(--red-e/);
+    assert.match(styles, /\.mark\.update \{[^}]*color: var\(--fg,/);
+    assert.match(styles, /\.mark\.warning \{[^}]*color: var\(--fg-dim/);
+    assert.match(styles, /\.mark\.ok \{[^}]*color: var\(--live/);
+    assert.match(styles, /\.mark\.offline \{[^}]*color: var\(--alarm/);
   });
 });
 

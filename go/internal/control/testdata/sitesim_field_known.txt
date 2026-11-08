@@ -1,0 +1,6 @@
+# Field matrix rows that fail on master: case, invariant and the fix that
+# turns the row green. TestSiteSimFieldMatrix fails when a listed row passes
+# and when a row fails that is not listed. FTW_FIELD_KNOWN=write rewrites
+# this file from a run, keeps each label and marks unlisted failures "new".
+#
+# No row fails: every case keeps the invariants.

@@ -111,9 +111,8 @@ func (m *Manager) ObserveSample(id string, sample EVSample) {
 		lp.chargingSteadySince = time.Time{}
 		lp.stoppedSince = time.Time{}
 		lp.steadyRunArmed = false
-		if lp.vehicleName != "" || lp.capacityFromCar {
+		if lp.capacityFromCar {
 			lp.VehicleCapacityWh = lp.baseCapacityWh
-			lp.vehicleName = ""
 			lp.capacityFromCar = false
 			lp.baseCapacityWh = 0
 		}
@@ -301,8 +300,9 @@ func (m *Manager) persistSession(id string) {
 }
 
 // observeConnectionProof handles a lost socket without inventing a cable
-// edge or refreshing the last physical observation. A fresh Boot alone must
-// not let an older manual Start follow an unidentified connection.
+// edge or refreshing the last physical observation. A fresh Boot alone does
+// not prove the same car. Charge now keeps its power and checks the next
+// hardware proof (restoreManualHoldForSession).
 func (m *Manager) observeConnectionProof(id string, generation uint64, unknown bool) {
 	m.sessionMu.Lock()
 	defer m.sessionMu.Unlock()
@@ -331,9 +331,8 @@ func (m *Manager) observeConnectionProof(id string, generation uint64, unknown b
 	lp.sessionGeneration = m.nextSessionGeneration
 	lp.socConfirmed = false
 	lp.socRetention = "unavailable"
-	if lp.vehicleName != "" || lp.capacityFromCar {
+	if lp.capacityFromCar {
 		lp.VehicleCapacityWh = lp.baseCapacityWh
-		lp.vehicleName = ""
 		lp.capacityFromCar = false
 		lp.baseCapacityWh = 0
 	}

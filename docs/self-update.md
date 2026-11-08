@@ -106,9 +106,10 @@ commit. Beta and stable contain different embedded version strings, so each
 package has its own hash and receipt. A tag, green CI run or published package
 alone is not field validation.
 
-On a native site the owner runs updates on the machine, by hand or from their
-own timer or agent. [Try the 0.x beta](native-beta.md) is the tester's
-guide. The installer puts the `ftw` command on `PATH`:
+On a native site the owner chooses when to update, from More → Version, on
+the machine, or from their own timer or agent.
+[Try the 0.x beta](native-beta.md) is the tester's guide. The installer puts
+the `ftw` command on `PATH`:
 
 ```bash
 ftw status                   # version, published release, last update, health
@@ -127,7 +128,7 @@ duration; in a log or script it is one line per step. Core records every
 finished step with its own timing, so a step that ends between two reads is
 still shown. `ftw update` waits through the restart, including a history
 migration, and reports the version and health that result. A trial only
-becomes current after readiness;
+becomes current after its first control tick;
 a failed trial falls back to the previous Core, and `ftw update` names the
 Core that runs. Already current exits 0, so a script can run the step
 unattended; a failed step exits 1. The same steps are Core API calls. A
@@ -138,8 +139,13 @@ natively yet; `ftw update` stops before it changes anything.
 `ftw status` also shows free space for releases and backups, and any local
 rollback points an older Core left; native Core does not use them, so they
 can be deleted.
-The web UI on a native install shows the running version, a published
-release and the command; it has no update controls. See
+On a native install, More → Version shows the running version and any newer
+release. **Update FTW** starts the same update through Core's API, with no
+separate updater. The dialog shows downloaded bytes, completed steps and
+connection loss during restart, then reloads and shows the result. A failed
+version needs an explicit **Try this version again** action; an unsupported
+change to stored data or an unready installation cannot start an update.
+`ftw` and the API still handle channel changes, rollback and backups. See
 [ADR 0007](adr/0007-self-updating-binary.md) and
 [full backup and restore](backup-and-restore.md).
 

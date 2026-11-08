@@ -61,8 +61,11 @@ func (e *commandMayHaveRunError) Is(target error) bool {
 
 const (
 	defaultRecoveryTimeout = 5 * time.Second
-	defaultRetryInitial    = 100 * time.Millisecond
-	defaultRetryMax        = 30 * time.Second
+	// commandRunTimeout is the least time a started command gets to finish.
+	// The caller's deadline bounds its wait, not the device's answer.
+	commandRunTimeout   = defaultRecoveryTimeout
+	defaultRetryInitial = 100 * time.Millisecond
+	defaultRetryMax     = 30 * time.Second
 )
 
 // DriverControlStatus describes the safety state that the API may expose to
@@ -80,6 +83,10 @@ type DriverControlStatus struct {
 type Registry struct {
 	tel                 *telemetry.Store
 	troubleshootingMode bool
+	// Set before Add. The callback reads the live installation mode.
+	ControlBlocked func() bool
+	// CommandBlocked stops new dispatch while safe defaults remain possible.
+	CommandBlocked func() bool
 
 	// MQTTFactory creates an MQTT capability for a driver given its config.
 	// Called on Add; the returned MQTTCap belongs to that driver alone.
@@ -93,15 +100,19 @@ type Registry struct {
 	// Optional — when nil, devices fall back to endpoint-hash IDs.
 	ARPLookup func(host string) (mac string, ok bool)
 	// SecretPersister, when set, durably stores a driver secret (keyed by
-	// driver name + key) in the unwatched state KV. Wired by main.go.
+	// credential owner + key) in the unwatched state KV. Wired by main.go.
 	// Optional — when nil, host.persist_secret returns an error and the
 	// driver degrades (an OAuth driver re-uses its last in-memory token).
-	SecretPersister func(driverName, key, value string) error
+	SecretPersister func(owner, key, value string) error
 	// SecretOverride, when set, returns a durably-persisted secret for a
 	// driver (the counterpart to SecretPersister). Applied over the
 	// config.yaml value at driver_init so a rotated token survives a
 	// restart. Returns ("", false) when no override exists.
-	SecretOverride func(driverName, key string) (string, bool)
+	SecretOverride         func(owner, key string) (string, bool)
+	VehicleWakeReservation func(makeName, serial string) (bool, time.Duration, error)
+	// SiteLocation, when set, gives vehicle drivers the site's coordinates
+	// (HostEnv.SiteLocation). Wired by main.go to the live config.
+	SiteLocation func() (lat, lon float64, ok bool)
 	// RuntimePolicyResolver returns the verified signed policy of a managed
 	// read-only artifact. Nil means bundled, local and control-capable
 	// signed drivers, which run without one.
@@ -114,6 +125,9 @@ type Registry struct {
 	lifecycleHook    func(name string)
 	lifecycleMu      sync.Mutex
 	lifecycleGates   map[string]*lifecycleGate
+	spawnRetries     map[string]*spawnRetry
+	spawnInflight    map[string]struct{}
+	spawnRetryClosed bool
 }
 
 // lifecycleGate serializes every lifecycle transition for one driver name.
@@ -132,6 +146,32 @@ func NewRegistry(tel *telemetry.Store) *Registry {
 		recoveryRequired: map[string]bool{},
 		lifecycleGates:   map[string]*lifecycleGate{},
 	}
+}
+
+func (r *Registry) controlBlocked() bool {
+	return r.ControlBlocked != nil && r.ControlBlocked()
+}
+
+func (r *Registry) commandBlocked(payload []byte) bool {
+	return r.CommandBlocked != nil && r.CommandBlocked() && !IsEVStanddown(payload)
+}
+
+// IsEVStanddown admits only the explicit stop forms used by Core. Extra
+// fields cannot turn the zero-power exception into a different command.
+func IsEVStanddown(payload []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil {
+		return false
+	}
+	var action string
+	if json.Unmarshal(fields["action"], &action) != nil {
+		return false
+	}
+	if action == "ev_pause" && len(fields) == 1 {
+		return true
+	}
+	var power *float64
+	return action == "ev_set_current" && len(fields) == 2 && json.Unmarshal(fields["power_w"], &power) == nil && power != nil && *power == 0
 }
 
 func (r *Registry) acquireLifecycle(name string) func() {
@@ -257,6 +297,10 @@ type runningDriver struct {
 	evPauseRevision uint64
 	evPauseCycleID  uint64
 	evPausePending  bool
+	// Default-recovery backoff bounds; zero means defaultRetryInitial and
+	// defaultRetryMax. Tests set them.
+	retryInitial time.Duration
+	retryMax     time.Duration
 	// Poll loop coordination
 	cmdCh     chan driverCmd
 	defaultCh chan driverCmd
@@ -323,6 +367,26 @@ func (rd *runningDriver) markDefaultRecoveryPending() {
 	rd.defaultConfirmed = false
 	rd.recoveryPending = true
 	rd.statusMu.Unlock()
+}
+
+// commandRunContext gives a started command at least commandRunTimeout. A
+// caller deadline shorter than that ends only the caller's wait; an explicit
+// cancel still stops the command.
+func commandRunContext(caller context.Context) (context.Context, func()) {
+	deadline, ok := caller.Deadline()
+	if !ok || time.Until(deadline) >= commandRunTimeout {
+		return caller, func() {}
+	}
+	run, cancel := context.WithTimeout(context.WithoutCancel(caller), commandRunTimeout)
+	stop := context.AfterFunc(caller, func() {
+		if errors.Is(caller.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return run, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (rd *runningDriver) beginCommand(ctx context.Context) (context.Context, func()) {
@@ -402,9 +466,12 @@ func (s *commandState) snapshot() (err error, started, completed bool) {
 	return err, started, completed
 }
 
+// commandContextError says whether a command that returned success was cut
+// short. The caller's deadline only ends its wait, so a success that arrives
+// after it still counts; an explicit cancel does not.
 func commandContextError(requestCtx, executionCtx context.Context) error {
 	if requestCtx != nil {
-		if err := requestCtx.Err(); err != nil {
+		if err := requestCtx.Err(); errors.Is(err, context.Canceled) {
 			return err
 		}
 	}
@@ -502,7 +569,7 @@ func legacyDriverRequiresDefaultMode(path string, hasCommand bool) (bool, error)
 // add is the shared driver construction path. The caller must hold the
 // lifecycle gate for cfg.Name. startupDefault is false only for connection
 // probes; operational drivers use the startup safety gate.
-func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) error {
+func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bool) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -512,6 +579,15 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		return fmt.Errorf("driver %q already registered", cfg.Name)
 	}
 	r.mu.Unlock()
+	if startupDefault {
+		prevDelay := r.takeSpawnRetry(cfg.Name)
+		retryCfg := cfg
+		defer func() {
+			if err != nil {
+				r.scheduleSpawnRetry(retryCfg, prevDelay, err)
+			}
+		}()
+	}
 
 	if cfg.Lua == "" {
 		return fmt.Errorf("driver %q: must specify `lua` path", cfg.Name)
@@ -526,6 +602,10 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	}
 
 	env := NewHostEnv(cfg.Name, r.tel)
+	env.ControlBlocked = r.ControlBlocked
+	if entry, err := ParseCatalogFile(cfg.Lua); err == nil {
+		env.SetupAuthPaths = append([]string{entry.AuthPostPath}, entry.AuthPostPaths...)
+	}
 	// runLoop owns the capabilities once the driver is registered. Until then
 	// every failed return closes what it opened: a leaked MQTT client keeps
 	// reconnecting under the same client ID and fights the next Add.
@@ -540,12 +620,19 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	// Wire secret write-back (rotated OAuth tokens). The host must install
 	// SecretPersister and SecretOverride before Add: init may persist a
 	// secret, and the poll loop starts before Add returns.
-	driverName := cfg.Name
+	env.ReserveVehicleWake = func(makeName, serial string) (bool, time.Duration, error) {
+		if cfg.ObserveOnly || r.VehicleWakeReservation == nil {
+			return false, 30 * time.Minute, ErrNoCapability
+		}
+		return r.VehicleWakeReservation(makeName, serial)
+	}
+	env.SiteLocation = r.SiteLocation
+	secretOwner := cfg.SecretOwner()
 	env.PersistSecret = func(key, value string) error {
 		if r.SecretPersister == nil {
 			return fmt.Errorf("persist_secret: not supported on this host")
 		}
-		return r.SecretPersister(driverName, key, value)
+		return r.SecretPersister(secretOwner, key, value)
 	}
 	if mq := cfg.EffectiveMQTT(); mq != nil && r.MQTTFactory != nil {
 		dialCfg := *mq
@@ -572,6 +659,10 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 			return fmt.Errorf("modbus capability: %w", err)
 		}
 		env.WithModbus(cap)
+		if policy, ok := cap.(interface{ ReadOnly() bool }); ok && policy.ReadOnly() {
+			cfg.ObserveOnly = true
+			env.DeviceReadOnly = true
+		}
 		env.SetEndpoint(fmt.Sprintf("modbus://%s:%d", dialCfg.Host, dialCfg.Port))
 		if r.ARPLookup != nil {
 			if mac, ok := r.ARPLookup(dialCfg.Host); ok {
@@ -590,6 +681,19 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	if cfg.Capabilities.HTTP != nil {
 		env.WithHTTP()
 		hosts := mergeAllowedHosts(cfg.Capabilities.HTTP.AllowedHosts, cfg.Config)
+		// Cloud drivers declare their fixed network boundary in DRIVER.http_hosts.
+		// Older saved configs (and connection probes built from them) may predate
+		// that metadata and therefore have no capabilities.http.allowed_hosts.
+		// Hydrate only from the Lua driver's own declaration; never from operator
+		// input. Explicit config hosts are retained and merged above.
+		if entry, err := ParseCatalogFile(cfg.Lua); err == nil {
+			for _, h := range entry.HTTPHosts {
+				h = strings.TrimSpace(h)
+				if h != "" && !slices.Contains(hosts, h) {
+					hosts = append(hosts, h)
+				}
+			}
+		}
 		if len(hosts) > 0 {
 			env.WithHTTPAllowedHosts(hosts)
 		}
@@ -616,10 +720,33 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	if cfg.Capabilities.AllowUnverifiedLocal {
 		env.WithAllowUnverifiedLocal()
 	}
+	// A cloud driver that streams from a fixed vendor host declares it in
+	// DRIVER.ws_hosts, as it declares http_hosts. For a driver whose config
+	// already grants HTTP, the declaration grants the WebSocket for those
+	// hosts, so a saved config needs no capabilities.websocket entry. A
+	// driver without HTTP gets no network access from a file edit. Hosts
+	// come only from the Lua driver's own declaration and are merged into
+	// any the config lists.
+	var wsHosts []string
 	if cfg.Capabilities.WebSocket != nil {
+		wsHosts = append(wsHosts, cfg.Capabilities.WebSocket.AllowedHosts...)
+	}
+	declaredWS := false
+	if entry, err := ParseCatalogFile(cfg.Lua); err == nil && cfg.Capabilities.HTTP != nil {
+		for _, h := range entry.WSHosts {
+			h = strings.TrimSpace(h)
+			if h != "" {
+				declaredWS = true
+				if !slices.Contains(wsHosts, h) {
+					wsHosts = append(wsHosts, h)
+				}
+			}
+		}
+	}
+	if cfg.Capabilities.WebSocket != nil || declaredWS {
 		env.WithWS(NewGorillaWS(cfg.Name, cfg.Capabilities.AllowUnverifiedLocal))
-		if hosts := cfg.Capabilities.WebSocket.AllowedHosts; len(hosts) > 0 {
-			env.WithWSAllowedHosts(hosts)
+		if len(wsHosts) > 0 {
+			env.WithWSAllowedHosts(wsHosts)
 		}
 	}
 	if cfg.Capabilities.TCP != nil {
@@ -668,7 +795,7 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 	if r.SecretOverride != nil && len(cfg.Config) > 0 {
 		merged := make(map[string]any, len(cfg.Config))
 		for k, v := range cfg.Config {
-			if ov, ok := r.SecretOverride(cfg.Name, k); ok {
+			if ov, ok := r.SecretOverride(secretOwner, k); ok {
 				merged[k] = ov
 			} else {
 				merged[k] = v
@@ -689,7 +816,7 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		return fmt.Errorf("driver_init: %w", err)
 	}
 	var startupDefaultErr error
-	if startupDefault && !cfg.ObserveOnly {
+	if startupDefault && !cfg.ObserveOnly && !r.controlBlocked() {
 		defaultCtx, cancel := context.WithTimeout(ctx, defaultRecoveryTimeout)
 		startupDefaultErr = drv.DefaultMode(defaultCtx)
 		cancel()
@@ -711,11 +838,12 @@ func (r *Registry) add(ctx context.Context, cfg config.Driver, startupDefault bo
 		stop:            make(chan bool, 1),
 		done:            make(chan struct{}),
 	}
+	controlBlockedAtStart := r.controlBlocked()
 	r.mu.Lock()
 	r.nextGeneration++
 	rd.generation = r.nextGeneration
 	inheritsRecovery := r.recoveryRequired[cfg.Name]
-	if startupDefault && !cfg.ObserveOnly {
+	if startupDefault && !cfg.ObserveOnly && !controlBlockedAtStart {
 		if startupDefaultErr == nil {
 			rd.defaultConfirmed = true
 			if inheritsRecovery {
@@ -770,7 +898,17 @@ func (r *Registry) runLoop(rd *runningDriver) {
 	}
 	var recoveryTimer *time.Timer
 	var recoveryC <-chan time.Time
-	retryDelay := defaultRetryInitial
+	retryInitial, retryMax := rd.retryInitial, rd.retryMax
+	if retryInitial <= 0 {
+		retryInitial = defaultRetryInitial
+	}
+	if retryMax <= 0 {
+		retryMax = defaultRetryMax
+	}
+	retryDelay := retryInitial
+	// pollFailed holds while the device's reads fail. The first good poll
+	// after it is the device's return.
+	pollFailed := false
 	clearRecoveryTimer := func() {
 		if recoveryTimer != nil {
 			if !recoveryTimer.Stop() {
@@ -781,12 +919,12 @@ func (r *Registry) runLoop(rd *runningDriver) {
 			}
 		}
 		recoveryC = nil
-		retryDelay = defaultRetryInitial
+		retryDelay = retryInitial
 	}
 	scheduleRecovery := func() {
 		d := retryDelay
 		if d <= 0 {
-			d = defaultRetryInitial
+			d = retryInitial
 		}
 		if recoveryTimer == nil {
 			recoveryTimer = time.NewTimer(d)
@@ -801,10 +939,10 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		}
 		recoveryC = recoveryTimer.C
 		rd.markDefaultRecoveryPending()
-		if retryDelay < defaultRetryMax {
+		if retryDelay < retryMax {
 			retryDelay *= 2
-			if retryDelay > defaultRetryMax {
-				retryDelay = defaultRetryMax
+			if retryDelay > retryMax {
+				retryDelay = retryMax
 			}
 		}
 	}
@@ -813,6 +951,9 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		scheduleRecovery()
 	}
 	attemptDefault := func() error {
+		if r.controlBlocked() {
+			return fmt.Errorf("setup measurement mode blocks device defaults")
+		}
 		// The actor owns this transition. Invalidate any pause→resume
 		// continuation before the default call starts, regardless of whether
 		// the device later confirms it.
@@ -841,6 +982,12 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		return commandOutcome
 	}
 	handleDefault := func(cmd driverCmd) {
+		if r.controlBlocked() {
+			if cmd.result != nil {
+				cmd.result <- fmt.Errorf("setup measurement mode blocks device defaults")
+			}
+			return
+		}
 		invalidateCommandSequence()
 		cmdCtx := cmd.ctx
 		if cmdCtx == nil {
@@ -883,6 +1030,7 @@ func (r *Registry) runLoop(rd *runningDriver) {
 		}
 		select {
 		case skipDefault := <-rd.stop:
+			skipDefault = skipDefault || r.controlBlocked()
 			if skipDefault {
 				rd.driver.Discard()
 			} else {
@@ -928,6 +1076,10 @@ func (r *Registry) runLoop(rd *runningDriver) {
 			}
 			switch cmd.kind {
 			case "command":
+				if r.controlBlocked() || r.commandBlocked(cmd.payload) {
+					err = fmt.Errorf("setup measurement mode blocks device commands")
+					break
+				}
 				metadata := commandMetadata(cmd.payload)
 				action := metadata.Action
 				cyclePause := action == "ev_pause" && cmd.cycleID != 0
@@ -973,13 +1125,21 @@ func (r *Registry) runLoop(rd *runningDriver) {
 					// own (manual ev_resume does not require a cycle id).
 					invalidateCommandSequence()
 				}
-				commandCtx, finishCommand := rd.beginCommand(cmdCtx)
+				// A wallbox-cycle step keeps its caller's deadline. Its owner gives
+				// up at that deadline and sends no resume, so a pause that lands
+				// late must fail and restore the default, not latch as pending.
+				runCtx, finishRun := cmdCtx, func() {}
+				if cmd.cycleID == 0 {
+					runCtx, finishRun = commandRunContext(cmdCtx)
+				}
+				commandCtx, finishCommand := rd.beginCommand(runCtx)
 				// SendDefault may close the control window after the earlier queue
 				// check but before this actor installs activeCancel. Recheck once the
 				// cancel hook exists; after this point a racing default cancels the
 				// context passed to the runtime.
 				if rejection := rd.commandRejection(cmd.controlEpoch); rejection != nil {
 					finishCommand()
+					finishRun()
 					err = rejection
 					break
 				}
@@ -1006,7 +1166,13 @@ func (r *Registry) runLoop(rd *runningDriver) {
 				} else {
 					rd.markCommandApplied()
 				}
+				if action == "wake_up" || action == "ev_wake" {
+					// A telemetry refresh may request an early read even when its
+					// wake was throttled. Apply that interval to the active timer.
+					timer.Reset(rd.env.PollInterval())
+				}
 				finishCommand()
+				finishRun()
 				if err == nil && cyclePause {
 					rd.evPausePending = true
 					rd.evPauseRevision = rd.commandRevision
@@ -1026,8 +1192,13 @@ func (r *Registry) runLoop(rd *runningDriver) {
 			// Register the poll as the active Lua call so SendDefault can
 			// cancel it the same way it cancels an in-flight command.
 			pollCtx, finishPoll := rd.beginCommand(ctx)
-			_, err := rd.driver.Poll(pollCtx)
+			returned, err := rd.driver.Poll(pollCtx)
 			finishPoll()
+			returnedFromOutage := err == nil && pollFailed
+			pollFailed = err != nil
+			if r.tel != nil {
+				r.tel.CountPoll(err != nil)
+			}
 			if err != nil {
 				slog.Warn("driver poll failed", "name", rd.cfg.Name, "err", err)
 				if r.tel != nil {
@@ -1044,9 +1215,25 @@ func (r *Registry) runLoop(rd *runningDriver) {
 				// re-stamps LastSuccess every tick from cached values.
 				r.tel.RecordDriverTick(rd.cfg.Name)
 			}
-			// Re-arm timer at driver's requested interval
-			interval = rd.env.PollInterval()
+			if r.tel != nil {
+				// The poll's readings are in the store: whoever streams
+				// them sends now, not on its next pulse.
+				r.tel.Arrived()
+			}
+			// Re-arm at the interval the poll returned, or the standing one.
+			interval = rd.env.nextPollInterval(returned)
 			timer.Reset(interval)
+			// A default that failed while the device was away is retried
+			// on its first good poll, not when the backoff (up to 30 s)
+			// next allows. Once per return: a device that reads but still
+			// refuses waits for the backoff again.
+			if returnedFromOutage && recoveryC != nil {
+				if err := attemptDefault(); err != nil {
+					slog.Error("driver default failed on its first good poll after an outage; control remains blocked", "name", rd.cfg.Name, "err", err)
+				} else {
+					slog.Info("driver default confirmed on its first good poll after an outage", "name", rd.cfg.Name)
+				}
+			}
 		case <-recoveryC:
 			if err := attemptDefault(); err != nil {
 				slog.Error("driver default recovery failed; control remains blocked", "name", rd.cfg.Name, "err", err)
@@ -1093,6 +1280,8 @@ func (r *Registry) remove(name string, skipDefault bool) {
 // lets Restart and Reload keep the old generation and its replacement in one
 // serialized transition instead of opening an Add/Remove gap.
 func (r *Registry) removeLocked(name string, skipDefault bool) {
+	r.takeSpawnRetry(name)
+	skipDefault = skipDefault || r.controlBlocked()
 	r.mu.Lock()
 	rd, ok := r.rec[name]
 	if !ok {
@@ -1180,6 +1369,9 @@ func (r *Registry) SendWithGeneration(ctx context.Context, name string, payload 
 }
 
 func (r *Registry) sendWithGeneration(ctx context.Context, name string, payload []byte, cycleID uint64, checkEVHealth bool, outcome func(error)) (uint64, error) {
+	if r.controlBlocked() || r.commandBlocked(payload) {
+		return 0, fmt.Errorf("setup measurement mode blocks device commands")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1234,6 +1426,9 @@ func (r *Registry) sendWithGeneration(ctx context.Context, name string, payload 
 // blocked until the default succeeds or the recovery timer retries it. An
 // observe_only driver is refused with ErrObserveOnly, as main's watchdog does.
 func (r *Registry) SendDefault(ctx context.Context, name string) error {
+	if r.controlBlocked() {
+		return fmt.Errorf("setup measurement mode blocks device defaults")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1275,6 +1470,15 @@ func (r *Registry) SendDefault(ctx context.Context, name string) error {
 	}
 }
 
+// CanControl checks the loaded driver's write authority without sending a
+// command. Registry.Send still checks it again for the selected generation.
+func (r *Registry) CanControl(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rd, ok := r.rec[name]
+	return ok && !rd.readOnly && !rd.cfg.ObserveOnly
+}
+
 // ControlStatus returns the command safety state for the current driver
 // generation without creating or changing any state.
 func (r *Registry) ControlStatus(name string) (DriverControlStatus, bool) {
@@ -1312,6 +1516,11 @@ func (r *Registry) Names() []string {
 
 // ShutdownAll stops every driver. Blocks until all poll loops exit.
 func (r *Registry) ShutdownAll() {
+	// An attempt in flight holds its gate and tears its driver down itself
+	// once it sees the registry closed. Wait for it.
+	for _, n := range r.closeSpawnRetries() {
+		r.acquireLifecycle(n)()
+	}
 	r.mu.Lock()
 	names := make([]string, 0, len(r.rec))
 	for n := range r.rec {
@@ -1337,6 +1546,14 @@ func (r *Registry) Reload(ctx context.Context, newDrivers []config.Driver, troub
 			continue
 		}
 		active = append(active, d)
+	}
+	// Stop retrying a driver that failed to start and has left the config.
+	for _, n := range r.pendingSpawnRetries() {
+		if _, ok := findDriver(active, n); !ok {
+			release := r.acquireLifecycle(n)
+			r.removeLocked(n, false)
+			release()
+		}
 	}
 
 	r.mu.Lock()
@@ -1439,7 +1656,7 @@ func replacementContext(ctx context.Context) context.Context {
 	return context.WithoutCancel(ctx)
 }
 
-// PollInterval returns the currently requested cadence for a running driver.
+// PollInterval returns the cadence a running driver is polled at now.
 // Repository activation uses it to wait for two fresh cycles before declaring
 // a new artifact healthy.
 func (r *Registry) PollInterval(name string) (time.Duration, bool) {
@@ -1449,7 +1666,7 @@ func (r *Registry) PollInterval(name string) (time.Duration, bool) {
 	if !ok {
 		return 0, false
 	}
-	return rd.env.PollInterval(), true
+	return rd.env.ScheduledPollInterval(), true
 }
 
 // tcpAllowedHostsFor builds the effective allowlist for a TCP-capable
@@ -1484,6 +1701,8 @@ func tcpAllowedHostsFor(cfg config.Driver) []string {
 		case int:
 			port = p
 		case int64:
+			port = int(p)
+		case uint64:
 			port = int(p)
 		case float64:
 			port = int(p)

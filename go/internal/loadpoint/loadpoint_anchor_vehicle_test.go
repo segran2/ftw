@@ -1,10 +1,47 @@
 package loadpoint
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
+
+	"github.com/srcfl/ftw/go/internal/telemetry"
 )
+
+func TestCachedVAGSoCReplacesManualPlanningAnchor(t *testing.T) {
+	tel := telemetry.NewStore()
+	soc := .78
+	tel.Update("vag", telemetry.DerVehicle, 0, &soc, json.RawMessage(`{"soc":78,"soc_fresh":false,"stale":true,"charging_state":"Stopped"}`))
+	tel.EmitMetric("vag", "vehicle_soc_age_s", 34*60, "s", "", "")
+	tel.DriverHealthMut("vag").RecordSuccess()
+	_, receivedAt, _ := tel.LatestMetric("vag", "vehicle_soc_age_s")
+	obs := telemetry.VehicleObservations(tel)
+	if len(obs) != 1 || obs[0].Driver != "vag" || !obs[0].At.Equal(receivedAt.Add(-34*time.Minute)) {
+		t.Fatalf("timestamped VAG observation did not reach the cars: %+v", obs)
+	}
+	pick := obs[0]
+	m := NewManager()
+	m.Load([]Config{{ID: "easee", VehicleCapacityWh: 95000, PluginSoC: .27}})
+	now := pick.At.Add(-time.Minute)
+	m.SetNowFn(func() time.Time { return now })
+	m.Observe("easee", true, 0, 0, true)
+	now = pick.At
+	m.Observe("easee", true, 0, 0, true)
+	now = receivedAt
+	m.Observe("easee", true, 0, 2000, true)
+	m.SetCurrentSoC("easee", .27)
+	for range 3 {
+		if !m.AnchorVehicleSoCAt("easee", pick.SoC, pick.At) {
+			t.Fatal("same-session VAG anchor refused")
+		}
+		st, _ := m.State("easee")
+		want := .78 + 2000*DefaultChargeEfficiency/95000
+		if math.Abs(st.CurrentSoC-want) > 1e-9 || st.SoCSource == "assumed" {
+			t.Fatalf("planning still uses manual 27%% or double-counted energy: %+v, want %v", st, want)
+		}
+	}
+}
 
 // TestAnchorVehicleSoC — when a trusted vehicle BMS reading (e.g. Tesla
 // via TeslaBLEProxy) is paired to a loadpoint, the control loop anchors
@@ -128,8 +165,11 @@ func TestAnchorVehicleSoCAtBeforePlugIn(t *testing.T) {
 	now = t0.Add(10 * time.Minute)
 	m.Observe("a", true, 11000, 1500, true)
 
-	if m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-anchorBeforePlugSlack-time.Minute)) {
-		t.Fatal("a reading long before plug-in may predate a drive")
+	if !m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-anchorBeforePlugSlack-time.Minute)) {
+		t.Fatal("qualified pre-connection reading refused")
+	}
+	if st, _ := m.State("a"); math.Abs(st.CurrentSoC-.60) > 1e-9 {
+		t.Fatalf("energy before the connection was invented: %.4f", st.CurrentSoC)
 	}
 	if !m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-time.Minute)) {
 		t.Fatal("a reading just before plug-in should anchor")
@@ -139,17 +179,23 @@ func TestAnchorVehicleSoCAtBeforePlugIn(t *testing.T) {
 	}
 }
 
-// After a restart the history starts mid-session. Energy at an earlier
-// reading is unknown, so the reading must not anchor.
-func TestAnchorVehicleSoCAtUnknownEnergyRefuses(t *testing.T) {
+// After a restart the history starts mid-session. Keep the qualified raw
+// reading and its source time without adding unknown earlier energy.
+func TestAnchorVehicleSoCAtUnknownEnergyKeepsRawReading(t *testing.T) {
 	m := NewManager()
 	m.Load([]Config{{ID: "a", VehicleCapacityWh: 60000, PluginSoC: 0.25}})
 	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 	now := t0
 	m.SetNowFn(func() time.Time { return now })
 	m.Observe("a", true, 11000, 4000, true)
-	if m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-2*time.Minute)) {
-		t.Fatal("energy before the first sample is unknown")
+	if !m.AnchorVehicleSoCAt("a", 0.60, t0.Add(-2*time.Minute)) {
+		t.Fatal("qualified reading with unknown earlier energy refused")
+	}
+	if st, _ := m.State("a"); math.Abs(st.CurrentSoC-.60) > 1e-9 {
+		t.Fatalf("unknown earlier energy was added: %.4f", st.CurrentSoC)
+	}
+	if !m.VehicleSoCSupersedes("a", t0.Add(-time.Minute)) {
+		t.Fatal("raw fallback used receipt time instead of measurement time")
 	}
 	if !m.AnchorVehicleSoCAt("a", 0.60, t0) {
 		t.Fatal("a reading at the first sample should anchor")
@@ -159,7 +205,10 @@ func TestAnchorVehicleSoCAtUnknownEnergyRefuses(t *testing.T) {
 		now = t0.Add(time.Duration(i) * 5 * time.Minute)
 		m.Observe("a", true, 11000, 4000+float64(i)*100, true)
 	}
-	if m.AnchorVehicleSoCAt("a", 0.60, t0) {
-		t.Fatal("trimmed history must not anchor")
+	if !m.AnchorVehicleSoCAt("a", 0.60, t0) {
+		t.Fatal("qualified reading outside retained history refused")
+	}
+	if st, _ := m.State("a"); math.Abs(st.CurrentSoC-.60) > 1e-9 {
+		t.Fatalf("trimmed energy history was invented: %.4f", st.CurrentSoC)
 	}
 }

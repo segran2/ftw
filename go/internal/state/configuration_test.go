@@ -1,10 +1,12 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestConfigurationCommitIsDurableAndAtomic(t *testing.T) {
@@ -101,5 +103,45 @@ func TestBackupExportsTheCapturedConfiguration(t *testing.T) {
 	current, _, err := s.Configuration()
 	if err != nil || current.Revision != 2 {
 		t.Fatalf("current revision: %+v %v", current, err)
+	}
+}
+
+// SaveDriverSecret and SaveConfiguration read before they write. SQLite then
+// skips busy_timeout and refuses the write at once while another connection
+// writes. A rotated OAuth token lost that way can lock a driver out at its
+// next restart, so both must wait for the other writer instead.
+func TestDurableConfigWriteWaitsForAnotherWriter(t *testing.T) {
+	s := freshStore(t)
+	rev, err := s.SaveConfiguration([]byte(`{"config":{"drivers":[{"name":"myuplink"}]}}`), 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holdWriteLock := func(hold time.Duration) {
+		t.Helper()
+		ctx := context.Background()
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+			t.Fatal(err)
+		}
+		time.AfterFunc(hold, func() {
+			_, _ = conn.ExecContext(ctx, `COMMIT`)
+			conn.Close()
+		})
+	}
+
+	holdWriteLock(300 * time.Millisecond)
+	if err := s.SaveDriverSecret("myuplink", "refresh_token", "RT-rotated"); err != nil {
+		t.Fatalf("rotated token refused while another connection wrote: %v", err)
+	}
+	if got, ok := s.LoadConfig(DriverSecretKey("myuplink", "refresh_token")); !ok || got != "RT-rotated" {
+		t.Fatalf("stored token = %q, %v", got, ok)
+	}
+
+	holdWriteLock(300 * time.Millisecond)
+	if _, err := s.SaveConfiguration([]byte(`{"config":{"drivers":[{"name":"myuplink"}]}}`), rev, nil); err != nil {
+		t.Fatalf("settings save refused while another connection wrote: %v", err)
 	}
 }

@@ -40,8 +40,8 @@ func TestPauseHoldsThroughCarRefusalAndResumesOnlyOnRequest(t *testing.T) {
 	}
 	c.SetManualHold(cfg.ID, ManualHold{PowerW: 4140, PhaseMode: "3p", Persistent: true})
 	c.Tick(context.Background(), now.Add(time.Hour+time.Second))
-	if got := sender.calls[len(sender.calls)-1].power; got != 4140 {
-		t.Fatalf("explicit start failed without planner: %v", got)
+	if last, ok := lastSetCurrent(sender.calls); !ok || last.power != 4140 {
+		t.Fatalf("explicit start failed without planner: %+v", sender.calls)
 	}
 }
 
@@ -86,7 +86,7 @@ func TestFusePowerBudgetNeverRoundsUp(t *testing.T) {
 			cfg.AllowedStepsW = tc.steps
 			c := newTestController(t, []Config{cfg}, nil, map[string]EVSample{}, &fakeSender{})
 			c.SetFuseEVMax(func() (float64, bool) { return tc.cap, true })
-			got, _ := c.applyFuseClampAndCooldown(time.Now(), cfg, tc.want)
+			got, _ := c.applyFuseClamp(cfg, tc.want, "")
 			if got != tc.expected || got > tc.cap || got > tc.want {
 				t.Fatalf("want %v cap %v: sent %v, expected %v", tc.want, tc.cap, got, tc.expected)
 			}

@@ -30,6 +30,15 @@ type Handler struct {
 	// no driver health, no metrics — so it cannot influence dispatch. See
 	// SetApprovedIDs.
 	approved map[string]bool
+
+	// managed is the approved chargers a loadpoint names, which FTW orders.
+	// bootLimit, set by the Server, holds each at 0 A from its boot until
+	// FTW's first order, once the connector statuses after the boot have
+	// been quiet for bootLimitSettle. See boot_limit.go.
+	managed         map[string]bool
+	bootLimit       func(id string)
+	bootLimitSettle time.Duration
+
 	nextTxID int
 
 	// vehicleIdentified, when set, fires once per new vehicle identity seen
@@ -48,6 +57,9 @@ type Handler struct {
 	// it is (BootNotification) — main.go writes its row in the device
 	// registry from it. See identity.go.
 	identityReported func(ChargerIdentity)
+	// later, set by the Server, runs the three callbacks above after the
+	// charger's socket lock is released. See boundCall.
+	later func(id string, fn func())
 
 	// capabilityProbe, set by the Server, asks a charger which feature
 	// profiles it supports (see capabilities.go). Fired from OnConnect and
@@ -79,7 +91,16 @@ type chargerState struct {
 	sessionMeterWh      float64
 	lastPowerW          float64
 	forecastPower       telemetry.ForecastPowerSample
-	powerConnectedAt    time.Time
+	// meterAtMS is the newest meter sample time accepted. A heartbeat moves
+	// forecastPower's time to Core's clock; this gate stays on the meter's.
+	meterAtMS int64
+	// available: the connector reported Available on this socket. With no
+	// vehicle no current flows, so its power is a known 0 W. OCPP reports a
+	// status change when it happens, so any later message from the charger
+	// confirms the reading. State is per charger, not per connector: on a
+	// two-connector charger an Available on one claims 0 W for both.
+	available        bool
+	powerConnectedAt time.Time
 	// lastAmps is the most recent per-phase limit this charger accepted.
 	// A resume with no rate of its own restores it.
 	lastAmps float64
@@ -89,6 +110,9 @@ type chargerState struct {
 	// transactionRef is the 2.0.1 transaction id, which is a string rather
 	// than the int transactionID above. Empty on the 1.6 path.
 	transactionRef string
+	// stoppedTxID is the last transaction this charger stopped. A late meter
+	// value for it must not take it up again.
+	stoppedTxID int
 	// vendor and model come from BootNotification and exist so the UI can
 	// label a charger with what it actually is rather than its URL segment.
 	// serial is the hardware-stable half of its identity — what the device
@@ -106,6 +130,11 @@ type chargerState struct {
 	identityProbeEpoch    uint64
 	identityProbeAttempts int
 	identityProbeAfter    time.Time
+	// bootLimitPending marks a boot that may get the 0 A start limit once
+	// the status burst after it settles with no car. bootLimitEpoch names
+	// the latest settle timer. See boot_limit.go.
+	bootLimitPending bool
+	bootLimitEpoch   uint64
 	// vehicleID is the identity presented when the current/last transaction
 	// started: the RFID idTag on 1.6, or a 2.0.1 idToken — where the token
 	// type MacAddress (autocharge) or eMAID (ISO 15118) names the actual
@@ -137,8 +166,20 @@ func NewHandler(tel *telemetry.Store, heartbeatIntervalS int) *Handler {
 		approved:            map[string]bool{},
 		probing:             map[string]bool{},
 		identityProbeTiming: defaultIdentityProbeTiming,
-		nextTxID:            1,
+		nextTxID:            firstTxID(time.Now()),
 	}
+}
+
+// txIDEpoch keeps clock-based transaction ids far below the 32-bit limit
+// many chargers store them in.
+var txIDEpoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// firstTxID starts a run's transaction ids at the seconds since txIDEpoch.
+// A charger keeps its transaction id while Core restarts, so a restart must
+// not hand that id to another transaction. The start moves on one per
+// second, and a home starts far fewer transactions than that.
+func firstTxID(now time.Time) int {
+	return max(1, int(now.Sub(txIDEpoch)/time.Second))
 }
 
 // SetApprovedIDs declares which charger ids are part of the site — the ids
@@ -177,6 +218,9 @@ func (h *Handler) SetApprovedIDs(ids []string) {
 		blob, _ := json.Marshal(map[string]any{"type": "ev", "w": 0.0, "forecast_power": telemetry.ForecastPowerSample{Version: 1}})
 		h.tel.Update(id, telemetry.DerEV, 0, nil, blob)
 	}
+	if len(revoked) > 0 {
+		h.tel.Arrived()
+	}
 }
 
 // IsApproved reports whether a charger id is on the site allowlist and may
@@ -200,7 +244,16 @@ func (h *Handler) isApproved(id string) bool {
 // The tel* wrappers are the quarantine choke points: every telemetry write
 // for a charger goes through one of them, so a pending charger is dropped
 // here once rather than gated at each call site.
+// telSuccess records a message from the charger. While the connector is
+// Available, any message also confirms its 0 W.
 func (h *Handler) telSuccess(id string) {
+	h.telHealth(id)
+	h.confirmAvailable(id)
+}
+
+// telHealth records a message without confirming the connector status: a
+// new socket or a boot says nothing about it until the charger reports.
+func (h *Handler) telHealth(id string) {
 	if h.isApproved(id) {
 		h.tel.RecordDriverSuccess(id)
 	}
@@ -271,10 +324,12 @@ func (h *Handler) probeFinished(id string) {
 }
 
 // noteVehicleID records the identity a transaction presented and fires the
-// vehicleIdentified callback when it is new for this charger. Quarantine
-// applies: a pending charger's identity is stored (the UI shows it so the
-// operator can build a profile from it) but never fires the callback.
-func (h *Handler) noteVehicleID(id, vehicleID, source string) {
+// vehicleIdentified callback when it is new for this charger, and at the
+// start of every transaction: the same card on the next plug-in names the
+// car of that plug-in (docs/cars.md). Quarantine applies: a pending
+// charger's identity is stored (the UI shows it so the operator can build a
+// profile from it) but never fires the callback.
+func (h *Handler) noteVehicleID(id, vehicleID, source string, started bool) {
 	if vehicleID == "" {
 		return
 	}
@@ -286,8 +341,8 @@ func (h *Handler) noteVehicleID(id, vehicleID, source string) {
 	fn := h.vehicleIdentified
 	approved := h.approved[id]
 	h.mu.Unlock()
-	if changed && approved && fn != nil {
-		fn(id, vehicleID, source)
+	if (changed || started) && approved && fn != nil {
+		h.callback(id, func() { fn(id, vehicleID, source) })
 	}
 }
 
@@ -401,6 +456,7 @@ func (h *Handler) OnConnect(id string) {
 	s.charging = false
 	s.clearMeasuredPower()
 	s.identityCurrent = false
+	s.bootLimitPending = false
 	s.featureProfiles = ""
 	s.steerable = nil
 	h.cancelIdentityProbeLocked(s)
@@ -408,7 +464,7 @@ func (h *Handler) OnConnect(id string) {
 	h.scheduleIdentityProbeLocked(id, s)
 	h.mu.Unlock()
 	h.pushReading(id, s)
-	h.telSuccess(id)
+	h.telHealth(id)
 	h.maybeProbeCapability(id)
 }
 
@@ -422,6 +478,7 @@ func (h *Handler) OnDisconnect(id string) {
 	delete(h.probing, id)
 	s.online = false
 	s.identityCurrent = false
+	s.bootLimitPending = false
 	h.cancelIdentityProbeLocked(s)
 	s.connectedKnown = false
 	s.charging = false
@@ -459,8 +516,9 @@ func (h *Handler) OnBootNotification(id string, req *core.BootNotificationReques
 	s.firmware = req.FirmwareVersion
 	h.mu.Unlock()
 	h.noteIdentity(id)
-	h.telSuccess(id)
+	h.telHealth(id)
 	h.maybeProbeCapability(id)
+	h.maybeSendBootLimit(id)
 	return core.NewBootNotificationConfirmation(
 		types.NewDateTime(time.Now()),
 		h.heartbeatIntervalS,
@@ -473,10 +531,23 @@ func (h *Handler) OnHeartbeat(id string, _ *core.HeartbeatRequest) (*core.Heartb
 	return core.NewHeartbeatConfirmation(types.NewDateTime(time.Now())), nil
 }
 
+// confirmAvailable publishes the 0 W of an Available connector again at the
+// time of a message from the charger. telSuccess calls it for both dialects.
+func (h *Handler) confirmAvailable(id string) {
+	s := h.state(id)
+	h.mu.Lock()
+	confirmed := s.confirmAvailablePower(time.Now())
+	h.mu.Unlock()
+	if confirmed {
+		h.pushReading(id, s)
+	}
+}
+
 func (h *Handler) OnAuthorize(id string, req *core.AuthorizeRequest) (*core.AuthorizeConfirmation, error) {
 	// Phase 1: auto-authorize every tag. RFID gating is a Phase 2 feature
 	// alongside RemoteStartTransaction.
 	slog.Debug("OCPP authorize", "charger", id, "tag", req.IdTag)
+	h.confirmAvailable(id)
 	return core.NewAuthorizationConfirmation(
 		types.NewIdTagInfo(types.AuthorizationStatusAccepted),
 	), nil
@@ -485,15 +556,32 @@ func (h *Handler) OnAuthorize(id string, req *core.AuthorizeRequest) (*core.Auth
 func (h *Handler) OnDataTransfer(id string, req *core.DataTransferRequest) (*core.DataTransferConfirmation, error) {
 	// Vendor-specific extensions — accept gracefully but do nothing.
 	slog.Debug("OCPP DataTransfer ignored", "charger", id, "vendor", req.VendorId)
+	h.confirmAvailable(id)
 	return core.NewDataTransferConfirmation(core.DataTransferStatusUnknownVendorId), nil
 }
 
 func (h *Handler) OnStatusNotification(id string, req *core.StatusNotificationRequest) (*core.StatusNotificationConfirmation, error) {
+	// Connector 0 is the charge point itself. Its Available, sent at boot and
+	// on reconnect, says the controller is up, not that a cable is out.
+	// Unavailable and Faulted there cover every connector.
+	if req.ConnectorId == 0 && req.Status == core.ChargePointStatusAvailable {
+		slog.Info("OCPP status", "charger", id, "connector", req.ConnectorId, "status", req.Status)
+		h.telSuccess(id)
+		return core.NewStatusNotificationConfirmation(), nil
+	}
 	s := h.state(id)
 	h.mu.Lock()
 	s.connectedKnown = true
+	if req.Status != core.ChargePointStatusAvailable {
+		s.leaveAvailable()
+	}
 	switch req.Status {
-	case core.ChargePointStatusAvailable, core.ChargePointStatusUnavailable:
+	case core.ChargePointStatusAvailable:
+		s.connected = false
+		s.charging = false
+		s.holdAvailablePower(time.Now(), statusTime(req.Timestamp))
+	case core.ChargePointStatusUnavailable:
+		// Out of service, maybe broken: no evidence that nothing flows.
 		s.connected = false
 		s.charging = false
 		s.clearMeasuredPower()
@@ -523,6 +611,7 @@ func (h *Handler) OnStatusNotification(id string, req *core.StatusNotificationRe
 
 	h.pushReading(id, s)
 	h.telSuccess(id)
+	h.resolveBootLimit(id)
 	return core.NewStatusNotificationConfirmation(), nil
 }
 
@@ -543,7 +632,9 @@ func (h *Handler) OnMeterValues(id string, req *core.MeterValuesRequest) (*core.
 				measurand = types.MeasurandEnergyActiveImportRegister
 			}
 			val, err := strconv.ParseFloat(sv.Value, 64)
-			if err != nil {
+			// ParseFloat accepts "NaN" and "Inf". Taken up as a start
+			// reading, one would spoil every later session value.
+			if err != nil || math.IsNaN(val) || math.IsInf(val, 0) {
 				continue
 			}
 			switch measurand {
@@ -559,6 +650,9 @@ func (h *Handler) OnMeterValues(id string, req *core.MeterValuesRequest) (*core.
 				if sv.Unit == types.UnitOfMeasureKWh {
 					val *= 1000
 				}
+				if s.transactionID < 0 && sv.Phase == "" && req.TransactionId != nil {
+					h.takeUpTransactionLocked(id, s, *req.TransactionId, val)
+				}
 				if s.transactionID >= 0 {
 					s.sessionMeterWh = val - s.sessionStartMeterWh
 				}
@@ -566,13 +660,30 @@ func (h *Handler) OnMeterValues(id string, req *core.MeterValuesRequest) (*core.
 		}
 		if w, ok := meterPowerW(samples); ok {
 			s.recordPower(w, measured, received)
+			s.meterCancelsBootLimitLocked(nil, w)
 		}
 	}
+	s.meterCancelsBootLimitLocked(req.TransactionId, 0)
 	h.mu.Unlock()
 
 	h.pushReading(id, s)
 	h.telSuccess(id)
 	return core.NewMeterValuesConfirmation(), nil
+}
+
+// takeUpTransactionLocked adopts a transaction that started before this run:
+// the charger kept it, and its meter values name it, while Core restarted.
+// The start meter reading went with the old process, so session energy
+// counts from this first reading. The caller holds h.mu.
+func (h *Handler) takeUpTransactionLocked(id string, s *chargerState, txID int, meterWh float64) {
+	if txID <= 0 || txID == s.stoppedTxID {
+		return
+	}
+	s.transactionID = txID
+	s.sessionStartMeterWh = meterWh
+	s.sessionMeterWh = 0
+	h.nextTxID = max(h.nextTxID, txID+1)
+	slog.Info("OCPP running transaction taken up", "charger", id, "txid", txID, "meter_wh", meterWh)
 }
 
 func (h *Handler) OnStartTransaction(id string, req *core.StartTransactionRequest) (*core.StartTransactionConfirmation, error) {
@@ -585,6 +696,7 @@ func (h *Handler) OnStartTransaction(id string, req *core.StartTransactionReques
 	s.sessionMeterWh = 0
 	s.connected = true
 	s.connectedKnown = true
+	s.leaveAvailable()
 	s.charging = true
 	h.mu.Unlock()
 
@@ -592,7 +704,7 @@ func (h *Handler) OnStartTransaction(id string, req *core.StartTransactionReques
 		"charger", id, "txid", txID, "tag", req.IdTag, "meter_start_wh", req.MeterStart)
 	// The 1.6 idTag names the RFID card that started the session — the
 	// closest thing to a vehicle identity this dialect has.
-	h.noteVehicleID(id, req.IdTag, "rfid")
+	h.noteVehicleID(id, req.IdTag, "rfid", true)
 	h.pushReading(id, s)
 	h.telSuccess(id)
 	return core.NewStartTransactionConfirmation(
@@ -604,10 +716,30 @@ func (h *Handler) OnStartTransaction(id string, req *core.StartTransactionReques
 func (h *Handler) OnStopTransaction(id string, req *core.StopTransactionRequest) (*core.StopTransactionConfirmation, error) {
 	s := h.state(id)
 	h.mu.Lock()
-	sessionWh := float64(req.MeterStop) - s.sessionStartMeterWh
+	// A stop for another transaction than the running one, such as a queued
+	// stop from before a restart, must not end the running one.
+	if s.transactionID >= 0 && req.TransactionId != s.transactionID {
+		current := s.transactionID
+		h.mu.Unlock()
+		slog.Warn("OCPP stop for another transaction ignored",
+			"charger", id, "txid", req.TransactionId, "current_txid", current)
+		h.telSuccess(id)
+		return core.NewStopTransactionConfirmation(), nil
+	}
+	// With no start and no meter value seen for the transaction, MeterStop is
+	// only the meter's lifetime total, not the session's energy.
+	known := s.transactionID >= 0
+	sessionWh := s.sessionMeterWh
+	if known {
+		sessionWh = float64(req.MeterStop) - s.sessionStartMeterWh
+	}
+	s.stoppedTxID = req.TransactionId
 	s.transactionID = -1
 	s.charging = false
-	s.clearMeasuredPower()
+	// A charger may report Available before the stop. The car is gone then.
+	if !s.available {
+		s.clearMeasuredPower()
+	}
 	s.sessionMeterWh = sessionWh
 	h.mu.Unlock()
 
@@ -615,7 +747,9 @@ func (h *Handler) OnStopTransaction(id string, req *core.StopTransactionRequest)
 		"charger", id, "txid", req.TransactionId,
 		"session_wh", sessionWh, "reason", req.Reason)
 	h.pushReading(id, s)
-	h.telMetric(id, "ev_session_wh", sessionWh, "Wh")
+	if known {
+		h.telMetric(id, "ev_session_wh", sessionWh, "Wh")
+	}
 	h.telSuccess(id)
 	return core.NewStopTransactionConfirmation(), nil
 }
@@ -663,6 +797,8 @@ func (h *Handler) pushReading(id string, s *chargerState) {
 	}
 	blob, _ := json.Marshal(data)
 	h.tel.Update(id, telemetry.DerEV, w, nil, blob)
+	// A charger sends its readings unpolled; this is its poll's end.
+	h.tel.Arrived()
 }
 
 // powerSample is one Power.Active.Import after unit conversion. An empty phase
@@ -703,16 +839,66 @@ func meterPowerW(samples []powerSample) (float64, bool) {
 // accepted timestamp. Samples from before this socket or in the future cannot
 // revive a stale or synthesized reading. The caller holds h.mu.
 func (s *chargerState) recordPower(w float64, measured, received time.Time) bool {
-	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 || measured.IsZero() || measured.After(received) || measured.Before(s.powerConnectedAt) || measured.UnixMilli() <= s.forecastPower.MeasuredAtMS {
+	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 || measured.IsZero() || measured.After(received) || measured.Before(s.powerConnectedAt) || measured.UnixMilli() <= s.meterAtMS {
 		return false
 	}
 	s.lastPowerW = w
+	s.meterAtMS = measured.UnixMilli()
 	s.forecastPower = telemetry.ForecastPowerSample{Version: 1, Known: true, Watts: w, MeasuredAtMS: measured.UnixMilli(), ReceivedAtMS: received.UnixMilli()}
 	return true
+}
+
+// statusTime is the charger's own time of a status, when it sent one.
+func statusTime(t *types.DateTime) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return t.Time
+}
+
+// holdAvailablePower records the 0 W of an empty connector. A meter sample
+// the charger took before the status cannot bring back the car's draw; a
+// newer one wins. The gate uses the charger's clock, so a clock that runs
+// behind Core's does not reject the next session's samples. Without a
+// status time it stays where it was. The caller holds h.mu.
+func (s *chargerState) holdAvailablePower(now, at time.Time) {
+	ms := now.UnixMilli()
+	s.available = true
+	s.lastPowerW = 0
+	if !at.IsZero() {
+		s.meterAtMS = max(s.meterAtMS, min(at.UnixMilli(), ms))
+	}
+	s.forecastPower = telemetry.ForecastPowerSample{Version: 1, Known: true, Watts: 0, MeasuredAtMS: ms, ReceivedAtMS: ms}
+}
+
+// confirmAvailablePower moves a 0 W reading to now while the connector stays
+// Available on a live socket. A meter that read more than 0 W is not
+// confirmed; it ages out. At most once a second. The caller holds h.mu.
+func (s *chargerState) confirmAvailablePower(now time.Time) bool {
+	ms := now.UnixMilli()
+	if !s.available || !s.online || !s.connectedKnown || !s.forecastPower.Known || s.forecastPower.Watts != 0 || ms-s.forecastPower.MeasuredAtMS < 1000 {
+		return false
+	}
+	s.forecastPower.MeasuredAtMS, s.forecastPower.ReceivedAtMS = ms, ms
+	return true
+}
+
+// leaveAvailable ends the hold when a car may be there. A 0 W reading is no
+// longer evidence then; power is unknown until the meter reports. The caller
+// holds h.mu.
+func (s *chargerState) leaveAvailable() {
+	if !s.available {
+		return
+	}
+	s.available = false
+	if s.forecastPower.Watts == 0 {
+		s.forecastPower.Known = false
+	}
 }
 
 // clearMeasuredPower zeros dispatch watts without recording a measured sample.
 func (s *chargerState) clearMeasuredPower() {
 	s.lastPowerW = 0
 	s.forecastPower.Known = false
+	s.available = false
 }

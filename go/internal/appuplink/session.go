@@ -6,19 +6,13 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/srcfl/ftw/go/internal/apiauth"
 	"github.com/srcfl/ftw/go/internal/appenroll"
 	"github.com/srcfl/ftw/go/internal/appproto"
-	"github.com/srcfl/ftw/go/internal/appwire"
+	"github.com/srcfl/ftw/go/protocol/appwire"
 )
-
-// MaxSessions is how many phones may watch one house at once.
-//
-// It matches the relay's own per-handle stream limit; a fifth stream never
-// reaches the box, so a larger number here would only describe sessions that
-// cannot exist.
-const MaxSessions = 4
 
 // session is one app's encrypted conversation with this box.
 //
@@ -32,6 +26,25 @@ type session struct {
 	// appStatic is the app's static key as the handshake authenticated it,
 	// never as it was claimed. Logged as a prefix and nothing more.
 	appStatic []byte
+	// release frees the device's slot (see slots), if the session still
+	// holds it. Nil for a session that took none. Set through setRelease,
+	// because a newer session can end this one before its claim returns.
+	relMu   sync.Mutex
+	release func()
+	closed  bool
+}
+
+// setRelease keeps the slot's release for close, or runs it at once when the
+// session already ended.
+func (s *session) setRelease(fn func()) {
+	s.relMu.Lock()
+	if s.closed {
+		s.relMu.Unlock()
+		fn()
+		return
+	}
+	s.release = fn
+	s.relMu.Unlock()
 }
 
 // close ends one session for good.
@@ -44,7 +57,35 @@ type session struct {
 func (s *session) close() {
 	s.handler.Close()
 	s.transport.Close()
+	s.relMu.Lock()
+	s.closed = true
+	fn := s.release
+	s.release = nil
+	s.relMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
+
+// pending is a handshake the box answered whose session has not yet proved
+// itself. A message 1 can be replayed by whoever carries it, and the box
+// cannot tell a replay from a phone until the phone's first transport
+// message decrypts. Until then it takes no device's place, stamps nothing
+// and spends no code.
+type pending struct {
+	transport *appwire.Transport
+	appStatic []byte
+	deviceID  string
+	commit    func() (appenroll.Grant, error)
+	at        time.Time
+}
+
+// pendingKept is how many unproved handshakes a table holds, and how long
+// one waits for its first transport message.
+const (
+	pendingKept = 8
+	pendingWait = 30 * time.Second
+)
 
 // sender encrypts one session's frames onto the shared socket.
 type sender struct {
@@ -69,14 +110,21 @@ func (s sender) Send(frame []byte) error {
 // decide. A message nothing authenticates is either a new handshake or noise,
 // and noise is dropped.
 type sessions struct {
-	mu    sync.Mutex
-	live  []*session
-	build HandlerBuilder
+	mu      sync.Mutex
+	live    []*session
+	pending []*pending
+	build   HandlerBuilder
+	// slots is the box's one slot per device, shared with the tunnel. Nil
+	// in a test that builds a table alone.
+	slots *slots
 
 	enroll *appenroll.Identity
 	static appwire.KeyPair
 	write  func([]byte) error
 	log    *slog.Logger
+
+	// testOut is where a test's write puts what the table sends.
+	testOut chan []byte
 }
 
 // prologue binds a session to the box it was enrolled against, so a captured
@@ -101,11 +149,30 @@ func (s *sessions) deliver(ctx context.Context, message []byte) {
 	}
 }
 
-// route hands the message to the session that can decrypt it, if any.
+// route hands the message to the session that can decrypt it, if any. A
+// message that proves a pending handshake makes its session live first.
 func (s *sessions) route(ctx context.Context, message []byte) bool {
 	s.mu.Lock()
 	live := append([]*session(nil), s.live...)
+	waiting := append([]*pending(nil), s.pending...)
 	s.mu.Unlock()
+
+	for _, p := range waiting {
+		frame, err := p.transport.Decrypt(message)
+		if err != nil {
+			continue
+		}
+		sess, err := s.promote(p)
+		if err != nil {
+			s.log.Debug("a proved handshake was not admitted", "err", err)
+			return true
+		}
+		if err := sess.handler.Handle(ctx, frame); err != nil {
+			s.log.Warn("app session failed on a frame", "err", err)
+			s.drop(sess)
+		}
+		return true
+	}
 
 	for _, sess := range live {
 		frame, err := sess.transport.Decrypt(message)
@@ -159,63 +226,90 @@ func (s *sessions) open(message []byte) error {
 
 	// The payload is the pairing code from the QR. A device that has already
 	// paired presents nothing and is recognised by its static key, which is
-	// what makes the code single-use without breaking reconnects.
-	grant, err := s.enroll.Authorise(noise.RemoteStatic, payload)
+	// what makes the code single-use without breaking reconnects. Checked
+	// now, committed when the session proves itself.
+	grant, commit, err := s.enroll.Check(noise.RemoteStatic, payload)
 	if err != nil {
 		transport.Close()
 		return err
+	}
+
+	s.mu.Lock()
+	now := time.Now()
+	kept := s.pending[:0]
+	for _, p := range s.pending {
+		if now.Sub(p.at) < pendingWait {
+			kept = append(kept, p)
+		} else {
+			p.transport.Close()
+		}
+	}
+	s.pending = kept
+	if len(s.pending) >= pendingKept {
+		s.pending[0].transport.Close()
+		s.pending = s.pending[1:]
+	}
+	s.pending = append(s.pending, &pending{transport: transport, appStatic: noise.RemoteStatic,
+		deviceID: grant.DeviceID, commit: commit, at: now})
+	s.mu.Unlock()
+
+	if err := s.write(reply); err != nil {
+		return err
+	}
+	return nil
+}
+
+// promote makes a proved handshake a live session: it commits the pairing or
+// the reconnect stamp, builds the handler from the grant as it stands now,
+// and takes the device's one slot.
+func (s *sessions) promote(p *pending) (*session, error) {
+	s.mu.Lock()
+	for i, q := range s.pending {
+		if q == p {
+			s.pending = append(s.pending[:i], s.pending[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	grant, err := p.commit()
+	if err != nil {
+		p.transport.Close()
+		return nil, err
 	}
 
 	// The grant becomes a caller here, and this is the only place it is
 	// built. Everything the box later decides about this phone — which
 	// commands it may send, which routes it may reach — is decided from this
 	// value, and nothing the phone sends can add to it.
-	caller := apiauth.Caller{
-		Subject: apiauth.KindApp + ":" + grant.DeviceID,
-		Kind:    apiauth.KindApp,
-		Role:    grant.Role,
-		Scopes:  appproto.ScopesForRole(grant.Role),
-		Epoch:   grant.Epoch,
-	}
-
+	caller := callerOf(grant)
 	handler, err := s.build(
-		sender{transport: transport, write: s.write},
+		sender{transport: p.transport, write: s.write},
 		caller,
 		liveGrant{enroll: s.enroll, deviceID: grant.DeviceID},
 	)
 	if err != nil {
-		transport.Close()
-		return err
+		p.transport.Close()
+		return nil, err
 	}
 
-	sess := &session{transport: transport, handler: handler, appStatic: noise.RemoteStatic}
+	sess := &session{transport: p.transport, handler: handler, appStatic: p.appStatic}
 	s.admit(sess)
-
-	// Written after the session is registered, so a fast app whose first
-	// frame arrives immediately meets a session that exists.
-	if err := s.write(reply); err != nil {
-		s.drop(sess)
-		return err
-	}
+	// The device's one slot: a session it held before, here or through FTW
+	// Cloud, ends now.
+	sess.setRelease(s.slots.claim(grant.DeviceID, func() { s.drop(sess) }))
 
 	s.log.Info("app session open", "sessions", s.count())
-	return nil
+	return sess, nil
 }
 
-// admit adds a session, evicting the oldest when the room is full.
-//
-// Evicting rather than refusing: the newcomer is the phone somebody is holding
-// right now, and the session it displaces is one whose socket the relay has
-// probably already reaped.
+// admit adds a session. There is no count to evict by: each device holds one
+// slot (see slots), so a phone that reconnects replaces its own session and
+// never another device's. The relay lets four streams into a room.
 func (s *sessions) admit(sess *session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	s.live = append(s.live, sess)
-	for len(s.live) > MaxSessions {
-		s.live[0].close()
-		s.live = s.live[1:]
-	}
 }
 
 // dropByAppKey terminates and forgets every session a revoked key is
@@ -225,6 +319,16 @@ func (s *sessions) admit(sess *session) {
 func (s *sessions) dropByAppKey(pub []byte) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	waiting := s.pending[:0]
+	for _, p := range s.pending {
+		if bytes.Equal(p.appStatic, pub) {
+			p.transport.Close()
+			continue
+		}
+		waiting = append(waiting, p)
+	}
+	s.pending = waiting
 
 	dropped := 0
 	kept := s.live[:0]
@@ -263,6 +367,10 @@ func (s *sessions) closeAll() {
 	s.mu.Lock()
 	live := s.live
 	s.live = nil
+	for _, p := range s.pending {
+		p.transport.Close()
+	}
+	s.pending = nil
 	s.mu.Unlock()
 
 	for _, sess := range live {
@@ -280,12 +388,50 @@ type liveGrant struct {
 	deviceID string
 }
 
-func (g liveGrant) Grant() (string, uint64, bool) {
+func (g liveGrant) Grant() (appproto.Enrolment, bool) {
 	grant, ok := g.enroll.GrantFor(g.deviceID)
 	if !ok {
-		return "", 0, false
+		return appproto.Enrolment{}, false
 	}
-	return grant.Role, grant.Epoch, true
+	return enrolmentOf(grant), true
+}
+
+// enrolmentOf is a grant as the message layer reads it. A watch spends its
+// parent phone's command ids, so one intent sent by both acts once. An agent
+// spends its own.
+func enrolmentOf(grant appenroll.Grant) appproto.Enrolment {
+	e := appproto.Enrolment{Role: grant.Role, Epoch: grant.Epoch, ParentRole: grant.ParentRole}
+	if grant.Parent != "" {
+		e.Root = subjectOf(grant.Parent)
+	}
+	if a := grant.Agent; a != nil {
+		e.Agent = &appproto.AgentGrant{Scopes: a.Scopes, Ops: a.Ops, Caps: a.Caps, ExpiresAtMs: a.ExpiresAtMs,
+			Principal: a.Principal, Expired: a.Expired, NoClock: a.NoClock}
+	}
+	return e
+}
+
+// callerOf is the caller a session carries. The grant becomes a caller here
+// and nowhere else: everything the box later decides about the session is
+// decided from this value, and nothing the device sends can add to it.
+func callerOf(grant appenroll.Grant) apiauth.Caller {
+	kind := apiauth.KindApp
+	if grant.Agent != nil {
+		kind = apiauth.KindAgent
+	}
+	return apiauth.Caller{
+		Subject: kind + ":" + grant.DeviceID,
+		Kind:    kind,
+		Role:    grant.Role,
+		Scopes:  appproto.ScopesForEnrolment(enrolmentOf(grant)),
+		Epoch:   grant.Epoch,
+	}
+}
+
+// subjectOf is the caller subject for a device id. Built here and nowhere
+// else, so the command log and the audit line name a device the same way.
+func subjectOf(deviceID string) string {
+	return apiauth.KindApp + ":" + deviceID
 }
 
 func (s *sessions) count() int {

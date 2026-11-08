@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/config"
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"github.com/srcfl/ftw/go/internal/savings"
 	"github.com/srcfl/ftw/go/internal/state"
 )
@@ -115,7 +116,7 @@ type savingsCacheT struct {
 //	              "actual_cost_ore": ..., "baseline_cost_ore": ..., "saved_ore": ...,
 //	              "expected_ms": ..., "history_covered_ms": ..., "priced_covered_ms": ...,
 //	              "history_coverage_pct": ..., "priced_coverage_pct": ... },
-//	  "tz": "Local", "value_scope": "site_total",
+//	  "tz": "Europe/Stockholm", "value_scope": "site_total",
 //	  "baseline": "no_pv_no_battery_vehicle_energy_at_daily_average"
 //	}
 //
@@ -162,7 +163,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	if zone == "" {
 		// No price provider configured → nothing to compare against.
 		writeJSON(w, 200, map[string]any{
-			"days": []any{}, "tz": time.Now().Location().String(),
+			"days": []any{}, "tz": localzone.Name(),
 			"value_scope": savingsValueScope, "baseline": savingsBaseline,
 		})
 		return
@@ -181,6 +182,11 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.ensureSavingsCache()
+	sourceThrough, sourceMode, err := s.deps.State.HistorySourceProgress(r.Context())
+	if err != nil {
+		http.Error(w, "savings load failed", http.StatusInternalServerError)
+		return
+	}
 
 	out := make([]map[string]any, 0, days)
 	var tImpWh, tExpWh, tLoadWh, tActual, tBaseline, tSaved float64
@@ -189,11 +195,16 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 	for i := days - 1; i >= 0; i-- {
 		dayStart := todayMidnight.AddDate(0, 0, -i)
 		dayKey := dayStart.Format("2006-01-02")
+		cacheKey := dayKey
+		if sourceMode {
+			cacheKey += ":source_interval_balance_v1"
+		}
 		isToday := i == 0
+		dayEnd := dayStart.AddDate(0, 0, 1)
 
 		var ds daySavings
-		if isToday {
-			b, err := s.deps.State.DailyCostBreakdownContext(r.Context(), dayStart.UnixMilli(), now.UnixMilli(), zone, ep)
+		if isToday || (sourceMode && sourceThrough < dayEnd.UnixMilli()) {
+			b, err := s.deps.State.DailyCostBreakdownContext(r.Context(), dayStart.UnixMilli(), min(now.UnixMilli(), dayEnd.UnixMilli()), zone, ep)
 			if err != nil {
 				slog.Error("handleSavingsDaily: DailyCostBreakdown failed", "err", err, "day", dayKey)
 				http.Error(w, "savings load failed", http.StatusInternalServerError)
@@ -202,7 +213,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 			ds = fromBreakdown(b, resolutionFor(b))
 		} else {
 			s.savingsCacheMu.Lock()
-			cached, ok := s.savingsCache[dayKey]
+			cached, ok := s.savingsCache[cacheKey]
 			s.savingsCacheMu.Unlock()
 			if ok {
 				ds = cached
@@ -216,7 +227,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 				}
 				ds = fromBreakdown(b, resolutionFor(b))
 				s.savingsCacheMu.Lock()
-				s.savingsCache[dayKey] = ds
+				s.savingsCache[cacheKey] = ds
 				s.savingsCacheMu.Unlock()
 			}
 		}
@@ -275,7 +286,7 @@ func (s *Server) handleSavingsDaily(w http.ResponseWriter, r *http.Request) {
 			"history_coverage_pct": boundedCoveragePct(tHistoryCoveredMs, tExpectedMs),
 			"priced_coverage_pct":  boundedCoveragePct(tPricedCoveredMs, tExpectedMs),
 		},
-		"tz":          loc.String(),
+		"tz":          localzone.Name(),
 		"value_scope": savingsValueScope,
 		"baseline":    savingsBaseline,
 	})
@@ -412,7 +423,7 @@ func (s *Server) writeLedgerSavings(w http.ResponseWriter, r *http.Request, days
 			"history_coverage_pct": boundedCoveragePct(tHist, tExpected),
 			"priced_coverage_pct":  boundedCoveragePct(tPrice, tExpected),
 		},
-		"tz": loc.String(), "value_scope": savingsValueScope, "baseline": savingsBaseline,
+		"tz": localzone.Name(), "value_scope": savingsValueScope, "baseline": savingsBaseline,
 		"baselines": []string{"no_pv_no_battery", "self_consumption"},
 	})
 	return true, nil

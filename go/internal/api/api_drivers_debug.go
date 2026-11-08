@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/srcfl/ftw/go/internal/config"
@@ -195,6 +197,7 @@ func (s *Server) configuredDriver(name string) (config.Driver, bool) {
 	}
 	for _, d := range s.deps.Cfg.Drivers {
 		if d.Name == name {
+			d.ObserveOnly = d.ObserveOnly || s.deps.Cfg.ModbusProxyOwnsWrites(d)
 			return d, true
 		}
 	}
@@ -228,6 +231,17 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 		cfg = wrapped.Drivers[0]
 	}
 
+	s.runDriverTest(w, r, cfg, nil)
+}
+
+// runDriverTest also serves setup drafts. A setup caller supplies credentials
+// from its exact draft and a private rotation sink; it never borrows or writes
+// the live Settings document.
+func (s *Server) runDriverTest(w http.ResponseWriter, r *http.Request, cfg config.Driver, prepareProbe func(*drivers.Registry, string)) {
+	if strings.TrimSpace(cfg.Lua) == "" {
+		writeJSON(w, 400, map[string]string{"error": "missing driver lua path"})
+		return
+	}
 	// Resolve UI-relative Lua paths the same way config.Load does.
 	baseDir := "."
 	if s.deps.ConfigPath != "" {
@@ -237,7 +251,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	resolved.ResolveDriverPaths(baseDir)
 	cfg = resolved.Drivers[0]
 
-	if err := rejectUnsafeProbeTargets(cfg); err != nil {
+	if err := rejectUnsafeProbeTargets(cfg, s.configuredProbeLoopbackHost(cfg)); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
@@ -267,8 +281,12 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	if displayName == "" {
 		displayName = filepath.Base(cfg.Lua)
 	}
+	probe := cfg
 	testName := "__test_" + safeProbeName(displayName) + "_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	cfg.Name = testName
+	// Settings posts credential_owner. The probe's registry must key secrets
+	// by testName, or wireDriverProbeSecrets cannot recognise its calls.
+	cfg.CredentialOwner = ""
 	if cfg.BatteryCapacityWh <= 0 {
 		// Probe-only: let battery-capable drivers emit enough to prove the
 		// connection even before the operator has entered nameplate capacity.
@@ -280,10 +298,29 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	reg.MQTTFactory = s.deps.DriverMQTTFactory
 	reg.ModbusFactory = s.deps.DriverModbusFactory
 	reg.ARPLookup = s.deps.DriverARPLookup
+	probeChangedSharedSecret := func() string { return "" }
+	if prepareProbe != nil {
+		prepareProbe(reg, testName)
+	} else {
+		probeChangedSharedSecret = s.wireDriverProbeSecrets(reg, testName, probe)
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
 	started := time.Now()
+	probeAdded := false
+	defer func() {
+		if probeAdded {
+			reg.RemoveProbe(cfg.Name)
+		}
+		restartName := probeChangedSharedSecret()
+		if restartName == "" || s.deps.Registry == nil {
+			return
+		}
+		if err := s.deps.Registry.RestartByName(context.Background(), restartName); err != nil {
+			slog.Warn("driver probe secret changed but restart failed", "driver", restartName, "err", err)
+		}
+	}()
 	if err := reg.AddProbe(ctx, cfg); err != nil {
 		writeJSON(w, 200, driverProbeResp{
 			Name:      displayName,
@@ -293,7 +330,7 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer reg.RemoveProbe(cfg.Name)
+	probeAdded = true
 
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -321,9 +358,104 @@ func (s *Server) handleDriverTest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func driverSecretStateKey(driverName, key string) string {
+	return "driver_secret:" + driverName + ":" + key
+}
+
+func (s *Server) sameConfiguredProbeDriver(probe config.Driver) (config.Driver, bool) {
+	if strings.TrimSpace(probe.Name) == "" || strings.TrimSpace(probe.Lua) == "" {
+		return config.Driver{}, false
+	}
+	current, ok := s.configuredDriver(probe.Name)
+	if !ok || current.Lua == "" ||
+		filepath.Clean(current.Lua) != filepath.Clean(probe.Lua) {
+		return config.Driver{}, false
+	}
+	return current, true
+}
+
+func probeConfigSecret(cfg config.Driver, key string) (string, bool) {
+	if cfg.Config == nil {
+		return "", false
+	}
+	raw, ok := cfg.Config[key].(string)
+	if !ok {
+		return "", false
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" || value == maskedPlaceholder {
+		return "", false
+	}
+	return value, true
+}
+
+func probePostedDifferentSecret(probe, live config.Driver, key string) bool {
+	posted, ok := probeConfigSecret(probe, key)
+	if !ok {
+		return false
+	}
+	saved, _ := probeConfigSecret(live, key)
+	return posted != saved
+}
+
+func (s *Server) wireDriverProbeSecrets(reg *drivers.Registry, probeName string, probe config.Driver) func() string {
+	var mu sync.Mutex
+	changed := false
+	restartName := ""
+	changedSharedSecret := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		if changed {
+			return restartName
+		}
+		return ""
+	}
+	if s.deps.State == nil {
+		return changedSharedSecret
+	}
+	live, ok := s.sameConfiguredProbeDriver(probe)
+	if !ok {
+		return changedSharedSecret
+	}
+	restartName = live.Name
+	secretOwner := live.SecretOwner()
+	ownerFor := func(driverName string) string {
+		if driverName == probeName {
+			return secretOwner
+		}
+		return driverName
+	}
+	reg.SecretOverride = func(driverName, key string) (string, bool) {
+		if driverName == probeName && probePostedDifferentSecret(probe, live, key) {
+			return "", false
+		}
+		return s.deps.State.LoadConfig(driverSecretStateKey(ownerFor(driverName), key))
+	}
+	reg.SecretPersister = func(driverName, key, value string) error {
+		if driverName == probeName && probePostedDifferentSecret(probe, live, key) {
+			return nil
+		}
+		owner := ownerFor(driverName)
+		stateKey := driverSecretStateKey(owner, key)
+		if old, ok := s.deps.State.LoadConfig(stateKey); ok && old == value {
+			return nil
+		}
+		if err := s.deps.State.SaveDriverSecret(owner, key, value); err != nil {
+			return err
+		}
+		if driverName == probeName && owner == secretOwner {
+			mu.Lock()
+			changed = true
+			mu.Unlock()
+		}
+		return nil
+	}
+	return changedSharedSecret
+}
+
 // rejectUnsafeProbeTargets checks every host a driver test might dial:
 // MQTT, Modbus, config.host / config.url, and HTTP/WS/TCP allowlists.
-func rejectUnsafeProbeTargets(cfg config.Driver) error {
+func rejectUnsafeProbeTargets(cfg config.Driver, allowedLoopbackHost string) error {
 	if mq := cfg.EffectiveMQTT(); mq != nil {
 		if err := rejectUnsafeProbeHost(mq.Host); err != nil {
 			return fmt.Errorf("mqtt host: %w", err)
@@ -342,7 +474,7 @@ func rejectUnsafeProbeTargets(cfg config.Driver) error {
 		}
 		if u, ok := cfg.Config["url"].(string); ok && strings.TrimSpace(u) != "" {
 			if host := hostFromProbeURL(u); host != "" {
-				if err := rejectUnsafeProbeHost(host); err != nil {
+				if err := rejectUnsafeProbeHostOrConfiguredLoopback(host, allowedLoopbackHost); err != nil {
 					return fmt.Errorf("config.url: %w", err)
 				}
 			}
@@ -353,7 +485,7 @@ func rejectUnsafeProbeTargets(cfg config.Driver) error {
 			if strings.TrimSpace(h) == "" {
 				continue
 			}
-			if err := rejectUnsafeProbeHost(hostFromAllowlistEntry(h)); err != nil {
+			if err := rejectUnsafeProbeHostOrConfiguredLoopback(hostFromAllowlistEntry(h), allowedLoopbackHost); err != nil {
 				return fmt.Errorf("http allowlist: %w", err)
 			}
 		}
@@ -379,6 +511,62 @@ func rejectUnsafeProbeTargets(cfg config.Driver) error {
 		}
 	}
 	return nil
+}
+
+// configuredProbeLoopbackHost permits a test to reach a loopback URL only
+// when that exact URL is already saved for the same enabled driver and Lua
+// file. A probe cannot introduce a new loopback destination in its request.
+func (s *Server) configuredProbeLoopbackHost(probe config.Driver) string {
+	if probe.Name == "" || probe.Lua == "" || probe.Config == nil {
+		return ""
+	}
+	current, ok := s.configuredDriver(probe.Name)
+	if !ok || current.Disabled || current.Lua == "" ||
+		filepath.Clean(current.Lua) != filepath.Clean(probe.Lua) ||
+		!sameProbeHTTPAllowlist(current.Capabilities.HTTP, probe.Capabilities.HTTP) {
+		return ""
+	}
+	savedURL, ok := current.Config["url"].(string)
+	if !ok || savedURL == "" || probe.Config["url"] != savedURL {
+		return ""
+	}
+	u, err := url.Parse(savedURL)
+	if err != nil || u.Host == "" ||
+		(!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) {
+		return ""
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil || !ip.IsLoopback() {
+		return ""
+	}
+	return ip.String()
+}
+
+func sameProbeHTTPAllowlist(saved, probe *config.HTTPCapability) bool {
+	if (saved == nil) != (probe == nil) {
+		return false
+	}
+	if saved == nil {
+		return true
+	}
+	if len(saved.AllowedHosts) != len(probe.AllowedHosts) {
+		return false
+	}
+	for i := range saved.AllowedHosts {
+		if saved.AllowedHosts[i] != probe.AllowedHosts[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func rejectUnsafeProbeHostOrConfiguredLoopback(host, allowedLoopbackHost string) error {
+	host = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() &&
+		allowedLoopbackHost != "" && ip.String() == allowedLoopbackHost {
+		return nil
+	}
+	return rejectUnsafeProbeHost(host)
 }
 
 func hostFromProbeURL(raw string) string {
@@ -579,7 +767,7 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 	// below it is what you reach for when the report does not settle the
 	// question. Shipping them together means the person asking for help
 	// sends one file and never has to pick the right one.
-	addFile("00-help-report.md", []byte(s.buildSupportReport(r.Context(), time.Now())))
+	addFile("00-help-report.md", []byte(redactDumpLog(s.buildSupportReport(r.Context(), now))))
 
 	manifest := map[string]any{
 		"generated_at": now.Format(time.RFC3339),
@@ -593,6 +781,8 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 			"00-help-report.md",
 			"config.redacted.yaml",
 			"drivers.json",
+			"planner.json",
+			"loadpoints.json",
 			"logs/global.log",
 			"logs/<driver>.log",
 			"telemetry/<driver>__<metric>.csv",
@@ -611,6 +801,8 @@ func (s *Server) handleSupportDump(w http.ResponseWriter, r *http.Request) {
 	// All driver health in one file — easier to scan than one-per-driver.
 	healthBody, _ := json.MarshalIndent(s.deps.Tel.AllHealth(), "", "  ")
 	addFile("drivers.json", healthBody)
+	addFile("planner.json", supportJSON(s.supportPlanner(now)))
+	addFile("loadpoints.json", supportJSON(s.loadpointsPayload(now)))
 
 	// Logs. Lua host.log and HTTP error bodies often carry OAuth JSON;
 	// redact before the zip leaves the house.

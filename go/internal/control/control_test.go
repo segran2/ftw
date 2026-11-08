@@ -143,6 +143,7 @@ func TestDispatchWrongDirectionWindupDecaysPIIntegral(t *testing.T) {
 	// every subsequent cycle (that's the 2026-05-25 sunrise regression).
 	var lastTarget float64
 	for i := 0; i < 5; i++ {
+		store.Update("ferroamp", telemetry.DerMeter, -1000, nil, nil) // the PI acts once per new sample
 		targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
 		if len(targets) == 1 {
 			lastTarget = targets[0].TargetW
@@ -371,8 +372,10 @@ func TestPlannerSelfIdleGateLeavesExistingDischargeAloneInsideDeadband(t *testin
 		Strategy:        "self_consumption",
 	}
 	// Grid balanced — battery is covering load fine. Deadband → no
-	// dispatch issued, but the running battery state is preserved.
-	store := seedStore(0, []struct {
+	// dispatch issued, but the running battery state is preserved. A
+	// battery that may not export holds the band above 0 W, so the
+	// balanced grid imports a little.
+	store := seedStore(20, []struct {
 		name          string
 		currentW, soc float64
 	}{
@@ -1656,8 +1659,8 @@ func TestJointFuseAllocatorScalesBothBatteryAndEV(t *testing.T) {
 	if got < 0 {
 		t.Errorf("TargetW = %.0f W — battery shouldn't be discharging here", got)
 	}
-	if !st.FuseSaturated {
-		t.Errorf("FuseSaturated = false; want true after joint scaling")
+	if !st.FuseSaturated || st.FuseSaturatedByImport {
+		t.Errorf("FuseSaturated = %v, by import %v; want the fuse after joint scaling", st.FuseSaturated, st.FuseSaturatedByImport)
 	}
 	// EV cap is the post-republish verdict: after applyFuseGuard +
 	// forceFuseDischarge constrain battery further (and may swing it
@@ -1673,6 +1676,23 @@ func TestJointFuseAllocatorScalesBothBatteryAndEV(t *testing.T) {
 	projected := 8200.0 + got
 	if projected > fuseMaxW+50 {
 		t.Errorf("projected grid %.0f W > fuse %.0f after dispatch", projected, float64(fuseMaxW))
+	}
+}
+
+// The same site under a 9 kW hourly import ceiling: the hour's limit, not
+// the fuse, sets the ceiling the allocator hits, and says so.
+func TestJointFuseAllocatorNamesTheHoursImportLimit(t *testing.T) {
+	now := time.Now()
+	dir := SlotDirective{SlotStart: now, SlotEnd: now.Add(15 * time.Minute), BatteryEnergyWh: 1250, Strategy: "arbitrage"}
+	store := seedStore(8200, []struct {
+		name          string
+		currentW, soc float64
+	}{{"ferroamp", 0, 0.5}})
+	st := newStateWithEnergyDispatch(dir, "ferroamp")
+	st.EVChargingW, st.BatteryCoversEV, st.PeakImportCeilingW = 8000, true, 9000
+	ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11000)
+	if !st.FuseSaturated || !st.FuseSaturatedByImport {
+		t.Fatalf("FuseSaturated = %v, by import %v; want the hour's import limit", st.FuseSaturated, st.FuseSaturatedByImport)
 	}
 }
 
@@ -3498,6 +3518,43 @@ func TestInverterAffinity_FallsBackToProportionalOnOverflow(t *testing.T) {
 	}
 }
 
+// PV on an inverter whose battery cannot charge is not DC-local to any
+// battery that can. It reaches them over the AC bus, so the fleet total
+// is split by capacity and nothing is lost. Before, that group's PV share
+// of the total went to no battery (golden seeded_siblings/039 lost 3,316 W
+// of a 9,600 W target).
+func TestInverterAffinity_PVWithoutItsBatteryKeepsTheTotal(t *testing.T) {
+	online := []batteryInfo{
+		{driver: "sungrow", capacityWh: 15200, soc: 0.5, online: true, group: "sg"},
+		{driver: "pixii", capacityWh: 15200, soc: 0.5, online: true, group: "px"},
+	}
+	blocked := append([]batteryInfo{
+		{driver: "ferroamp", capacityWh: 10000, soc: 0.5, online: true, group: "fa", chargeBlocked: true},
+	}, online...)
+	for _, tc := range []struct {
+		name     string
+		bats     []batteryInfo
+		targetW  float64
+		wantEach float64
+	}{
+		{"battery offline", online, 6000, 3000},
+		{"battery cannot charge", blocked, 6000, 3000},
+		// Below the down group's PV, master gave the whole target to it: 0 W each.
+		{"target below that PV", online, 2000, 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groupPV := map[string]float64{"fa": 3316}
+			got := map[string]float64{}
+			for _, tg := range distributeProportional(tc.bats, tc.targetW, groupPV) {
+				got[tg.Driver] = tg.TargetW
+			}
+			if math.Abs(got["sungrow"]-tc.wantEach) > 1 || math.Abs(got["pixii"]-tc.wantEach) > 1 || got["ferroamp"] != 0 {
+				t.Errorf("targets = %v, want sungrow and pixii %.0f each, ferroamp 0", got, tc.wantEach)
+			}
+		})
+	}
+}
+
 // With no inverter groups configured, the algorithm must produce
 // identical results to today's capacity-proportional split — the
 // backward-compat invariant.
@@ -4008,12 +4065,23 @@ func TestPlannerSelfIdleGateLeavesSurplusOnlyEVReserve(t *testing.T) {
 	st.MinDispatchIntervalS = 0
 	st.SlotDirective = func(time.Time) (SlotDirective, bool) { return dir, true }
 
-	targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
-	if len(targets) != 1 {
-		t.Fatalf("want 1 target, got %d", len(targets))
+	// The PI may take a few ticks to get there; it must never pass it.
+	var last float64
+	for i := 0; i < 10; i++ {
+		targets := ComputeDispatch(store, st, caps(map[string]float64{"ferroamp": 15200}), 11040)
+		if len(targets) != 1 {
+			t.Fatalf("tick %d: want 1 target, got %d", i, len(targets))
+		}
+		last = targets[0].TargetW
+		if last > 1000+1 {
+			t.Fatalf("tick %d: TargetW = %f — battery took the surplus-only EV reserve", i, last)
+		}
+		store.Update("ferroamp", telemetry.DerBattery, last, ptrF64(0.5), nil)
+		store.Update("ferroamp", telemetry.DerMeter, -3000+last, nil, nil)
+		store.DriverHealthMut("ferroamp").RecordSuccess()
 	}
-	if math.Abs(targets[0].TargetW-1000) > 1 {
-		t.Errorf("TargetW = %f — idle gate must leave surplus-only EV reserve; want ~1000", targets[0].TargetW)
+	if math.Abs(last-1000) > 1 {
+		t.Errorf("TargetW = %f — idle gate must leave surplus-only EV reserve; want ~1000", last)
 	}
 }
 
@@ -5442,20 +5510,19 @@ func TestEnergyDispatchClampsDischargeWhenEVActuallyCharging(t *testing.T) {
 // charge battery, EV is on surplus_only at 2.5 kW with 11 kW max,
 // and 3 kW is currently exporting at the real meter.
 //
-// dispatch.go:685 subtracts EVChargingW from gridW before the home-
-// battery decision so the battery sees "what export would exist
-// without the EV", which is 3000 + 2500 = 5500 W in this scenario.
-// The reserve cap then carves out reserveRemaining for the EV to
-// step up into.
+// The car comes before battery charge, so the battery sees the
+// export the car leaves: the real 3000 W, not the 5500 W there would
+// be without the car. The reserve cap then carves out
+// reserveRemaining for the EV to step up into.
 //
 // Pre-fix (reserve = full MaxChargeW = 11000): reserveRemaining
-// = 11000 - 2500 = 8500. ceiling = 5500 - 8500 = -3000 → 0. Battery
+// = 11000 - 2500 = 8500. ceiling = 3000 - 8500 → 0. Battery
 // idles; surplus dumps to grid.
 //
 // Post-fix (reserve = CurrentPowerW + EVRampHeadroomW = 4500):
-// reserveRemaining = 4500 - 2500 = 2000. ceiling = 5500 - 2000 =
-// 3500. Battery picks up the bulk of the surplus while leaving 2 kW
-// of headroom for the EV to ramp up.
+// reserveRemaining = 4500 - 2500 = 2000. ceiling = 3000 - 2000 =
+// 1000. Battery takes the surplus beyond 2 kW of headroom for the
+// EV to ramp up, and none of the car's own 2.5 kW.
 //
 // The test sets EVSurplusOnlyReserveW directly to the value
 // loadpoint.SurplusReserveW would produce; the helper itself is
@@ -5487,12 +5554,12 @@ func TestEnergyDispatchAbsorbsSurplusBeyondEVReserveActualDraw(t *testing.T) {
 		t.Fatalf("want 1 target, got %d", len(targets))
 	}
 	got := targets[0].TargetW
-	// Want ≈ 3500 W. Allow ±400 W slack for time drift / formula edge.
-	if got < 3100 {
-		t.Errorf("TargetW = %.0f W — battery should absorb the surplus that the EV's adaptive reserve no longer hoards (want ≈ 3500 W, was 0 pre-fix)", got)
+	// Want ≈ 1000 W. Allow ±100 W slack for time drift / formula edge.
+	if got < 900 {
+		t.Errorf("TargetW = %.0f W — battery should absorb the surplus that the EV's adaptive reserve no longer hoards (want ≈ 1000 W, was 0 pre-fix)", got)
 	}
-	if got > 3900 {
-		t.Errorf("TargetW = %.0f W — battery overshoot, must leave EVRampHeadroomW (2 kW) of headroom for EV ramp-up (want ≈ 3500 W)", got)
+	if got > 1100 {
+		t.Errorf("TargetW = %.0f W — battery overshoot, must leave the car's draw and EVRampHeadroomW (2 kW) of headroom for EV ramp-up (want ≈ 1000 W)", got)
 	}
 }
 

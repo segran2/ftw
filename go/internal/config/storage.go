@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
 	"github.com/srcfl/ftw/go/internal/state"
 	"gopkg.in/yaml.v3"
@@ -20,6 +21,26 @@ type storedSettings struct {
 	Config          *Config `json:"config"`
 	LANPasswordHash string  `json:"lan_password_hash,omitempty"`
 	YAMLSourceHash  string  `json:"yaml_source_hash,omitempty"`
+}
+
+func (s *storedSettings) UnmarshalJSON(raw []byte) error {
+	var doc struct {
+		Config          json.RawMessage `json:"config"`
+		LANPasswordHash string          `json:"lan_password_hash"`
+		YAMLSourceHash  string          `json:"yaml_source_hash"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	if len(doc.Config) == 0 || bytes.Equal(bytes.TrimSpace(doc.Config), []byte("null")) {
+		return errors.New("stored settings have no config")
+	}
+	cfg := new(Config)
+	if err := DecodeJSON(doc.Config, cfg); err != nil {
+		return err
+	}
+	*s = storedSettings{Config: cfg, LANPasswordHash: doc.LANPasswordHash, YAMLSourceHash: doc.YAMLSourceHash}
+	return nil
 }
 
 func decodeStored(c state.Configuration, database, baseDir string) (*Config, error) {
@@ -44,13 +65,51 @@ func decodeStored(c state.Configuration, database, baseDir string) (*Config, err
 	}
 	_ = json.Unmarshal(c.Document, &legacyControl)
 	cfg.applyRetiredControl(legacyControl.Config)
+	cfg.noteOldFuseMargin()
 	// This is the same typed config that was validated on save. Do not apply new
 	// defaults during a storage-only reload: nil, false and zero stay distinct.
+	// The only exception is the site timings, which have no meaning at zero.
+	cfg.Site.FillUnsetTimings()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("stored settings: %w", err)
 	}
 	cfg.ResolveDriverPaths(baseDir)
 	return cfg, nil
+}
+
+func restoredFromSnapshot(st *state.Store) bool {
+	for _, ev := range st.HealEvents() {
+		if ev.Tier == "state" && ev.Action == "restored" {
+			return true
+		}
+	}
+	return false
+}
+
+// HealSettingsDatabase runs state.HealBeforeLoad on the database a seed file
+// names. Boot calls it before Load, which reads settings before state.Open.
+func HealSettingsDatabase(path string) (*state.HealEvent, error) {
+	database := filepath.Join(filepath.Dir(path), "state.db")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var source struct {
+			Database string `yaml:"config_database"`
+		}
+		if yaml.Unmarshal(data, &source) != nil || source.Database == "" {
+			return nil, nil // the seed holds the settings
+		}
+		database = source.Database
+		if !filepath.IsAbs(database) {
+			database = filepath.Join(filepath.Dir(path), database)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, nil // Load reports it
+	}
+	database, err = filepath.Abs(database)
+	if err != nil {
+		return nil, err
+	}
+	return state.HealBeforeLoad(database)
 }
 
 func loadStored(database, baseDir string) (*Config, error) {
@@ -78,7 +137,9 @@ func loadSettingsBesideSeed(seedPath string) (*Config, bool) {
 // InitializeStorage imports YAML once, then records the database location in
 // the seed file. If a crash interrupted this last step, reuse the committed
 // document instead of importing the old YAML again. A recovered database must
-// still contain the exact settings revision loaded before state.Open.
+// still contain the exact settings revision loaded before state.Open, unless
+// state.Open restored it from an older snapshot: then the snapshot's settings
+// run and /api/health reports the step back.
 func InitializeStorage(path, database string, cfg *Config, st *state.Store) (*Config, error) {
 	database, err := filepath.Abs(database)
 	if err != nil {
@@ -92,12 +153,20 @@ func InitializeStorage(path, database string, cfg *Config, st *state.Store) (*Co
 		return nil, err
 	}
 	if cfg.ConfigDatabase != "" {
-		if !found || doc.Revision != cfg.Revision {
+		rolledBack := found && doc.Revision < cfg.Revision && restoredFromSnapshot(st)
+		if !found || (doc.Revision != cfg.Revision && !rolledBack) {
 			return nil, errors.New("database recovery lost current settings; restore a full backup")
 		}
 		current, err := decodeStored(doc, database, filepath.Dir(path))
 		if err != nil {
 			return nil, err
+		}
+		if rolledBack {
+			// The next boot would load the snapshot's settings anyway; run them
+			// now instead of exiting, and say so.
+			st.RecordHealEvent(state.HealEvent{Tier: "state", Action: "restored", AtMs: time.Now().UnixMilli(),
+				Detail: fmt.Sprintf("state.db was corrupt — restored from last snapshot; settings went back from revision %d to %d", cfg.Revision, doc.Revision)})
+			cfg = current
 		}
 		if !reflect.DeepEqual(cfg, current) {
 			return nil, errors.New("database recovery changed current settings; restore a full backup")
@@ -215,6 +284,12 @@ func SaveStored(st *state.Store, path string, cfg *Config) error {
 	return saveStored(st, path, cfg, "")
 }
 
+// SaveStoredWithValues commits a settings change and its companion records
+// in the same SQLite transaction, for example a setup commit receipt.
+func SaveStoredWithValues(st *state.Store, path string, cfg *Config, values map[string]string) error {
+	return saveStoredValues(st, path, cfg, "", values, nil, nil)
+}
+
 // DropRetiredSettings rewrites stored settings that still carry settings of a
 // removed feature. Ask why kept an OpenRouter key there; nothing reads it, so
 // it must not stay in state.db and every backup. Device Support repositories,
@@ -241,6 +316,28 @@ func DropRetiredSettings(st *state.Store, path string, cfg *Config) ([]string, e
 }
 
 func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) error {
+	return saveStoredValues(st, path, cfg, sourceHash, nil, nil, nil)
+}
+
+// ErrReviewedConfigChanged means a save would differ from the reviewed document.
+var ErrReviewedConfigChanged = errors.New("configuration changed after review; validate and review the returned draft again")
+
+// SaveStoredReviewedWithValues checks the portable document after all save-time
+// normalization, before committing either settings or companion records.
+func SaveStoredReviewedWithValues(st *state.Store, path string, cfg *Config, values map[string]string, reviewedJSON []byte) error {
+	return SaveStoredReviewedWithCheck(st, path, cfg, values, reviewedJSON, nil)
+}
+
+// SaveStoredReviewedWithCheck checks authority after all save preparation,
+// immediately before committing the reviewed settings and companion records.
+func SaveStoredReviewedWithCheck(st *state.Store, path string, cfg *Config, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
+	if len(reviewedJSON) == 0 {
+		return errors.New("reviewed configuration is required")
+	}
+	return saveStoredValues(st, path, cfg, "", values, reviewedJSON, beforeSave)
+}
+
+func saveStoredValues(st *state.Store, path string, cfg *Config, sourceHash string, values map[string]string, reviewedJSON []byte, beforeSave func() error) error {
 	if cfg.ConfigDatabase == "" {
 		return errors.New("settings database is not initialized")
 	}
@@ -276,12 +373,24 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 			return errors.New("move the state database offline; its path cannot change in Settings")
 		}
 	}
+	if err := assignCredentialOwners(cfg, previous); err != nil {
+		return err
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	portable := *cfg
 	portable.Drivers = append([]Driver(nil), cfg.Drivers...)
 	portable.UnresolveDriverPaths(filepath.Dir(path))
+	if reviewedJSON != nil {
+		actual, err := json.Marshal(&portable)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(actual, reviewedJSON) {
+			return ErrReviewedConfigChanged
+		}
+	}
 	raw, err := json.Marshal(storedSettings{Config: &portable, LANPasswordHash: cfg.LANPasswordHash, YAMLSourceHash: sourceHash})
 	if err != nil {
 		return err
@@ -290,26 +399,25 @@ func saveStored(st *state.Store, path string, cfg *Config, sourceHash string) er
 	if cfg.EVCharger != nil {
 		password = cfg.EVCharger.Password
 	}
-	credentials := map[string]string{
-		"ev_charger_password": password,
-		"lan_auth_password":   cfg.LANPasswordHash,
+	storedSecrets, err := st.LoadConfigByPrefix("driver_secret")
+	if err != nil {
+		return err
 	}
-	for _, d := range cfg.Drivers {
-		token, ok := d.Config["refresh_token"].(string)
-		if !ok {
-			continue
+	credentials, err := collectDriverSecretCredentials(cfg, previous, storedSecrets)
+	if err != nil {
+		return err
+	}
+	credentials["ev_charger_password"] = password
+	credentials["lan_auth_password"] = cfg.LANPasswordHash
+	for key, value := range values {
+		if _, credential := credentials[key]; credential || key == "settings/config_v1" {
+			return errors.New("companion settings record conflicts with configuration or credentials")
 		}
-		oldToken := ""
-		if previous != nil {
-			for _, old := range previous.Drivers {
-				if old.Name == d.Name {
-					oldToken, _ = old.Config["refresh_token"].(string)
-					break
-				}
-			}
-		}
-		if previous != nil && token != oldToken {
-			credentials["driver_secret:"+d.Name+":refresh_token"] = token
+		credentials[key] = value
+	}
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return err
 		}
 	}
 	revision, err := st.SaveConfiguration(raw, cfg.Revision, credentials)

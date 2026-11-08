@@ -59,6 +59,33 @@ test('expected limits stay calm and explain themselves', () => {
   assert.equal(car.title, 'Car is full');
   const limit = controlStatus(row({kind: 'ev', status: 'limited', reason: 'device_limit', severity: 'warning', device_limit_a: 8, requested_a: 16}));
   assert.equal(limit.text, 'The charger’s own limit is 8 A, below the 16 A FTW asked for.');
+  // Field trace, 23 Oct 2026: 15 A ordered, Easee's load balancing allowed 13 A.
+  const lb = {kind: 'ev', mode: 'plan', status: 'limited', reason: 'load_balancer_limit', severity: 'info',
+    sent_w: 10350, actual_w: 8850, requested_a: 15, offered_a: 15, device_limit_a: 16, limit_a: 13, limited_by: 'load_balancer'};
+  const balanced = controlStatus(row({...lb, make: 'Easee'}));
+  assert.equal(balanced.title, 'Limited by the charger’s load balancing');
+  assert.equal(balanced.text, 'Easee limits the charger to 13 A (its load balancing). FTW asked for 15 A; the car takes 8.8 kW.');
+  assert.equal(balanced.next, 'If this happens often, compare the charger’s load balancing settings with FTW’s main fuse setting.');
+  assert.equal(balanced.tone, 'neutral');
+  assert.equal(controlStatus(row(lb)).text, 'The charger’s load balancing limits it to 13 A. FTW asked for 15 A; the car takes 8.8 kW.');
+  assert.deepEqual(controlNumbers(row(lb)).filter(([label]) => /current|offer|limit|allows/i.test(label)), [
+    ['Requested current', '15 A'], ['Reported current setting', '15 A'], ['Charger limit', '16 A'], ['Load balancing allows', '13 A']]);
+  // A lower current with no cause shown says what the charger does, no more.
+  const unexplained = {...lb, reason: 'offered_current_lower', severity: 'warning', limited_by: undefined};
+  assert.equal(controlStatus(row(unexplained)).text, 'The charger lets the car take 13 A, below the 15 A FTW asked for.');
+  assert.deepEqual(controlNumbers(row(unexplained)).at(-1), ['Charger lets the car take', '13 A']);
+  // A charger holding a lower order than FTW sent.
+  const lower = controlStatus(row({kind: 'ev', status: 'limited', reason: 'offered_current_lower', severity: 'warning', offered_a: 12, requested_a: 15}));
+  assert.equal(lower.text, 'The charger offers 12 A, below the 15 A FTW asked for.');
+  // A lower held order is said first, even when the driver reports less.
+  const both = controlStatus(row({kind: 'ev', status: 'limited', reason: 'offered_current_lower', severity: 'warning', offered_a: 12, limit_a: 10, requested_a: 15}));
+  assert.equal(both.text, 'The charger offers 12 A, below the 15 A FTW asked for.');
+  const onePhase = controlStatus(row({kind: 'ev', mode: 'plan', status: 'limited', reason: 'one_phase', severity: 'info',
+    sent_w: 3680, actual_w: 3650, charging_phase: 'L1', charging_phase_max_w: 3680}));
+  assert.equal(onePhase.title, 'Charging on one phase');
+  assert.equal(onePhase.text, 'The car charges on L1 only, at most 3.7 kW. FTW plans with what it takes.');
+  assert.equal(onePhase.next, '');
+  assert.equal(onePhase.tone, 'neutral');
 });
 
 test('the receipt walks from sent to confirmed without inventing proof', () => {
@@ -139,4 +166,31 @@ test('the summary answers the question for the whole site', () => {
   assert.equal(controlSummary([row({severity: 'alarm'}), row({severity: 'alarm'})]).title, '2 devices need attention now');
   assert.equal(controlSummary([row({status: 'not_controlled', reason: 'observe_only'})]).tone, 'neutral');
   assert.equal(controlSummary([row()], false).tone, 'stale');
+});
+
+
+test('limited positive EV offer does not explain prolonged zero delivery', () => {
+ const missing=controlStatus(row({kind:'ev',status:'not_following',reason:'no_power_response',severity:'warning',requested_w:10350,sent_w:6900,actual_w:0,requested_a:15,offered_a:10,device_reason:'limited by dynamic charger current'}));
+ assert.equal(missing.title,'Not following');
+ assert.match(missing.text,/6.9 kW charge.*no power/);
+ const capped=controlStatus(row({kind:'ev',status:'limited',reason:'fuse_limit',sent_w:6900,actual_w:6800}));
+ assert.equal(capped.title,'Limited by the main fuse');
+ assert.match(capped.text,/protect the main fuse/);
+ const hour=controlStatus(row({kind:'ev',status:'limited',reason:'import_limit',sent_w:4140,actual_w:4100}));
+ assert.equal(hour.title,'Limited by the hourly import limit');
+ assert.match(hour.text,/this hour’s grid import/);
+ assert.doesNotMatch(hour.text,/fuse/);
+});
+
+test('a confirmed lower pilot is an explained restriction with separate current values', () => {
+  const r = row({kind:'ev',status:'limited',reason:'charger_pilot_limit',severity:'info',
+    requested_a:15,offered_a:15,dynamic_limit_a:15,pilot_a:13,actual_w:8850,sent_w:10350});
+  const words=controlStatus(r);
+  assert.match(words.title,/Limited by the charger/);
+  assert.match(words.text,/signals 13 A/);
+  assert.match(words.text,/internal limiting cause is unknown/);
+  const numbers=controlNumbers(r);
+  assert.ok(numbers.some(([label,value])=>label==='Actual pilot current'&&value==='13 A'));
+  assert.ok(numbers.some(([label,value])=>label==='Dynamic current setting'&&value==='15 A'));
+  assert.ok(!numbers.some(([label])=>label==='Charger offer'));
 });

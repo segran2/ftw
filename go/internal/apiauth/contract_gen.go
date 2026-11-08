@@ -6,28 +6,81 @@ package apiauth
 // what the registry exists to stop, and a role is the one name here
 // that decides whether a phone may change anything.
 const (
+	// RoleAgent — Assistant.
+	RoleAgent = "agent"
 	// RoleOwner — Owner.
 	RoleOwner = "owner"
+	// RoleRelease — Release check.
+	RoleRelease = "release"
+	// RoleSupport — Sourceful support.
+	RoleSupport = "support"
 	// RoleViewer — Viewer.
 	RoleViewer = "viewer"
+	// RoleWatch — Watch.
+	RoleWatch = "watch"
 )
 
 // RoleScopes is what each role carries, with '*' already expanded.
 // A role is a projection over scopes and never a replacement for them,
 // so this is the only place the projection is written down.
 var RoleScopes = map[string][]string{
+	RoleAgent: {
+		"ftw.live.read",
+		"ftw.history.read",
+		"ftw.plan.read",
+		"ftw.health.read",
+		"ftw.events.read",
+		"ftw.logs.read",
+		"ftw.config.read",
+		"ftw.diag.run",
+		"ftw.setup.write",
+		"ftw.dispatch.hold",
+		"ftw.goals.request",
+	},
 	RoleOwner: {
 		"ftw.live.read",
 		"ftw.history.read",
 		"ftw.plan.read",
 		"ftw.health.read",
 		"ftw.assets.read",
+		"ftw.events.read",
 		"ftw.dispatch.write",
 		"ftw.mode.write",
 		"ftw.members.read",
 		"ftw.members.write",
+		"ftw.logs.read",
+		"ftw.config.read",
+		"ftw.diag.run",
+		"ftw.setup.write",
+		"ftw.dispatch.hold",
+		"ftw.goals.request",
+		"ftw.update.request",
+		"ftw.cars.read",
+		"ftw.cars.write",
+	},
+	RoleRelease: {
+		"ftw.health.read",
+	},
+	RoleSupport: {
+		"ftw.live.read",
+		"ftw.history.read",
+		"ftw.plan.read",
+		"ftw.health.read",
+		"ftw.events.read",
+		"ftw.logs.read",
+		"ftw.config.read",
+		"ftw.diag.run",
+		"ftw.setup.write",
+		"ftw.dispatch.hold",
+		"ftw.goals.request",
 	},
 	RoleViewer: {
 		"ftw.live.read",
+	},
+	RoleWatch: {
+		"ftw.live.read",
+		"ftw.plan.read",
+		"ftw.events.read",
+		"ftw.dispatch.write",
 	},
 }

@@ -67,7 +67,17 @@ const (
 	// KindLAN is an unauthenticated request off the box's own LAN listener.
 	// Naming it is not a promotion: it writes down what the LAN already is.
 	KindLAN = "lan"
+	// KindAgent is an agent row (docs/agents.md): an assistant, Sourceful
+	// support or the release check, through FTW Cloud's tunnel only.
+	KindAgent = "agent"
 )
+
+// AgentRole reports whether a role is an agent's: a grant an owner gave to an
+// assistant, to Sourceful support or to the release check, never to a paired
+// device. Pairing codes and role changes refuse these roles.
+func AgentRole(role string) bool {
+	return role == RoleAgent || role == RoleSupport || role == RoleRelease
+}
 
 // Tier is how much a route costs before it runs.
 //

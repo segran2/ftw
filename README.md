@@ -34,6 +34,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Community help is best effort;
 
 Join the [FTW Discord](https://discord.gg/UK2ygPBu8N) for questions and community discussions.
 
+See [project statistics](https://stats.ftw.energy/) for public development
+activity and anonymous usage totals.
+
 ## Architecture
 
 FTW has three explicit modules:
@@ -124,15 +127,20 @@ session and blind relay; relay loss does not stop local control.
 
 ## Install on Home Assistant
 
-The existing [Home Assistant app](https://github.com/srcfl/home-assistant-addons)
-is on the retired 3.x line. It does not follow new 0.x releases. Do not install
-that beta to get current FTW. Run new FTW on a separate Linux host and use the
-[MQTT integration](docs/ha-integration.md) with Home Assistant.
+**Beta / pilot:** the new **FTW (0.x beta)** Home Assistant app runs new FTW
+directly on Home Assistant OS, for example a Home Assistant Green. Follow
+[FTW on Home Assistant](docs/home-assistant-app.md) step by step
+([svenska](docs/setup-guide/home-assistant-sv.md)).
 
-Follow [the switch guide](docs/native-beta.md#coming-from-an-older-ftw), including
-backup and stopping the old app's Core, Start on boot and Watchdog. Supervisor
-still owns recovery of the old app; its update controls do not migrate to 0.x.
-Report old app or Supervisor faults in its
+The older **FTW (beta)** app is on the retired 3.x line and does not follow new
+0.x releases; do not install it to get current FTW. The tested alternative is
+still to run FTW on a separate Linux host and use the
+[MQTT integration](docs/ha-integration.md).
+
+Switching from the old app: follow
+[the switch guide](docs/native-beta.md#coming-from-an-older-ftw), including
+backup and stopping the old app's Core, Start on boot and Watchdog. Report app
+or Supervisor faults in its
 [issue tracker](https://github.com/srcfl/home-assistant-addons/issues), and Core
 faults in this repository.
 
@@ -237,6 +245,24 @@ metadata are the detailed reference.
 
 Other files under [`docs/`](docs/) are focused installation or
 external-integration guides.
+
+## Related repositories
+
+FTW spans several repositories. This one is Core; the others are:
+
+| Repository | Role |
+|---|---|
+| [`srcfl/device-drivers`](https://github.com/srcfl/device-drivers) | Lua driver source, contracts, tests and the signed driver bundle Core pins. Change drivers there. |
+| [`srcfl/device-simulator`](https://github.com/srcfl/device-simulator) | Simulated house: inverters, batteries, chargers and meters over Modbus TCP, MQTT and OCPP. |
+| [`srcfl/ftw-webapp`](https://github.com/srcfl/ftw-webapp) | Installable everyday client. |
+| [`srcfl/ftw-app`](https://github.com/srcfl/ftw-app) | Native iOS and Android app. |
+| [`srcfl/ftw-cloud`](https://github.com/srcfl/ftw-cloud) | Opt-in, box-signed, read-only copy of each home's state for the apps. |
+| [`srcfl/home-assistant-addons`](https://github.com/srcfl/home-assistant-addons) | Home Assistant app packaging of each FTW release. |
+| [`srcfl/ftw-web`](https://github.com/srcfl/ftw-web) | The project website. |
+| [`srcfl/energyplan-demo`](https://github.com/srcfl/energyplan-demo) | Browser demo running the Energyplan worker in WebAssembly against a simulated home. |
+
+The Energyplan solver source is private; Core receives only its compiled
+worker and public integration metadata.
 
 ## Contributing
 

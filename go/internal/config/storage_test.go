@@ -135,7 +135,15 @@ ev_charger:
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, _ := json.Marshal(reloaded)
+	stripped := *reloaded
+	stripped.Drivers = append([]Driver(nil), reloaded.Drivers...)
+	for i := range stripped.Drivers {
+		if stripped.Drivers[i].CredentialOwner == "" {
+			t.Fatalf("import left driver %q without credential_owner", stripped.Drivers[i].Name)
+		}
+		stripped.Drivers[i].CredentialOwner = ""
+	}
+	after, _ := json.Marshal(&stripped)
 	if string(before) != string(after) {
 		t.Fatalf("config meaning changed across SQLite import\nbefore=%s\nafter=%s", before, after)
 	}
@@ -482,5 +490,27 @@ func TestDropRetiredSettingsDeletesTheAskWhyKey(t *testing.T) {
 	}
 	if removed, err := DropRetiredSettings(st, path, reloaded); err != nil || len(removed) != 0 {
 		t.Fatalf("second DropRetiredSettings = %v, %v; want nothing", removed, err)
+	}
+}
+
+// A box that stored zero timings before they counted as unset must still boot.
+// Slew stays 0, because zero slew means "no limit".
+func TestStoredZeroTimingsLoadAsDefaults(t *testing.T) {
+	path, _, st := importedLiveSettings(t)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Site.ControlIntervalS, cfg.Site.WatchdogTimeoutS, cfg.Site.SlewRateW = 0, 0, 0
+	if err := SaveStored(st, path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Site.ControlIntervalS != 2 || got.Site.WatchdogTimeoutS != 60 || got.Site.SlewRateW != 0 {
+		t.Fatalf("reloaded interval=%d watchdog=%d slew=%v, want 2, 60, 0",
+			got.Site.ControlIntervalS, got.Site.WatchdogTimeoutS, got.Site.SlewRateW)
 	}
 }

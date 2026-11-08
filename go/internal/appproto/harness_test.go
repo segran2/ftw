@@ -16,7 +16,7 @@ import (
 // testCodec is the frame layout from docs/protocol.md, implemented here so the
 // tests drive real bytes rather than passing structs to themselves.
 //
-// go/internal/appwire owns the production one. Keeping a copy in _test.go means
+// go/protocol/appwire owns the production one. Keeping a copy in _test.go means
 // a test passing here says the message layer works against the documented
 // layout, not that a stub agreed with itself — and it cannot be mistaken for
 // the real codec, because it does not ship.
@@ -245,16 +245,20 @@ type fakeGrants struct {
 	role  string
 	epoch uint64
 	gone  bool
+	// parentRole and root make the grant a watch's: the role its phone holds
+	// now, and that phone's subject.
+	parentRole string
+	root       string
 }
 
 func newGrants() *fakeGrants { return &fakeGrants{role: apiauth.RoleOwner, epoch: 1} }
 
 func newViewerGrants() *fakeGrants { return &fakeGrants{role: apiauth.RoleViewer, epoch: 1} }
 
-func (g *fakeGrants) Grant() (string, uint64, bool) {
+func (g *fakeGrants) Grant() (Enrolment, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.role, g.epoch, !g.gone
+	return Enrolment{Role: g.role, Epoch: g.epoch, ParentRole: g.parentRole, Root: g.root}, !g.gone
 }
 
 // revoke is what appenroll.Revoke does to a row: it stops existing.
@@ -278,6 +282,11 @@ func (g *fakeGrants) setRole(role string) {
 // all live.
 func newRig(t *testing.T) (*Handler, *fakeBox, *recorder, *fakeClock) {
 	t.Helper()
+	return newRigWith(t, nil)
+}
+
+func newRigWith(t *testing.T, prefs PlannerPrefs) (*Handler, *fakeBox, *recorder, *fakeClock) {
+	t.Helper()
 
 	clock := &fakeClock{uptimeMs: 60_000, now: time.UnixMilli(1_760_000_000_000)}
 	box := &fakeBox{
@@ -293,6 +302,7 @@ func newRig(t *testing.T) (*Handler, *fakeBox, *recorder, *fakeClock) {
 			PVW:             -3400,
 			BatteryW:        900,
 			LoadW:           3700,
+			LoadWKnown:      true,
 			BatterySoC:      0.62,
 			BatterySoCKnown: true,
 			Sources: []Source{
@@ -309,19 +319,21 @@ func newRig(t *testing.T) (*Handler, *fakeBox, *recorder, *fakeClock) {
 	rec := &recorder{}
 
 	h, err := New(Config{
-		Clock:      clock,
-		Site:       box,
-		Info:       box,
-		Modes:      box,
-		Plans:      box,
-		Codec:      testCodec{},
-		Sender:     rec,
-		Caller:     ownerCaller(),
-		Grants:     newGrants(),
-		SrcGrid:    "meter.p1",
-		SrcPV:      "inverter.sungrow",
-		SrcBattery: "battery.sungrow",
-		NewLeaseID: func() string { return "lease-test" },
+		Clock:        clock,
+		Site:         box,
+		Info:         box,
+		Modes:        box,
+		Plans:        box,
+		PlannerPrefs: prefs,
+		Codec:        testCodec{},
+		Sender:       rec,
+		Caller:       ownerCaller(),
+		Grants:       newGrants(),
+		Commands:     NewCmdLog(),
+		SrcGrid:      "meter.p1",
+		SrcPV:        "inverter.sungrow",
+		SrcBattery:   "battery.sungrow",
+		NewLeaseID:   func() string { return "lease-test" },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -331,6 +343,14 @@ func newRig(t *testing.T) (*Handler, *fakeBox, *recorder, *fakeClock) {
 
 // deliver hands one client message to the handler as bytes.
 func deliver(t *testing.T, h *Handler, msgType string, id *uint32, b any) {
+	t.Helper()
+	if err := h.Handle(context.Background(), clientFrame(t, msgType, id, b)); err != nil {
+		t.Fatalf("handle %s: %v", msgType, err)
+	}
+}
+
+// clientFrame is one client message as the bytes deliver hands over.
+func clientFrame(t *testing.T, msgType string, id *uint32, b any) []byte {
 	t.Helper()
 	env, err := newEnvelope(msgType, id, b)
 	if err != nil {
@@ -348,9 +368,7 @@ func deliver(t *testing.T, h *Handler, msgType string, id *uint32, b any) {
 	if err != nil {
 		t.Fatalf("frame %s: %v", msgType, err)
 	}
-	if err := h.Handle(context.Background(), frame); err != nil {
-		t.Fatalf("handle %s: %v", msgType, err)
-	}
+	return frame
 }
 
 func subscribe(t *testing.T, h *Handler, rec *recorder) {

@@ -34,6 +34,10 @@ func WithSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		w.Header().Set("X-Frame-Options", "DENY")
+		if HomeAssistantIngress(r) {
+			w.Header().Set("Content-Security-Policy", "frame-ancestors 'self'")
+			w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
@@ -120,6 +124,26 @@ func Authenticate(next http.Handler, policy MutationPolicy) http.Handler {
 	})
 }
 
+// remoteProved reports whether a request has shown what a protected request
+// must: it came from a local client to a local host name, or it carries
+// FTW_API_TOKEN where the policy asks remote callers for it. A read that is
+// open to anyone uses it to leave out what identifies a person's property,
+// such as a car's VIN, which a protected request would have had to prove
+// itself to see.
+func remoteProved(r *http.Request, policy MutationPolicy) bool {
+	if !policy.RequireTokenForRemote {
+		return true
+	}
+	reqAuthority, err := parseAuthority(r.Host)
+	if err != nil {
+		return false
+	}
+	if isLocalAuthority(reqAuthority) && isLocalClient(r.RemoteAddr) {
+		return true
+	}
+	return strings.TrimSpace(policy.Token) != "" && validBearerToken(r.Header.Get("Authorization"), policy.Token)
+}
+
 func lanAuthOn(policy MutationPolicy) bool {
 	return policy.LANAuthEnabled != nil && policy.LANAuthEnabled()
 }
@@ -134,7 +158,8 @@ func lanAuthExempt(path string) bool {
 }
 
 func decideLANCaller(r *http.Request, policy MutationPolicy, houseOK bool) apiauth.Caller {
-	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || houseOK {
+	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || houseOK ||
+		validBearerToken(r.Header.Get("Authorization"), policy.Token) {
 		return localCaller(r)
 	}
 	return lanViewerCaller(r)
@@ -146,11 +171,18 @@ func decideLANCaller(r *http.Request, policy MutationPolicy, houseOK bool) apiau
 // counted as a house-password guess. The outer listener and Server.Handler
 // both wrap Authenticate; a context flag stops the inner wrap from hashing
 // or counting twice.
+//
+// The proof counts from the box itself too, so a browser on the box can let
+// an assistant in once it signs in. Loopback stays an owner for settings
+// without it, so it is not a wall against programs on the box: drivers
+// cannot reach the API at all (drivers/selfguard.go), and anything else
+// running there can already change every setting. An app session is proved
+// by its own key and never presents this one.
 func resolveLANSecret(r *http.Request, policy MutationPolicy) (bool, *http.Request) {
 	if ok, checked := lanSecretFrom(r.Context()); checked {
 		return ok, r
 	}
-	if !lanAuthOn(policy) || isLoopbackClient(r.RemoteAddr) || !isLocalClient(r.RemoteAddr) {
+	if !lanAuthOn(policy) || !isLocalClient(r.RemoteAddr) || appLinkOverSession(r) {
 		return false, r
 	}
 	if secret, ok := parseBearer(r.Header.Get("Authorization")); ok {
@@ -240,6 +272,7 @@ func requiresMutationProtection(r *http.Request) bool {
 func protectedReadPath(path string) bool {
 	switch path {
 	case "/api/config",
+		"/api/setup/draft",
 		"/api/support/dump",
 		"/api/support/report",
 		"/api/logs",
@@ -268,6 +301,9 @@ func protectedReadPath(path string) bool {
 		"/api/notifications/vapid",
 		"/api/device_repository/catalog",
 		"/api/app-link/status",
+		"/api/agents",
+		"/api/agents/audit",
+		"/api/agent-invites",
 		"/api/ocpp/chargers":
 		return true
 	}

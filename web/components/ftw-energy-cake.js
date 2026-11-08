@@ -161,6 +161,7 @@ class FtwEnergyCake extends FtwElement {
     if (!this._totals) {
       return `<div class="empty">No data yet.</div>`;
     }
+    if (this._totals.incomplete) return `<div class="empty">Incomplete measurements. The energy split is unknown.</div>`;
     const importWh = Math.max(0, Number(this._totals.import_wh) || 0);
     const loadWh = Math.max(0, Number(this._totals.load_wh) || 0);
     const exportWh = Math.max(0, Number(this._totals.export_wh) || 0);
@@ -252,8 +253,8 @@ class FtwEnergyCake extends FtwElement {
   }
 
   _renderSlices(selfPct) {
-    // Two-slice donut. Self-consumption is the amber/accent slice
-    // because it's "yours"; import is the red/--red-e slice because
+    // Two-slice donut. Self-consumption is the ink/accent slice
+    // because it's "yours"; import is the grid slice because
     // it's the bit you'd want to shrink.
     const self = ringPath({
       startPct: 0,

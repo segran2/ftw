@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/srcfl/ftw/go/internal/localzone"
 	"gopkg.in/yaml.v3"
 )
 
@@ -43,22 +44,29 @@ type Config struct {
 	Nova             *Nova              `yaml:"nova,omitempty" json:"nova,omitempty"`
 	DeviceRepository *DeviceRepository  `yaml:"device_repository,omitempty" json:"device_repository,omitempty"`
 	OCPP             *OCPP              `yaml:"ocpp,omitempty" json:"ocpp,omitempty"`
+	Setup            *Setup             `yaml:"setup,omitempty" json:"setup,omitempty"`
+	ForecastPriors   *ForecastPriors    `yaml:"forecast_priors,omitempty" json:"forecast_priors,omitempty"`
 
 	// LoadWarnings collects recoverable problems Parse repaired instead of
 	// refusing the file: an on-disk config an older version accepted must
 	// still boot, or the operator loses the UI they would fix it with. The
 	// write path (Settings save, bootstrap) never populates this — it calls
 	// Validate directly and stays strict. Never serialized.
-	LoadWarnings []string `yaml:"-" json:"-"`
+	LoadWarnings      []string `yaml:"-" json:"-"`
+	LoadpointWarnings []string `yaml:"-" json:"-"`
 	// Retired names settings of removed features that loading dropped so
-	// they cannot steer the site. Startup warns once for each;
-	// DropRetiredSettings deletes them from stored settings.
+	// they cannot steer the site, and stored values that match an old
+	// default. Startup warns once for each; DropRetiredSettings deletes the
+	// removed settings from stored settings and leaves the values alone.
 	Retired []string `yaml:"-" json:"-"`
 	// Used once at startup to end an old calendar's persisted away selection.
 	RetiredCalendarEnabled bool   `yaml:"-" json:"-"`
 	ConfigDatabase         string `yaml:"config_database,omitempty" json:"-"`
 	Revision               int64  `yaml:"-" json:"-"`
 	LANPasswordHash        string `yaml:"-" json:"-"`
+	// Startup write ownership stays in force until restart, including after
+	// saving a different proxy mode or a failed listener start.
+	ModbusProxyWriteOwners map[string]bool `yaml:"-" json:"-"`
 }
 
 // OCPP configures the built-in OCPP 1.6J and 2.0.1 Central System. Chargers connect to
@@ -243,10 +251,10 @@ type FleetPing struct {
 	Endpoint string `yaml:"endpoint,omitempty" json:"endpoint,omitempty"`
 }
 
-// DefaultFleetPingEndpoint is the fleet-report door on FTW's relay. The relay
+// DefaultFleetPingEndpoint is the anonymous fleet-report route on FTW Cloud. It
 // adds the report to daily totals and discards the request; a failed ping is
 // forgotten, never retried.
-const DefaultFleetPingEndpoint = "https://relay.ftw.energy/fleet"
+const DefaultFleetPingEndpoint = "https://cloud.ftw.energy/v1/fleet"
 
 // On reports whether the ping is switched on, and is the only place that
 // answers it.
@@ -270,7 +278,7 @@ func (f *FleetPing) On() bool {
 // this address after FTW moved the collector, and the aggregate would
 // quietly lose every box that had ever saved its settings.
 func (f *FleetPing) Resolved() string {
-	if f == nil || f.Endpoint == "" {
+	if f == nil || f.Endpoint == "" || strings.TrimSpace(f.Endpoint) == "https://relay.ftw.energy/fleet" {
 		return DefaultFleetPingEndpoint
 	}
 	return f.Endpoint
@@ -446,7 +454,9 @@ type Loadpoint struct {
 
 	// PhaseMode selects how the controller picks between 1Φ and 3Φ
 	// delivery: "3p" (default) | "1p" | "auto". Empty == "3p" for
-	// backward compat with pre-switching configs. See loadpoint.Config.
+	// backward compat with pre-switching configs. "auto" charges on three
+	// phases and uses one only for surplus charging below the 3Φ minimum.
+	// See loadpoint.Config.
 	PhaseMode     string  `yaml:"phase_mode,omitempty" json:"phase_mode,omitempty"`
 	PhaseSplitW   float64 `yaml:"phase_split_w,omitempty" json:"phase_split_w,omitempty"`
 	MinPhaseHoldS int     `yaml:"min_phase_hold_s,omitempty" json:"min_phase_hold_s,omitempty"`
@@ -764,7 +774,7 @@ const (
 	PlannerEngineEnergyplan = "energyplan"
 )
 
-// EngineName resolves an explicit engine. The launcher applies beta defaults
+// EngineName resolves an explicit engine. The launcher applies release defaults
 // before calling this method; an unset value here keeps Core for other callers.
 func (p *Planner) EngineName() string {
 	if p == nil {
@@ -791,6 +801,11 @@ type Site struct {
 	Gain                 float64 `yaml:"gain" json:"gain"`
 	SlewRateW            float64 `yaml:"slew_rate_w" json:"slew_rate_w"`
 	MinDispatchIntervalS int     `yaml:"min_dispatch_interval_s" json:"min_dispatch_interval_s"`
+
+	// TimeZone is the household's IANA zone: the clock car goals, the import
+	// hour, daily history and savings read. Empty keeps the host's zone.
+	// Core reads it once at start (localzone.Use).
+	TimeZone string `yaml:"time_zone,omitempty" json:"time_zone,omitempty"`
 
 	// SlewEnabled gates the external per-cycle ramp limiter. Both
 	// supported inverter families (Ferroamp, Sungrow) have their own
@@ -860,11 +875,16 @@ type Site struct {
 	MaxExportW float64 `yaml:"max_export_w,omitempty" json:"max_export_w,omitempty"`
 }
 
-// DefaultFuseSafetyMarginA is the fall-back per-phase amp headroom
-// applied when fuse.safety_margin_a is unset (nil) in the YAML.
-// Single source of truth — main.go routes through Fuse.Effective-
-// SafetyMarginA() rather than re-declaring it.
-const DefaultFuseSafetyMarginA = 0.5
+// DefaultFuseSafetyMarginA is the per-phase margin applied when
+// fuse.safety_margin_a is unset (nil). Core works to the fuse rating by
+// default; a margin is opt-in. Single source of truth: main.go routes
+// through Fuse.EffectiveSafetyMarginA() rather than re-declaring it.
+const DefaultFuseSafetyMarginA = 0.0
+
+// oldDefaultFuseSafetyMarginA was the default until FTW worked to the fuse
+// rating. A stored value equal to it may be the settings form's old prefill
+// rather than a choice, so loading names it once and keeps it.
+const oldDefaultFuseSafetyMarginA = 0.5
 
 // Fuse describes the shared breaker limit used by the fuse guard.
 type Fuse struct {
@@ -872,15 +892,11 @@ type Fuse struct {
 	Phases  int     `yaml:"phases" json:"phases"`
 	Voltage float64 `yaml:"voltage" json:"voltage"`
 
-	// SafetyMarginA reserves headroom (per-phase amps) below MaxAmps
-	// inside the dispatch fuse guard. Pointer so we can distinguish
-	// "unset" (nil → DefaultFuseSafetyMarginA) from "explicitly
-	// disabled" (non-nil 0.0). Inverters often have their own per-
-	// phase current protection that trips before the breaker; without
-	// a margin the dispatch can ride right up to MaxAmps and the
-	// inverter cuts to 0 W in one tick, then dispatch ramps back up —
-	// visible as a flap. 0.5 A × 230 V × 3 phases ≈ 345 W of aggregate
-	// headroom.
+	// SafetyMarginA is an opt-in per-phase margin below MaxAmps: each
+	// phase's working limit is MaxAmps − SafetyMarginA. Pointer so an
+	// explicit value, 0 included, always wins over the default (nil →
+	// DefaultFuseSafetyMarginA, which is 0). Set it for an inverter whose
+	// own per-phase limiter trips at the rating and cuts to 0 W.
 	SafetyMarginA *float64 `yaml:"safety_margin_a,omitempty" json:"safety_margin_a,omitempty"`
 }
 
@@ -889,10 +905,9 @@ func (f Fuse) MaxPowerW() float64 {
 	return f.MaxAmps * f.Voltage * float64(f.Phases)
 }
 
-// EffectiveSafetyMarginA returns the per-phase amp headroom to apply,
-// resolving nil ("unset → use default") vs an explicit value (including
-// 0.0 to disable the margin entirely). Single read site so the default
-// can never drift across consumers.
+// EffectiveSafetyMarginA returns the per-phase margin to apply: the
+// explicit value when set, otherwise DefaultFuseSafetyMarginA. Single read
+// site so the default can never drift across consumers.
 func (f Fuse) EffectiveSafetyMarginA() float64 {
 	if f.SafetyMarginA == nil {
 		return DefaultFuseSafetyMarginA
@@ -900,10 +915,26 @@ func (f Fuse) EffectiveSafetyMarginA() float64 {
 	return *f.SafetyMarginA
 }
 
+// noteOldFuseMargin adds one notice when fuse.safety_margin_a holds FTW's
+// old default. The value stays: from April to September 2026 the settings
+// form saved its 0.5 A prefill on any save, but a value saved later is the
+// user's choice, and the stored document cannot tell the two apart.
+func (c *Config) noteOldFuseMargin() {
+	if m := c.Fuse.SafetyMarginA; m != nil && *m == oldDefaultFuseSafetyMarginA {
+		c.Retired = append(c.Retired,
+			"fuse.safety_margin_a is 0.5 A, FTW's old default. FTW now works to the fuse rating. Set 0 to use it.")
+	}
+}
+
 // Driver is one driver entry. Each driver is a Lua script loaded by
 // the driver host at startup (or on hot-reload via the file watcher).
 type Driver struct {
-	Name              string  `yaml:"name" json:"name"`
+	Name string `yaml:"name" json:"name"`
+	// CredentialOwner is a stable id for rotated OAuth secrets. It is not a
+	// household setting: Core mints it on first save and the UI posts it
+	// back unchanged. Secrets are stored as driver_secret:<owner>:<key> so
+	// a rename keeps the rotation and a reused name cannot inherit it.
+	CredentialOwner   string  `yaml:"credential_owner,omitempty" json:"credential_owner,omitempty"`
 	Lua               string  `yaml:"lua,omitempty" json:"lua,omitempty"` // path to .lua file
 	IsSiteMeter       bool    `yaml:"is_site_meter,omitempty" json:"is_site_meter,omitempty"`
 	BatteryCapacityWh float64 `yaml:"battery_capacity_wh,omitempty" json:"battery_capacity_wh,omitempty"`
@@ -1119,6 +1150,11 @@ type Price struct {
 	GridTariffOreKwh float64 `yaml:"grid_tariff_ore_kwh,omitempty" json:"grid_tariff_ore_kwh,omitempty"`
 	VATPercent       float64 `yaml:"vat_percent,omitempty" json:"vat_percent,omitempty"`
 	APIKey           string  `yaml:"api_key,omitempty" json:"api_key,omitempty"`
+	// BaseURL is for tests and development only. It points the
+	// elprisetjustnu provider at another server with the same API and
+	// turns off the Nord Pool fallback, so the site rig can pin prices.
+	// Only the elprisetjustnu provider reads it; other providers ignore it.
+	BaseURL string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
 
 	// Currency is the ISO code for pricing (default "SEK"). ENTSOE
 	// returns EUR/MWh; we convert using ECB daily FX rates.
@@ -1347,6 +1383,7 @@ func (c Config) MaskSecrets() Config {
 // wherever the incoming value is empty (the UI sends "" for masked fields).
 // Call this before saving a config received from the API.
 func (incoming *Config) PreserveMaskedSecrets(existing *Config) {
+	incoming.ModbusProxyWriteOwners = existing.ModbusProxyWriteOwners
 	incoming.ConfigDatabase = existing.ConfigDatabase
 	incoming.Revision = existing.Revision
 	incoming.LANPasswordHash = existing.LANPasswordHash
@@ -1477,6 +1514,7 @@ func Parse(data []byte, baseDir string) (*Config, error) {
 	var retiredControl retiredControlSettings
 	_ = doc.Decode(&retiredControl)
 	c.applyRetiredControl(retiredControl)
+	c.noteOldFuseMargin()
 	// An omitted app_link section follows the new default. An explicit YAML
 	// null was a valid opt-out before that default changed, so retain it as an
 	// explicit disabled section instead of letting applyDefaults turn it on.
@@ -1669,6 +1707,23 @@ func relToBaseDir(baseDir, p string) string {
 	return rel
 }
 
+// FillUnsetTimings treats a zero control interval or watchdog timeout as
+// unset. Neither has a meaning at zero: a 0 s interval panics the boot ticker
+// and a 0 s watchdog marks every driver stale. Every decoded settings
+// document runs this, not only YAML, so a partial save cannot store a zero
+// that the next boot cannot start from.
+func (s *Site) FillUnsetTimings() {
+	if s.ControlIntervalS == 0 {
+		// 2 s matches Ferroamp's ehub MQTT cadence (~1 Hz) without
+		// dispatching twice on the same telemetry sample, and halves
+		// the perceived response lag operators saw at the original 5 s.
+		s.ControlIntervalS = 2
+	}
+	if s.WatchdogTimeoutS == 0 {
+		s.WatchdogTimeoutS = 60
+	}
+}
+
 // applyDefaults fills in sensible zero-value defaults.
 func applyDefaults(c *Config) {
 	if c.DeviceRepository == nil {
@@ -1709,17 +1764,9 @@ func applyDefaults(c *Config) {
 	}
 	// Endpoint is deliberately left blank: Resolved() supplies the default at
 	// use, so the collector's address is never written into a household's YAML.
-	if c.Site.ControlIntervalS == 0 {
-		// 2 s matches Ferroamp's ehub MQTT cadence (~1 Hz) without
-		// dispatching twice on the same telemetry sample, and halves
-		// the perceived response lag operators saw at the original 5 s.
-		c.Site.ControlIntervalS = 2
-	}
+	c.Site.FillUnsetTimings()
 	if c.Site.GridToleranceW == 0 {
 		c.Site.GridToleranceW = 42 // The Answer
-	}
-	if c.Site.WatchdogTimeoutS == 0 {
-		c.Site.WatchdogTimeoutS = 60
 	}
 	if c.Site.SmoothingAlpha == 0 {
 		c.Site.SmoothingAlpha = 0.3
@@ -1906,6 +1953,13 @@ func isLegacyDefaultDriverRepository(repo DriverRepositorySource) bool {
 // Validate ensures the config is internally consistent and safe to run with.
 func (c *Config) Validate() error {
 	c.NormalizeUnits()
+	c.dropZeroBatteryCeilings()
+	if err := c.validateSetup(); err != nil {
+		return err
+	}
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	if c.State != nil && c.State.ColdRetentionDays < 0 {
 		return fmt.Errorf("state.cold_retention_days must be >= 0, got %d", c.State.ColdRetentionDays)
 	}
@@ -1930,6 +1984,11 @@ func (c *Config) Validate() error {
 	if err := c.Price.Validate(); err != nil {
 		return err
 	}
+	if c.Site.TimeZone != "" {
+		if _, err := localzone.Load(c.Site.TimeZone); err != nil {
+			return fmt.Errorf("site.time_zone: %w", err)
+		}
+	}
 
 	// Empty drivers list is a valid shape — e.g. an EV-only site that
 	// configured a cloud EV charger in the setup wizard and doesn't
@@ -1939,6 +1998,7 @@ func (c *Config) Validate() error {
 	// exists.
 	siteMeters := 0
 	names := make(map[string]bool, len(c.Drivers))
+	owners := make(map[string]string, len(c.Drivers))
 	for _, d := range c.Drivers {
 		if d.Name == "" {
 			return errors.New("driver: name is required")
@@ -1947,6 +2007,15 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("driver %q: duplicate name", d.Name)
 		}
 		names[d.Name] = true
+		if owner := strings.TrimSpace(d.CredentialOwner); owner != "" {
+			if strings.Contains(owner, ":") {
+				return fmt.Errorf("driver %q: credential_owner must not contain ':'", d.Name)
+			}
+			if other, ok := owners[owner]; ok {
+				return fmt.Errorf("drivers %q and %q share credential_owner", other, d.Name)
+			}
+			owners[owner] = d.Name
+		}
 
 		if d.IsSiteMeter {
 			siteMeters++
@@ -2011,7 +2080,7 @@ func (c *Config) Validate() error {
 	if c.Site.MinDispatchIntervalS < 0 {
 		return errors.New("site.min_dispatch_interval_s must be >= 0")
 	}
-	if c.Fuse.MaxAmps <= 0 {
+	if c.Fuse.MaxAmps < 0 || c.Fuse.MaxAmps == 0 && !c.MeasurementOnly() {
 		return errors.New("fuse.max_amps must be > 0")
 	}
 	if c.Fuse.Phases <= 0 {
@@ -2030,7 +2099,7 @@ func (c *Config) Validate() error {
 	}
 	// safety_margin_a must be in [0, max_amps) when explicitly set.
 	// Negative would *raise* the per-phase threshold above the breaker
-	// rating (defeating the guard); >= max_amps zeroes the headroom
+	// rating (defeating the guard); >= max_amps leaves no working limit
 	// and silently disables the per-phase clamp — both are real safety
 	// holes if reached through a typo'd config. nil (unset) is OK and
 	// resolves to DefaultFuseSafetyMarginA at the consumer.
@@ -2287,6 +2356,9 @@ func SaveAtomic(path string, c *Config) error {
 }
 
 func saveAtomic(w durableWriter, path string, c *Config) error {
+	if err := c.normalizeLoadpointSteps(); err != nil {
+		return err
+	}
 	// Driver paths are resolved to absolute-ish paths at Load() time.
 	// Convert them back to config-relative before writing so that
 	// repeated save cycles don't accumulate extra "../" prefixes.

@@ -14,42 +14,52 @@
  */
 
 :root {
-  /* ----- Terminal Native surface roles: dark (default). ----- */
-  --ink:          #0d0d0d;
-  --ink-sunken:   #101010;
-  --ink-raised:   #161616;
-  --ink-elevated: #1e1e1e;
-  --line:         #2a2a2a;
-  --line-soft:    #222222;
-  --fg:           #e8e8e8;
-  --fg-dim:       #a0a0a0;
-  --fg-muted:     #858585;
-  --fg-label:     #d8d8d8;
-  --on-accent:    #0a0a0a;
+  /* ----- Surface roles, from the iOS app's palette: dark (default). ----- */
+  --ink:          #05080f;
+  --ink-sunken:   #03060c;
+  --ink-raised:   #0b111c;
+  --ink-elevated: #111a29;
+  --line:         #1b2433;
+  --line-soft:    #141c29;
+  --fg:           #eef3ff;
+  --fg-dim:       #9aa5b8;
+  --fg-muted:     #727d90;
+  --fg-label:     #c4ccda;
+  --on-accent:    var(--ink);
 
-  --amber:    oklch(0.82 0.18 75);
-  --amber-d:  oklch(0.65 0.14 75);
-  --red-e:    oklch(0.72 0.18 20);
-  --green-e:  oklch(0.78 0.16 150);
-  --cyan:     oklch(0.82 0.14 210);
-  --cyan-dim: oklch(0.65 0.10 210);
-  --violet:   oklch(0.80 0.14 300);
+  /* Colour is energy. Each kind has one hue, the battery two: --cyan
+     stores and --energy-gives gives. The grid is one hue both ways; the
+     sign and the word say buying or selling. */
+  --amber:    #ffe14d;
+  --amber-d:  #ffe14d;
+  --red-e:    #ff5fa8;
+  --green-e:  #ff5fa8;
+  --cyan:     #18d9ff;
+  --cyan-dim: #0f9db9;
+  --violet:   #b69cff;
+  --energy-gives: #ffb000;
   --white-s:  var(--fg);
 
-  --accent-hue: 65;
-  --accent-e: oklch(0.82 0.16 var(--accent-hue));
+  /* States, never levels: live or confirmed, and refused, failed or
+     blocked. A warning that needs action takes --alarm. */
+  --live:  #83f52c;
+  --alarm: #ff453a;
+
+  /* The interface is ink: no orange accent. */
+  --accent-e: var(--fg);
 
   /* Compatibility bridge for legacy light-DOM CSS and /setup. New work
      uses the canonical roles above; these aliases keep older surfaces in
-     the same theme without duplicating palette values. */
+     the same theme without duplicating palette values. --green and --red
+     are states; energy uses the -e names. */
   --bg:       var(--ink);
   --surface:  var(--ink-raised);
   --surface2: var(--ink-sunken);
   --border:   var(--line);
   --text:     var(--fg);
   --text-dim: var(--fg-dim);
-  --green:    var(--green-e);
-  --red:      var(--red-e);
+  --green:    var(--live);
+  --red:      var(--alarm);
   --yellow:   var(--amber);
   --blue:     var(--cyan);
   --accent:   var(--accent-e);
@@ -57,22 +67,19 @@
 
   /* Hero-specific surfaces. Extracted as tokens so the flow hero adapts
      cleanly to the light theme without duplicating the SVG render path. */
-  --hero-bg-top: #1a1a1a;
-  --hero-bg-bot: #111111;
-  --hero-glow-a: oklch(0.4 0.15 var(--accent-hue) / 0.08);
-  --hero-line-base: #2a2a2a;
-  --hero-box-fill: rgb(22 22 22 / 95%);
-  --hero-box-border: #303030;
-  --hero-house-fill: #1c1c1c;
-  --hero-house-stroke: oklch(0.7 0.14 var(--accent-hue));
-  --hero-house-ring:   oklch(0.55 0.1 var(--accent-hue));
-  --hero-load-text:    oklch(0.9 0.08 var(--accent-hue));
-  /* Labels / subs inside the energy-flow bubbles — pulled up to match
-     the brighter --fg-label token used by card-labels so the bubble
-     text isn't noticeably dimmer than every other label on the page. */
-  --hero-label-text:   #d8d8d8;
-  --hero-sub-text:     #b8b8b8;
-  --hero-soc-track:    #2a2a2a;
+  --hero-bg-top: var(--ink-raised);
+  --hero-bg-bot: var(--ink);
+  --hero-glow-a: transparent;
+  --hero-line-base: var(--line);
+  --hero-box-fill: rgb(11 17 28 / 95%);
+  --hero-box-border: var(--line);
+  --hero-house-fill: var(--ink-raised);
+  --hero-house-stroke: var(--fg);
+  --hero-house-ring:   var(--fg-muted);
+  --hero-load-text:    var(--fg);
+  --hero-label-text:   var(--fg-label);
+  --hero-sub-text:     var(--fg-dim);
+  --hero-soc-track:    var(--line-soft);
 
   /* No external font CDN — all fallbacks are either shipped with the
      OS (system-ui, Segoe UI, Roboto, Helvetica Neue) or resolved by
@@ -94,43 +101,30 @@
   --card-pad-tight: 12px 14px;
 }
 
-/* ----- Light application theme. Compatibility aliases above follow these
-        canonical overrides automatically. ----- */
+/* ----- Light application theme. Compatibility aliases and hero tokens
+        above follow these canonical overrides automatically. ----- */
 html[data-theme="light"] {
-  --ink:          #f4f4f2;
-  --ink-sunken:   #ecece8;
-  --ink-raised:   #fafaf8;
+  --ink:          #f5f6f8;
+  --ink-sunken:   #eceef2;
+  --ink-raised:   #ffffff;
   --ink-elevated: #ffffff;
-  --line:         #cecec7;
-  --line-soft:    #ddddd7;
-  --fg:           #191919;
-  --fg-dim:       #4f4f4b;
-  --fg-muted:     #686862;
-  --fg-label:     #4f4f4b;
+  --line:         #dce0e7;
+  --line-soft:    #e7eaf0;
+  --fg:           #0a0f1a;
+  --fg-dim:       #545e70;
+  --fg-muted:     #677184;
+  --fg-label:     #2e3646;
 
-  /* Functional colours pulled ~15% darker so they keep contrast on paper
-     without turning neon. Accent hue still drives --accent-e. */
-  --amber:    oklch(0.68 0.17 75);
-  --amber-d:  oklch(0.55 0.14 75);
-  --red-e:    oklch(0.55 0.20 20);
-  --green-e:  oklch(0.58 0.18 150);
-  --cyan:     oklch(0.58 0.14 210);
-  --cyan-dim: oklch(0.48 0.10 210);
-  --violet:   oklch(0.55 0.14 300);
-  --accent-e: oklch(0.68 0.16 var(--accent-hue));
+  --amber:    #8a6c00;
+  --amber-d:  #8a6c00;
+  --red-e:    #c2186f;
+  --green-e:  #c2186f;
+  --cyan:     #00739a;
+  --cyan-dim: #3d8fae;
+  --violet:   #6a48d8;
+  --energy-gives: #a35700;
+  --live:  #2f7a00;
+  --alarm: #d70015;
 
-  /* Hero: neutral paper surfaces with semantic energy colors intact. */
-  --hero-bg-top:  #fafaf8;
-  --hero-bg-bot:  #ecece8;
-  --hero-glow-a:  oklch(0.72 0.14 var(--accent-hue) / 0.10);
-  --hero-line-base:    #cecec7;
-  --hero-box-fill:     rgb(255 255 255 / 96%);
-  --hero-box-border:   #cecec7;
-  --hero-house-fill:   #fafaf8;
-  --hero-house-stroke: oklch(0.55 0.14 var(--accent-hue));
-  --hero-house-ring:   oklch(0.72 0.10 var(--accent-hue));
-  --hero-load-text:    oklch(0.40 0.18 var(--accent-hue));
-  --hero-label-text:   #4f4f4b;
-  --hero-sub-text:     #686862;
-  --hero-soc-track:    #ddddd7;
+  --hero-box-fill: rgb(255 255 255 / 96%);
 }

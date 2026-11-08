@@ -55,6 +55,12 @@ type Config struct {
 	// UI so an operator can adopt it, withheld from telemetry so it cannot
 	// influence dispatch. Empty means every charger is pending.
 	ApprovedIDs []string `yaml:"-"`
+
+	// ManagedIDs is the part of ApprovedIDs a loadpoint names: the chargers
+	// FTW orders. Each starts at 0 A on boot (see boot_limit.go). Derived by
+	// the caller, never read from YAML, and empty while Core blocks every
+	// charger write (setup measurement mode).
+	ManagedIDs []string `yaml:"-"`
 }
 
 // TLSConfig points at the certificate this server presents, and optionally at
@@ -94,11 +100,10 @@ func (t *TLSConfig) serverTLS() (*tls.Config, error) {
 	if !t.Enabled() {
 		return nil, errors.New("ocpp: tls needs both cert_file and key_file")
 	}
-	if _, err := os.Stat(t.CertFile); err != nil {
-		return nil, fmt.Errorf("ocpp: tls cert_file: %w", err)
-	}
-	if _, err := os.Stat(t.KeyFile); err != nil {
-		return nil, fmt.Errorf("ocpp: tls key_file: %w", err)
+	// ServeTLS loads the pair again inside the listener goroutine, where a
+	// failure stops the listener with no error anyone sees.
+	if _, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile); err != nil {
+		return nil, fmt.Errorf("ocpp: tls cert_file and key_file: %w", err)
 	}
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if t.ClientCAFile == "" {
@@ -128,8 +133,11 @@ func (c *Config) Defaults() {
 	if c.Path == "" {
 		c.Path = "/"
 	}
+	// Half the 60 s watchdog and history age limit: an idle charger often
+	// sends nothing else, so one late heartbeat would otherwise mark it
+	// offline and its Available 0 W stale.
 	if c.HeartbeatIntervalS == 0 {
-		c.HeartbeatIntervalS = 60
+		c.HeartbeatIntervalS = 30
 	}
 }
 

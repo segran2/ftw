@@ -16,10 +16,13 @@ import (
 	"github.com/srcfl/ftw/go/internal/events"
 	"github.com/srcfl/ftw/go/internal/loadpoint"
 	"github.com/srcfl/ftw/go/internal/ocpp"
+	"github.com/srcfl/ftw/go/internal/ocpp/chargersocket"
 	"github.com/srcfl/ftw/go/internal/telemetry"
 )
 
-func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
+// A reconnect is not an unplug. The same charger keeps its Start; another
+// serial on the same charge point name pauses it and asks for Start.
+func TestOCPPReconnectIsNotAnUnplug(t *testing.T) {
 	for _, power := range []float64{0, 4140} {
 		for _, skipUnknown := range []bool{false, true} {
 			t.Run(fmt.Sprintf("power=%v/fast=%v", power, skipUnknown), func(t *testing.T) {
@@ -56,7 +59,7 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 				})
 				connect := func() ocpp16.ChargePoint {
 					t.Helper()
-					cp := ocpp16.NewChargePoint("garage", nil, nil)
+					cp := chargersocket.ChargePoint16("garage", nil)
 					if e := cp.Start("ws://" + addr); e != nil {
 						t.Fatal(e)
 					}
@@ -92,16 +95,21 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 				bus.Subscribe(events.KindChargingConnected, func(events.Event) { connectedEvents++ })
 				bus.Publish(events.HealthTick{Health: map[string]telemetry.DriverHealth{"garage": {Status: telemetry.StatusOk, LastSuccess: &now}}, Now: now})
 				commands := []float64{}
+				sendCount := 0
 				ctrl := loadpoint.NewController(manager, func(time.Time) (loadpoint.Directive, bool) { return loadpoint.Directive{}, false }, func(name string) (loadpoint.EVSample, bool) {
 					return currentEVSample(tel.Get(name, telemetry.DerEV), tel.DriverHealth(name), time.Minute, time.Now(), srv.Handler().IsOnline(name), currentOCPPDeviceID(srv.Handler(), name))
 				}, func(_ context.Context, _ string, p []byte) error {
 					var d struct {
-						Power float64 `json:"power_w"`
+						Power  float64 `json:"power_w"`
+						Action string  `json:"action"`
 					}
 					if e := json.Unmarshal(p, &d); e != nil {
 						return e
 					}
-					commands = append(commands, d.Power)
+					sendCount++
+					if d.Action == "ev_set_current" {
+						commands = append(commands, d.Power)
+					}
 					return nil
 				})
 				ctrl.SetSiteFuse(loadpoint.SiteFuse{MaxAmps: 16, Voltage: 230, PhaseCnt: 3})
@@ -111,7 +119,7 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 				ctrl.SetManualHold("garage", loadpoint.ManualHold{Persistent: true, PowerW: power})
 				tick()
 				before, _ := manager.State("garage")
-				commandCount := len(commands)
+				commandCount := sendCount
 				cp.Stop()
 				await(func() bool {
 					r := tel.Get("garage", telemetry.DerEV)
@@ -125,10 +133,10 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 					tick()
 					st, _ := manager.State("garage")
 					hold, ok := ctrl.GetManualHold("garage", now)
-					if !ok || hold.PowerW != 0 || !st.PluggedIn || st.ManualRestoreUnconfirmed != (power > 0) {
-						t.Fatalf("unknown socket lost safety: hold=%+v state=%+v", hold, st)
+					if !ok || hold.PowerW != power || !st.PluggedIn || st.ManualRestoreUnconfirmed {
+						t.Fatalf("the outage changed the hold: hold=%+v state=%+v", hold, st)
 					}
-					if len(commands) != commandCount {
+					if sendCount != commandCount {
 						t.Fatal("unknown cable dispatched a command")
 					}
 					if st.UpdatedAtMs != before.UpdatedAtMs {
@@ -165,12 +173,16 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 				}
 				status(cp, true)
 				tick()
-				hold, ok := ctrl.GetManualHold("garage", now)
-				if !ok || hold.PowerW != 0 || commands[len(commands)-1] != 0 {
-					t.Fatalf("status revived an old Start: %+v %v", hold, commands)
+				want, unconfirmed := power, false
+				if serial != "A" {
+					want, unconfirmed = 0, power > 0
 				}
-				if st, _ := manager.State("garage"); st.ManualRestoreUnconfirmed != (power > 0) {
-					t.Fatal("status changed required confirmation")
+				hold, ok := ctrl.GetManualHold("garage", now)
+				if !ok || hold.PowerW != want || commands[len(commands)-1] != want {
+					t.Fatalf("serial %s after reconnect: hold=%+v commands=%v, want %v W", serial, hold, commands, want)
+				}
+				if st, _ := manager.State("garage"); st.ManualRestoreUnconfirmed != unconfirmed {
+					t.Fatalf("serial %s after reconnect: unconfirmed=%v, want %v", serial, st.ManualRestoreUnconfirmed, unconfirmed)
 				}
 				if connectedEvents != 0 {
 					t.Fatalf("socket reconnect invented %d plug notifications", connectedEvents)
@@ -181,6 +193,9 @@ func TestOCPPReconnectDoesNotUnplugOrResumeOldStart(t *testing.T) {
 					t.Fatal("fresh explicit Start did not work")
 				}
 				status(cp, false)
+				tick()
+				// The cable stays out for UnplugGrace.
+				now = now.Add(loadpoint.UnplugGrace)
 				tick()
 				if _, ok := ctrl.GetManualHold("garage", now); ok {
 					t.Fatal("physical unplug did not clear hold")

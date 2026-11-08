@@ -60,6 +60,11 @@ import (
 // per-driver staleness window. Tesla's 5-minute BLE proxy fits; a year does not.
 const maxDriverWatchdogTimeout = 15 * time.Minute
 
+// driverInitTimeout bounds driver_init. An init that runs past it fails like
+// any other init error, so a looping or hung init cannot block boot, a reload
+// or a settings save.
+var driverInitTimeout = 30 * time.Second
+
 // LuaDriver wraps a running Lua VM bound to a HostEnv.
 type LuaDriver struct {
 	Env  *HostEnv
@@ -167,21 +172,26 @@ func driverDeclaresReadOnly(L *lua.LState) bool {
 }
 
 func driverDeclaresReadOnlyBattery(L *lua.LState) bool {
-	if !driverDeclaresReadOnly(L) {
+	return driverDeclaresReadOnly(L) && driverDeclaresCapability(L, "battery")
+}
+
+// driverDeclaresCapability reports whether the DRIVER table lists capability.
+func driverDeclaresCapability(L *lua.LState, capability string) bool {
+	meta, ok := L.GetGlobal("DRIVER").(*lua.LTable)
+	if !ok {
 		return false
 	}
-	meta := L.GetGlobal("DRIVER").(*lua.LTable)
 	caps, ok := meta.RawGetString("capabilities").(*lua.LTable)
 	if !ok {
 		return false
 	}
-	hasBattery := false
+	found := false
 	caps.ForEach(func(_, value lua.LValue) {
-		if strings.EqualFold(value.String(), "battery") {
-			hasBattery = true
+		if strings.EqualFold(value.String(), capability) {
+			found = true
 		}
 	})
-	return hasBattery
+	return found
 }
 
 // Init calls driver_init(config) if defined. config is the optional
@@ -208,7 +218,7 @@ func (d *LuaDriver) callInitLocked(ctx context.Context) error {
 	if d.initConfig != nil {
 		arg = goToLua(d.L, d.initConfig)
 	}
-	cleanup := d.setLifecycleContext(ctx)
+	cleanup := d.setLuaCallContext(ctx, driverInitTimeout)
 	defer cleanup()
 	return d.L.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}, arg)
 }
@@ -281,7 +291,7 @@ func (d *LuaDriver) pollLocked(ctx context.Context) (time.Duration, error) {
 	}
 	// Driver may return an int number of milliseconds.
 	if n, ok := ret.(lua.LNumber); ok && n > 0 {
-		return time.Duration(n) * time.Millisecond, nil
+		return returnedPollInterval(float64(n)), nil
 	}
 	return 0, nil
 }
@@ -524,7 +534,7 @@ func newLuaHTTPTransport(allowUnverifiedLocal bool, proxy func(*net_http.Request
 	}
 	transport.Proxy = proxyExceptLocal(proxy)
 	mdnsDialer := mdnsresolve.Dialer{AllowUnverifiedLocal: allowUnverifiedLocal}
-	transport.DialContext = mdnsDialer.DialContext
+	transport.DialContext = guardDial(mdnsDialer.DialContext)
 	return transport
 }
 
@@ -641,6 +651,48 @@ func registerHost(L *lua.LState, env *HostEnv) {
 	host.RawSetString("millis", L.NewFunction(func(L *lua.LState) int {
 		L.Push(lua.LNumber(env.millis()))
 		return 1
+	}))
+
+	// Wall-clock time is separate from millis/now_ms, which measure uptime.
+	host.RawSetString("unix_ms", L.NewFunction(func(L *lua.LState) int {
+		L.Push(lua.LNumber(time.Now().UnixMilli()))
+		return 1
+	}))
+	// The site's coordinates, for a vehicle driver only: it measures its
+	// car's distance from the site and emits site_distance_m. Other drivers
+	// talk to vendor clouds that have no use for where the home is. What
+	// makes a driver a vehicle driver is its signed catalog entry: a Lua
+	// file's own DRIVER table could claim anything, so a bundled or local
+	// file gets nil.
+	host.RawSetString("site_location", L.NewFunction(func(L *lua.LState) int {
+		if env.SiteLocation == nil || !env.RuntimePolicy.Lists("vehicle") {
+			L.Push(lua.LNil)
+			return 1
+		}
+		lat, lon, ok := env.SiteLocation()
+		if !ok {
+			L.Push(lua.LNil)
+			return 1
+		}
+		L.Push(lua.LNumber(lat))
+		L.Push(lua.LNumber(lon))
+		return 2
+	}))
+	host.RawSetString("reserve_vehicle_wake", L.NewFunction(func(L *lua.LState) int {
+		allowed, retry, err := false, 30*time.Minute, ErrNoCapability
+		if !env.ProbeReadOnly && !driverDeclaresReadOnly(L) &&
+			(env.RuntimePolicy == nil || !env.RuntimePolicy.ReadOnly) && env.ReserveVehicleWake != nil {
+			makeName, serial := env.Identity()
+			allowed, retry, err = env.ReserveVehicleWake(makeName, serial)
+		}
+		L.Push(lua.LBool(allowed && err == nil))
+		L.Push(lua.LNumber(retry.Milliseconds()))
+		if err != nil {
+			L.Push(lua.LString("vehicle wake reservation failed"))
+		} else {
+			L.Push(lua.LNil)
+		}
+		return 3
 	}))
 
 	// host.sleep(ms) — block the driver goroutine for ms milliseconds.
@@ -1438,7 +1490,7 @@ func registerHost(L *lua.LState, env *HostEnv) {
 				}
 			})
 		}
-		if err := env.WS.Open(url, headers); err != nil {
+		if err := env.WS.Open(luaCallContext(L), url, headers); err != nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString(err.Error()))
 			return 2
@@ -1448,6 +1500,11 @@ func registerHost(L *lua.LState, env *HostEnv) {
 	}))
 
 	host.RawSetString("ws_send", L.NewFunction(func(L *lua.LState) int {
+		if err := env.allowWrite("websocket.send"); err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
 		if env.WS == nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString("ws: capability not granted"))

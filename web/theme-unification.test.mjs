@@ -13,28 +13,47 @@ const html = read("index.html");
 const setup = read("setup.html");
 
 describe("terminal-native palette", () => {
-  it("defines the approved neutral dark and light roles", () => {
+  it("defines the iOS app's neutral dark and light roles", () => {
     for (const value of [
-      "#0d0d0d",
-      "#101010",
-      "#161616",
-      "#1e1e1e",
-      "#2a2a2a",
-      "#e8e8e8",
-      "#a0a0a0",
-      "#858585",
-      "#f4f4f2",
-      "#ecece8",
-      "#fafaf8",
+      "#05080f",
+      "#03060c",
+      "#0b111c",
+      "#111a29",
+      "#1b2433",
+      "#141c29",
+      "#eef3ff",
+      "#c4ccda",
+      "#9aa5b8",
+      "#727d90",
+      "#f5f6f8",
+      "#eceef2",
       "#ffffff",
-      "#cecec7",
-      "#191919",
-      "#4f4f4b",
-      "#686862",
+      "#dce0e7",
+      "#e7eaf0",
+      "#0a0f1a",
+      "#2e3646",
+      "#545e70",
+      "#677184",
     ]) {
       assert.match(theme, new RegExp(value, "i"), value);
     }
-    assert.match(theme, /--on-accent:\s*#0a0a0a/i);
+    // Primary buttons are ink with ground text, as on the phone.
+    assert.match(theme, /--accent-e:\s*var\(--fg\)/);
+    assert.match(theme, /--on-accent:\s*var\(--ink\)/);
+  });
+
+  it("keeps states apart from energy", () => {
+    // The grid is one hue both ways; live and alarm are states.
+    for (const [name, dark, light] of [
+      ["red-e", "#ff5fa8", "#c2186f"],
+      ["green-e", "#ff5fa8", "#c2186f"],
+      ["energy-gives", "#ffb000", "#a35700"],
+      ["live", "#83f52c", "#2f7a00"],
+      ["alarm", "#ff453a", "#d70015"],
+    ]) {
+      const decls = [...theme.matchAll(new RegExp(`--${name}:\\s*([^;]+);`, "g"))].map((m) => m[1].trim());
+      assert.deepEqual(decls, [dark, light], name);
+    }
   });
 
   it("bridges every legacy role to the canonical palette", () => {
@@ -45,8 +64,8 @@ describe("terminal-native palette", () => {
       border: "line",
       text: "fg",
       "text-dim": "fg-dim",
-      green: "green-e",
-      red: "red-e",
+      green: "live",
+      red: "alarm",
       yellow: "amber",
       blue: "cyan",
       accent: "accent-e",
@@ -94,7 +113,7 @@ describe("terminal-native light DOM chrome", () => {
     );
   });
 
-  it("uses amber instead of blue for selected interface chrome", () => {
+  it("uses the ink accent instead of blue for selected interface chrome", () => {
     assert.match(
       styleCss,
       /\.diag-row\.active\s*\{[^}]*var\(--accent-e\)/,

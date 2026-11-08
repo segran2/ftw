@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,14 +29,17 @@ const (
 	plainHourKeep                 = 5 * 365 * 24 * time.Hour
 )
 
-// Tables copied into a history file that no longer carries raw polls. Import
-// cursors and Parquet summary receipts travel with the hours they produced:
-// without them a restart repeats an import and adds its samples twice.
+// Tables copied into a history file that no longer carries raw polls. Keep
+// imported chart snapshots: live writes use history_dashboard, but older chart
+// readers still need these frozen tiers. Import cursors and Parquet receipts
+// travel with the hours they produced so restart cannot count samples twice.
 var plainHistoryTables = []string{
+	sourceEnergyTable, "history_source_cursor", "history_source_periods",
+	"history_hot", "history_warm", "history_cold",
 	"ts_drivers", "ts_metrics", "ts_latest",
 	"energy_daily", "energy_ledger_meta", "energy_assets", "energy_ledger_entries", "energy_ledger_cursors",
 	"ts_buckets", "ts_aggregate_hours", "ts_series_hour", "ts_archive_days",
-	"history_dashboard", "history_site_energy", "history_site_cursor",
+	"history_load_estimates", "history_load_estimate_pending", "history_dashboard", "history_site_energy", "history_site_cursor", "history_quality", "history_daily_quality", "history_dashboard_partial", "history_site_energy_partial", "history_partial_cursor", "energy_daily_partial",
 	"history_migrations", "history_sqlite_progress",
 }
 
@@ -43,7 +47,7 @@ var plainHistoryTables = []string{
 var replaceHistoryFile = os.Rename
 
 // RetireRawHistory replaces history.db with a copy that omits raw polls and
-// the old hot/warm/cold point log. The previous file stays beside it and is
+// keeps imported chart snapshots. The previous file stays beside it and is
 // not opened again. Ledger rows are counted before the swap.
 func (s *Store) RetireRawHistory(ctx context.Context) error {
 	if s == nil || s.history == nil {
@@ -99,6 +103,9 @@ func (s *Store) RetireRawHistory(ctx context.Context) error {
 		if _, err := dest.ExecContext(ctx, `INSERT INTO `+table+` SELECT * FROM src.`+table); err != nil {
 			return fmt.Errorf("copy %s: %w", table, err)
 		}
+	}
+	if _, err := dest.ExecContext(ctx, `INSERT OR IGNORE INTO history_migrations(name) VALUES(?)`, legacyChartRecovery); err != nil {
+		return err
 	}
 	srcN, srcSum, err := ledgerDigest(ctx, s.history)
 	if err != nil {
@@ -194,6 +201,13 @@ func (s *Store) RetireRawHistory(ctx context.Context) error {
 // goes with them, and so does a sample day whose hourly summary receipt
 // matches the file. Other sample days stay readable until the background
 // rollup summarizes them. Diagnostics files are left in place.
+//
+// An unreadable bucket file never stops boot. It moves aside under
+// unreadableColdSuffix, out of every reader's glob, so reads for that day
+// still work. It stays on disk, and HistoryBackend lists it. The day's legacy
+// copy stays on disk unimported and serves reads. A good copy of the original
+// restored under its normal name imports on the next boot, and the legacy
+// copy then goes without a conflict.
 func (s *Store) AbsorbColdHistory(ctx context.Context, cold string) error {
 	if s == nil || s.history == nil || strings.TrimSpace(cold) == "" {
 		return nil
@@ -207,19 +221,49 @@ func (s *Store) AbsorbColdHistory(ctx context.Context, cold string) error {
 		return err
 	}
 	var imported int
+	unreadable := map[string]bool{}
+	// held lists files kept at their normal name: an unreadable file that
+	// could not move aside, or the legacy copy of an unreadable original.
+	held := map[string]bool{}
+	skip := func(path string, err error) {
+		unreadable[path] = true
+		aside := path + unreadableColdSuffix
+		if _, statErr := os.Lstat(aside); errors.Is(statErr, os.ErrNotExist) {
+			renameErr := os.Rename(path, aside)
+			if renameErr == nil {
+				slog.Warn("history bucket file unreadable; moved aside", "path", aside, "err", err)
+				return
+			}
+			slog.Warn("history bucket file could not move aside", "path", path, "err", renameErr)
+		}
+		slog.Warn("history bucket file unreadable; kept in place", "path", path, "err", err)
+		held[path] = true
+	}
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if strings.Contains(path, ".legacy-buckets.") {
 			original := strings.Replace(path, ".legacy-buckets.parquet", ".buckets.parquet", 1)
-			if _, statErr := os.Stat(original); statErr == nil {
+			if _, statErr := os.Stat(original); statErr == nil && !unreadable[original] {
+				continue
+			}
+			// Importing these hours would conflict with a good copy of the
+			// original restored later, and stop that boot. Keep the file;
+			// it serves reads for the day until then.
+			if _, statErr := os.Lstat(original + unreadableColdSuffix); statErr == nil || unreadable[original] {
+				slog.Warn("history legacy bucket file kept while its original is unreadable", "path", path)
+				held[path] = true
 				continue
 			}
 		}
 		digest, err := historyFileHashContext(ctx, path)
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			skip(path, err)
+			continue
 		}
 		receipt := "plain-archive:" + digest
 		hours := map[string]*namedHour{}
@@ -234,7 +278,11 @@ func (s *Store) AbsorbColdHistory(ctx context.Context, cold string) error {
 			h.sources = append(h.sources, b.BucketSummary)
 			return nil
 		}); err != nil {
-			return fmt.Errorf("read %s: %w", filepath.Base(path), err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			skip(path, err)
+			continue
 		}
 		if err := s.writeHourBuckets(ctx, hours, receipt); err != nil {
 			return err
@@ -245,6 +293,27 @@ func (s *Store) AbsorbColdHistory(ctx context.Context, cold string) error {
 	if err != nil {
 		return err
 	}
+	sampleDays := len(keep)
+	// Earlier boots moved unreadable files aside; list them on every boot.
+	aside, err := filepath.Glob(filepath.Join(cold, "[0-9][0-9][0-9][0-9]", "[0-9][0-9]", "[0-9][0-9].*"+unreadableColdSuffix))
+	if err != nil {
+		return err
+	}
+	var kept []string
+	for _, path := range aside {
+		keep[path] = true
+		kept = append(kept, coldRel(path))
+	}
+	for path := range held {
+		keep[path] = true
+		if unreadable[path] {
+			kept = append(kept, coldRel(path))
+		}
+	}
+	slices.Sort(kept)
+	s.maintenanceStatusMu.Lock()
+	s.coldUnreadable = kept
+	s.maintenanceStatusMu.Unlock()
 	if err := removeColdHistory(cold, keep); err != nil {
 		return err
 	}
@@ -252,11 +321,20 @@ func (s *Store) AbsorbColdHistory(ctx context.Context, cold string) error {
 	if err != nil {
 		return err
 	}
-	if len(keep) > 0 {
-		slog.Warn("history sample days kept until they have hourly summaries", "days", len(keep))
+	if sampleDays > 0 {
+		slog.Warn("history sample days kept until they have hourly summaries", "days", sampleDays)
 	}
 	slog.Info("history cold files absorbed", "days", imported, "retired_files", removed)
 	return nil
+}
+
+// unreadableColdSuffix marks a bucket file that failed to read. The name no
+// longer ends in .parquet, so no reader, importer or converter opens it.
+const unreadableColdSuffix = ".unreadable"
+
+// coldRel names a cold file as YYYY/MM/<file>.
+func coldRel(path string) string {
+	return filepath.Base(filepath.Dir(filepath.Dir(path))) + "/" + filepath.Base(filepath.Dir(path)) + "/" + filepath.Base(path)
 }
 
 // A sample day counts as absorbed only through the summary receipt for this
@@ -328,11 +406,11 @@ func (s *Store) writeHourBuckets(ctx context.Context, hours map[string]*namedHou
 		return err
 	}
 	defer s.historyWriteMu.Unlock()
-	tx, err := s.history.BeginTx(ctx, nil)
+	tx, end, err := s.beginHistoryWrite(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer end()
 	var imported bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM history_migrations WHERE name=?)`, receipt).Scan(&imported); err != nil {
 		return err

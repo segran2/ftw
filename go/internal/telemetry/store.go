@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -90,7 +91,7 @@ type DerReading struct {
 	RawW         float64
 	SmoothedW    float64
 	SoC          *float64  // optional; 0..1 fraction for every DER including vehicles
-	SoCUpdatedAt time.Time // last fresh SoC receipt time; preserved across cached updates
+	SoCUpdatedAt time.Time // last SoC source observation (receipt time for legacy drivers)
 	Data         json.RawMessage
 	UpdatedAt    time.Time
 }
@@ -217,11 +218,13 @@ func (h *DriverHealth) RecordTick() {
 }
 
 // RecordError bumps the error counter and degrades the status after 3 in a row.
+// An offline driver stays offline: only fresh data brings it back. Lifting it
+// to degraded made its held readings live again until the next watchdog scan.
 func (h *DriverHealth) RecordError(err string) {
 	h.ConsecutiveErrors++
 	h.LastError = err
 	h.TickCount++
-	if h.ConsecutiveErrors >= 3 {
+	if h.ConsecutiveErrors >= 3 && h.Status != StatusOffline {
 		h.Status = StatusDegraded
 	}
 }
@@ -274,6 +277,13 @@ func (h *DriverHealth) TelemetryLive() bool {
 	return h != nil && h.Status != StatusOffline
 }
 
+// LastReadFailed reports whether the driver's latest poll failed, so its
+// readings are held from an earlier one. Only failed reads count: a refused
+// command sets DeviceFault and leaves this alone.
+func (h *DriverHealth) LastReadFailed() bool {
+	return h != nil && h.ConsecutiveErrors > 0
+}
+
 // MetricSample is one (driver, metric, ts, value) tuple buffered for the
 // long-format TS database. State.Store consumes these via FlushSamples.
 type MetricSample struct {
@@ -300,9 +310,6 @@ type Store struct {
 	processNoise     float64
 	measurementNoise float64
 
-	// Separate slow filter for computed load (see UpdateLoad below).
-	loadFilter *KalmanFilter1D
-
 	// Per-cycle metric buffer. Drivers push via EmitMetric, the control loop
 	// drains via FlushSamples once per tick. Decouples the hot path from
 	// the (potentially blocking) DB writer.
@@ -314,6 +321,21 @@ type Store struct {
 	// waiting for the control loop to flush it to the TS DB.
 	latestMu     sync.RWMutex
 	latestMetric map[string]metricSnap
+
+	// arrivals hear of each finished poll (see Arrived).
+	arrivalsMu sync.Mutex
+	arrivals   map[chan struct{}]struct{}
+
+	// pollHours counts driver polls and their errors, all drivers together,
+	// one slot per clock hour of the last day, since born. Guarded by mu.
+	pollHours [24]pollHour
+	born      time.Time
+}
+
+// pollHour is one clock hour's driver polls, all drivers together.
+type pollHour struct {
+	hour          int64 // Unix hours
+	polls, errors uint64
 }
 
 type metricSnap struct {
@@ -331,10 +353,9 @@ func NewStore() *Store {
 		filters:          make(map[string]*KalmanFilter1D),
 		health:           make(map[string]*DriverHealth),
 		latestMetric:     make(map[string]metricSnap),
+		born:             time.Now(),
 		processNoise:     100, // W of expected change between samples
 		measurementNoise: 50,  // W of sensor noise
-		// Load: slow filter (process 20 — load changes slowly, measurement 500 — noisy)
-		loadFilter: NewKalman(20, 500),
 	}
 }
 
@@ -426,6 +447,21 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 	var socUpdatedAt time.Time
 	if socFresh {
 		socUpdatedAt = now
+		if t == DerVehicle {
+			var fields map[string]json.RawMessage
+			_ = json.Unmarshal(data, &fields)
+			if raw, present := fields["soc_observed_at_ms"]; present {
+				var ms int64
+				if json.Unmarshal(raw, &ms) != nil || ms <= 0 || ms > now.UnixMilli() {
+					socFresh = false
+				} else {
+					socUpdatedAt = time.UnixMilli(ms)
+					if previous := s.readings[k]; previous != nil && !socUpdatedAt.After(previous.SoCUpdatedAt) {
+						socFresh = false
+					}
+				}
+			}
+		}
 	}
 	// Preserve last-known SoC when the new emit doesn't include one or marks a
 	// non-nil value as a cached replay.
@@ -435,6 +471,7 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 	// persisted metrics can still distinguish it from a fresh number.
 	// A battery SoC older than BatterySoCMaxAge is not carried: it is unknown.
 	if !socFresh {
+		socUpdatedAt = time.Time{}
 		prev, ok := s.readings[k]
 		switch {
 		case !ok || prev.SoC == nil:
@@ -470,7 +507,7 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 	)
 	if socFresh {
 		s.pending = append(s.pending,
-			MetricSample{Driver: driver, Metric: t.String() + "_soc", TsMs: tsMs, Value: *soc},
+			MetricSample{Driver: driver, Metric: t.String() + "_soc", TsMs: socUpdatedAt.UnixMilli(), Value: *soc},
 		)
 	}
 	s.pendingMu.Unlock()
@@ -652,6 +689,90 @@ func (s *Store) SumOnlineV2XW() float64 {
 	return sum
 }
 
+// OnlineLowerW returns the lower of a driver's raw and smoothed power of
+// one type, while the driver is still reporting and its latest poll
+// succeeded. A held reading after a failed poll returns false.
+func (s *Store) OnlineLowerW(driver string, t DerType) (float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, found := s.readings[key(driver, t)]
+	h, known := s.health[driver]
+	if !found || !known || !h.TelemetryLive() || h.LastReadFailed() {
+		return 0, false
+	}
+	w := math.Min(r.RawW, r.SmoothedW)
+	return w, !math.IsNaN(w) && !math.IsInf(w, 0)
+}
+
+// SumOnlineHigherW sums the higher of raw and smoothed power over the
+// readings of these types whose drivers are still reporting.
+func (s *Store) SumOnlineHigherW(types ...DerType) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var sum float64
+	for _, r := range s.readings {
+		if h, ok := s.health[r.Driver]; ok && h.TelemetryLive() && slices.Contains(types, r.DerType) {
+			sum += math.Max(r.RawW, r.SmoothedW)
+		}
+	}
+	return sum
+}
+
+// OnlineMeterW returns a site meter's latest power and when it arrived,
+// while its driver is still reporting. A watchdog-offline meter returns
+// false, so its last value never counts as a new reading.
+func (s *Store) OnlineMeterW(driver string) (w float64, at time.Time, ok bool) {
+	return s.OnlineRawW(driver, DerMeter)
+}
+
+// OnlineRawW returns a driver's latest raw power of one type and when it
+// arrived, while the driver is still reporting. A watchdog-offline driver
+// returns false.
+func (s *Store) OnlineRawW(driver string, t DerType) (w float64, at time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, found := s.readings[key(driver, t)]
+	if !found || math.IsNaN(r.RawW) || math.IsInf(r.RawW, 0) {
+		return 0, time.Time{}, false
+	}
+	if h, known := s.health[driver]; !known || !h.TelemetryLive() {
+		return 0, time.Time{}, false
+	}
+	return r.RawW, r.UpdatedAt, true
+}
+
+// OnlineMeterSample is OnlineMeterW with the reading's data, which holds
+// the phase values.
+func (s *Store) OnlineMeterSample(driver string) (w float64, data json.RawMessage, at time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, found := s.readings[key(driver, DerMeter)]
+	if !found || math.IsNaN(r.RawW) || math.IsInf(r.RawW, 0) {
+		return 0, nil, time.Time{}, false
+	}
+	if h, known := s.health[driver]; !known || !h.TelemetryLive() {
+		return 0, nil, time.Time{}, false
+	}
+	return r.RawW, r.Data, r.UpdatedAt, true
+}
+
+// OnlineRawWByType returns the latest raw power of every driver of one type
+// that is still reporting. A watchdog-offline driver is left out.
+func (s *Store) OnlineRawWByType(t DerType) map[string]float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]float64)
+	for _, r := range s.readings {
+		if r.DerType != t || math.IsNaN(r.RawW) || math.IsInf(r.RawW, 0) {
+			continue
+		}
+		if h, known := s.health[r.Driver]; known && h.TelemetryLive() {
+			out[r.Driver] = r.RawW
+		}
+	}
+	return out
+}
+
 // ReadingsByDriver returns all readings from one driver.
 func (s *Store) ReadingsByDriver(driver string) []*DerReading {
 	s.mu.RLock()
@@ -730,6 +851,48 @@ func (s *Store) RecordDriverError(name, err string) {
 	s.driverHealthLocked(name).RecordError(err)
 }
 
+// CountPoll counts one finished driver poll, failed or not. The driver
+// registry's poll loop is the one caller: an OCPP charger's messages are not
+// polls and are counted neither way.
+func (s *Store) CountPoll(failed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.countPollLocked(time.Now(), failed)
+}
+
+// countPollLocked counts one poll in its clock hour, reusing the slot of the
+// same hour a day before.
+func (s *Store) countPollLocked(now time.Time, failed bool) {
+	hour := now.Unix() / 3600
+	slot := &s.pollHours[hour%int64(len(s.pollHours))]
+	if slot.hour != hour {
+		*slot = pollHour{hour: hour}
+	}
+	slot.polls++
+	if failed {
+		slot.errors++
+	}
+}
+
+// PollsLastDay is how many driver polls ran in the 24 clock hours up to now,
+// all drivers together, how many of them failed, and how much of the day the
+// count covers: the counts live in memory, so after a restart they cover
+// only the time since. The anonymous fleet report coarsens the share into a
+// bucket; no driver's name is counted.
+func (s *Store) PollsLastDay(now time.Time) (polls, errors uint64, covered time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	covered = min(24*time.Hour, max(0, now.Sub(s.born)))
+	hour := now.Unix() / 3600
+	for _, slot := range s.pollHours {
+		if slot.hour > hour-int64(len(s.pollHours)) && slot.hour <= hour {
+			polls += slot.polls
+			errors += slot.errors
+		}
+	}
+	return polls, errors, covered
+}
+
 // Remove drops all in-memory state for a driver: readings, Kalman
 // filters, the health entry and the latest emit_metric snapshots. Called
 // from the driver Registry when a driver is removed from config (or
@@ -737,7 +900,8 @@ func (s *Store) RecordDriverError(name, err string) {
 // rendering the stale card. A replacement under the same name that no
 // longer emits a metric (e.g. site-meter phase currents) must not inherit
 // the old, ageing snapshot, which would read as stale and block dispatch.
-// Historical TS-DB samples are NOT touched; they stay queryable.
+// A battery's outstanding order bound survives until raw power confirms its
+// replacement. Historical TS-DB samples stay queryable.
 func (s *Store) Remove(driver string) {
 	s.mu.Lock()
 	for _, t := range allDerTypes {
@@ -753,11 +917,7 @@ func (s *Store) Remove(driver string) {
 		c.Baseline, c.StepAfter = nil, nil
 		s.commands[k] = c
 	}
-	for k, command := range s.commands {
-		if command.Driver == driver {
-			delete(s.commands, k)
-		}
-	}
+	s.clearCommandEvidenceLocked(driver, time.Now())
 	s.mu.Unlock()
 
 	prefix := driver + ":"
@@ -885,20 +1045,4 @@ func (s *Store) SetDriverCommandFault(name string, faulted bool, reason string) 
 type WatchdogTransition struct {
 	Name   string
 	Online bool
-}
-
-// UpdateLoad applies the slow load filter. load = grid - pv - bat is noisy
-// because battery responds faster than the grid meter sees the change. This
-// filter gives a stable house-load estimate.
-//
-// Negative rawLoad is physically impossible for household consumption and
-// indicates a transient driver-startup or PV/meter sync-lag artifact.
-// Clamping to zero prevents the Kalman filter from tracking garbage.
-func (s *Store) UpdateLoad(rawLoad float64) float64 {
-	if rawLoad < 0 {
-		rawLoad = 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.loadFilter.Update(rawLoad)
 }

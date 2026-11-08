@@ -97,6 +97,9 @@ type Bridge struct {
 	cb     CommandCallbacks
 	plan   PlanSource   // nil when MPC is not configured
 	energy EnergySource // nil when state.Store is not available
+	// Set before the publish loop starts; the callback reads the current
+	// source topology shared by all live views.
+	measurementOptions func() telemetry.ForecastOptions
 
 	topicPrefix string // stable wire ID, e.g. "forty-two-watts"
 	discoPrefix string // e.g. "homeassistant"
@@ -194,6 +197,7 @@ func Start(
 	cb CommandCallbacks,
 	plan PlanSource,
 	energy EnergySource,
+	measurementOptions func() telemetry.ForecastOptions,
 ) (*Bridge, error) {
 	b := &Bridge{
 		tel:                     tel,
@@ -202,6 +206,7 @@ func Start(
 		cb:                      cb,
 		plan:                    plan,
 		energy:                  energy,
+		measurementOptions:      measurementOptions,
 		topicPrefix:             "forty-two-watts",
 		discoPrefix:             "homeassistant",
 		deviceID:                "forty_two_watts",
@@ -487,6 +492,7 @@ func (b *Bridge) publishDiscovery() {
 		{"battery_power", "Battery Power", "W", "power", "measurement", b.stateTopic("bat_w")},
 		{"ev_power", "EV Power", "W", "power", "measurement", b.stateTopic("ev_w")},
 		{"v2x_power", "V2X Power", "W", "power", "measurement", b.stateTopic("v2x_w")},
+		// Live balance as the dashboard shows it.
 		{"load_power", "Load Power", "W", "power", "measurement", b.stateTopic("load_w")},
 		{"battery_soc", "Battery SoC", "%", "battery", "measurement", b.stateTopic("bat_soc_pct")},
 		// Control setpoints
@@ -810,6 +816,12 @@ func metricUnitAndClass(name, explicitUnit string) (unit, devClass string) {
 func (b *Bridge) subscribeCommands() {
 	b.client.Subscribe(b.cmdTopic("mode"), 0, func(_ paho.Client, m paho.Message) {
 		mode := string(m.Payload())
+		// A stored broker command is replayed on every reconnect. It
+		// must not undo the boot rule that ends manual Charge.
+		if mode == string(control.ModeCharge) && m.Retained() {
+			slog.Warn("HA: ignored a retained Charge command; send a new command to charge")
+			return
+		}
 		if b.cb.SetMode != nil {
 			if err := b.cb.SetMode(mode); err != nil {
 				slog.Warn("HA set mode failed", "err", err)
@@ -933,17 +945,24 @@ func (b *Bridge) publishState() {
 	}
 	evW := b.tel.SumOnlineEVW()
 	v2xW := b.tel.SumOnlineV2XW()
-	loadW := gridW - batW - pvW - evW - v2xW
-	if loadW < 0 {
-		loadW = 0
+	options := telemetry.ForecastOptions{}
+	if b.measurementOptions != nil {
+		options = b.measurementOptions()
 	}
+	live := b.tel.LiveMeasurementNow(siteMeter, options)
 
 	b.publishValue("grid_w", gridW)
 	b.publishValue("pv_w", pvW)
 	b.publishValue("bat_w", batW)
 	b.publishValue("ev_w", evW)
 	b.publishValue("v2x_w", v2xW)
-	b.publishValue("load_w", loadW)
+	if live.LoadKnown {
+		b.publishValue("load_w", live.LoadW)
+	} else {
+		// HA's numeric MQTT sensors ignore an empty payload. The literal
+		// None replaces the previous value with unknown.
+		b.publishString("load_w", "None")
+	}
 	b.publishValue("bat_soc_pct", units.PercentFromFraction(avgSoC))
 	b.publishValue("grid_target_w", gridTarget)
 	b.publishValue("peak_limit_w", peakLimit)
@@ -1112,24 +1131,37 @@ func (b *Bridge) publishState() {
 		if r.SoC != nil {
 			b.publishDriver(name, "vehicle_soc_pct", units.PercentFromFraction(*r.SoC))
 		}
-		attrs := map[string]any{
-			"updated_at": r.UpdatedAt.UTC().Format(time.RFC3339),
+		if d, err := json.Marshal(vehicleAttrs(r)); err == nil {
+			b.publish(b.driverTopic(name, "vehicle_json"), d, false)
 		}
-		if r.SoC != nil {
-			attrs["soc_pct"] = units.PercentFromFraction(*r.SoC)
-		}
-		if len(r.Data) > 0 {
-			var extra map[string]any
-			if json.Unmarshal(r.Data, &extra) == nil {
-				for k, v := range extra {
+	}
+}
+
+// vehicleWhereKeys say where the car is and when its cable went in. They are
+// for the box's own choice of car, and Home Assistant already knows them from
+// its own entities; vehicle_json goes to a broker other clients read.
+var vehicleWhereKeys = map[string]bool{"at_site": true, "site_distance_m": true, "plugged_since_ms": true}
+
+// vehicleAttrs is a vehicle reading's vehicle_json: its level in percent and
+// the driver's own fields, less where the car is.
+func vehicleAttrs(r *telemetry.DerReading) map[string]any {
+	attrs := map[string]any{
+		"updated_at": r.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if len(r.Data) > 0 {
+		var extra map[string]any
+		if json.Unmarshal(r.Data, &extra) == nil {
+			for k, v := range extra {
+				if !vehicleWhereKeys[k] {
 					attrs[k] = v
 				}
 			}
 		}
-		if d, err := json.Marshal(attrs); err == nil {
-			b.publish(b.driverTopic(name, "vehicle_json"), d, false)
-		}
 	}
+	if r.SoC != nil {
+		attrs["soc_pct"] = units.PercentFromFraction(*r.SoC)
+	}
+	return attrs
 }
 
 // announceEVDriver publishes HA discovery for an EV charger reader.

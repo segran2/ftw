@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
 	"github.com/lorenzodonini/ocpp-go/ocpp1.6/types"
 	"github.com/lorenzodonini/ocpp-go/ws"
@@ -28,31 +28,68 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// startServer brings up an OCPP CS on a free port and returns the port + a
-// matching ws://… URL plus the running server. Caller must defer Stop.
-// approved lists the charger ids treated as loadpoint-named; chargers outside
-// it connect as pending and push no telemetry.
+// startServer brings up an OCPP CS on a free port and returns the port and
+// the running server, which stops at cleanup. approved lists the charger ids
+// treated as loadpoint-named; chargers outside it connect as pending and push
+// no telemetry.
 func startServer(t *testing.T, tel *telemetry.Store, approved ...string) (int, *Server) {
 	t.Helper()
-	port := freePort(t)
-	cfg := &Config{Enabled: true, Bind: "127.0.0.1", Port: port, HeartbeatIntervalS: 60, ApprovedIDs: approved}
-	srv, err := Start(context.Background(), cfg, tel)
+	srv := startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", HeartbeatIntervalS: 60, ApprovedIDs: approved}, tel, false)
+	return srv.cfg.Port, srv
+}
+
+// A port another process holds fails Start, and each charger the site names
+// carries the reason in its health. The library gives up on the port inside
+// a goroutine and logs nowhere we read, so without this the chargers stay
+// away and nothing says why.
+func TestStartFailsWhenItsPortIsTaken(t *testing.T) {
+	taken := holdPort(t)
+	tel := telemetry.NewStore()
+	cfg := &Config{Enabled: true, Bind: "127.0.0.1", Port: taken, ApprovedIDs: []string{"garage"}}
+	if _, err := Start(context.Background(), cfg, tel); err == nil {
+		t.Fatalf("Start succeeded with port %d taken", taken)
+	} else if !strings.Contains(err.Error(), fmt.Sprint(taken)) {
+		t.Errorf("error %q does not name port %d", err, taken)
+	}
+	if h := tel.DriverHealth("garage"); h == nil || !strings.Contains(h.LastError, fmt.Sprint(taken)) {
+		t.Fatalf("the charger's health does not say why it cannot connect: %+v", h)
+	}
+}
+
+// A taken 2.0.1 port leaves the 1.6 listener running, so the chargers that
+// dial 1.6 are still steered. The reason stays on each charger that has not
+// connected.
+func TestATaken201PortLeavesThe16ListenerRunning(t *testing.T) {
+	taken := holdPort(t)
+	tel := telemetry.NewStore()
+	srv := startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", PortV201: taken, HeartbeatIntervalS: 60, ApprovedIDs: []string{"garage", "carport"}}, tel, false)
+	if srv.csms != nil {
+		t.Fatalf("a 2.0.1 listener started on taken port %d", taken)
+	}
+	cp, _, err := dialChargePoint16(t, wsURL(srv.cfg.Port), "garage", nil, nil)
 	if err != nil {
-		t.Fatalf("start: %v", err)
+		t.Fatalf("a 1.6 charger could not connect: %v", err)
 	}
-	// Wait for the listener to be reachable. cs.Start launches goroutines —
-	// without a tiny pause the client will racily connect to nothing.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
-		if err == nil {
-			c.Close()
-			return port, srv
-		}
-		time.Sleep(20 * time.Millisecond)
+	if _, err := cp.BootNotification("Home", "Easee"); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("server did not bind on port %d within deadline", port)
-	return 0, nil
+	if h := tel.DriverHealth("garage"); h == nil || h.LastError != "" {
+		t.Errorf("the connected 1.6 charger still shows an error: %+v", h)
+	}
+	if h := tel.DriverHealth("carport"); h == nil || !strings.Contains(h.LastError, fmt.Sprint(taken)) {
+		t.Errorf("the charger that has not connected does not say why: %+v", h)
+	}
+}
+
+// holdPort takes a port on every interface until the test ends.
+func holdPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 func TestStopIsConcurrentAndIdempotent(t *testing.T) {
@@ -73,14 +110,11 @@ func TestStopIsConcurrentAndIdempotent(t *testing.T) {
 func TestBootAndMeterValuesPushDerEV(t *testing.T) {
 	tel := telemetry.NewStore()
 	port, srv := startServer(t, tel, "EH123456")
-	defer srv.Stop()
 
-	cp := ocpp16.NewChargePoint("EH123456", nil, nil)
-	url := fmt.Sprintf("ws://127.0.0.1:%d", port)
-	if err := cp.Start(url); err != nil {
+	cp, _, err := dialChargePoint16(t, wsURL(port), "EH123456", nil, nil)
+	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
-	defer cp.Stop()
 
 	if _, err := cp.BootNotification("EaseeHome", "Easee"); err != nil {
 		t.Fatalf("boot: %v", err)
@@ -132,7 +166,6 @@ func TestBootAndMeterValuesPushDerEV(t *testing.T) {
 func TestStartStopTransactionTracksSession(t *testing.T) {
 	tel := telemetry.NewStore()
 	port, srv := startServer(t, tel, "EH-SESSION")
-	defer srv.Stop()
 
 	// The idTag that starts a transaction is the session's vehicle identity
 	// — main.go turns it into a vehicle-profile lookup, so the callback and
@@ -145,11 +178,10 @@ func TestStartStopTransactionTracksSession(t *testing.T) {
 		idMu.Unlock()
 	})
 
-	cp := ocpp16.NewChargePoint("EH-SESSION", nil, nil)
-	if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	cp, _, err := dialChargePoint16(t, wsURL(port), "EH-SESSION", nil, nil)
+	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer cp.Stop()
 
 	if _, err := cp.BootNotification("Home", "Easee"); err != nil {
 		t.Fatalf("boot: %v", err)
@@ -194,13 +226,11 @@ func TestStartStopTransactionTracksSession(t *testing.T) {
 func TestPendingChargerIsQuarantinedFromTelemetry(t *testing.T) {
 	tel := telemetry.NewStore()
 	port, srv := startServer(t, tel, "adopted-charger")
-	defer srv.Stop()
 
-	cp := ocpp16.NewChargePoint("intruder", nil, nil)
-	if err := cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port)); err != nil {
+	cp, _, err := dialChargePoint16(t, wsURL(port), "intruder", nil, nil)
+	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer cp.Stop()
 
 	if _, err := cp.BootNotification("EvilCo", "FakeCharger"); err != nil {
 		t.Fatalf("boot: %v", err)
@@ -281,22 +311,11 @@ func TestPendingChargerIsQuarantinedFromTelemetry(t *testing.T) {
 }
 
 func TestBasicAuthRejectsWrongCredentials(t *testing.T) {
-	tel := telemetry.NewStore()
-	port := freePort(t)
-	cfg := &Config{Enabled: true, Bind: "127.0.0.1", Port: port, Username: "easee", Password: "secret"}
-	srv, err := Start(context.Background(), cfg, tel)
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	defer srv.Stop()
-	time.Sleep(100 * time.Millisecond)
+	srv := startOCPP(t, Config{Enabled: true, Bind: "127.0.0.1", Username: "easee", Password: "secret"}, telemetry.NewStore(), false)
 
 	wsClient := ws.NewClient()
 	wsClient.SetBasicAuth("easee", "wrong-password")
-	cp := ocpp16.NewChargePoint("EH-AUTH", nil, wsClient)
-	err = cp.Start(fmt.Sprintf("ws://127.0.0.1:%d", port))
-	if err == nil {
-		cp.Stop()
+	if _, _, err := dialChargePoint16(t, wsURL(srv.cfg.Port), "EH-AUTH", wsClient, nil); err == nil {
 		t.Error("expected auth failure with wrong password, got nil")
 	}
 }

@@ -5,6 +5,7 @@
 
 site:
   name: "Home"
+  # time_zone: Europe/Stockholm  # the home's clock; empty uses the host's zone (UTC in Docker)
   control_interval_s: 2         # 2 s matches Ferroamp ehub ~1 Hz; drop to 1 for snappier response
   grid_target_w: 0              # 0 = self-consumption
   grid_tolerance_w: 42          # deadband (The Answer)
@@ -12,7 +13,7 @@ site:
   smoothing_alpha: 0.3
   slew_rate_w: 3000             # W per cycle. Both Ferroamp and Sungrow ramp internally — this is a soft ceiling, not the primary protection
   # slew_enabled: false         # disable the external slew limiter entirely and trust the inverter's internal ramp control (experimental)
-  min_dispatch_interval_s: 2    # debounce; keep == control_interval_s
+  min_dispatch_interval_s: 2    # least time between battery commands; at or below control_interval_s it never skips a tick
 
 fuse:
   max_amps: 16
@@ -157,7 +158,12 @@ homeassistant:
 # modbus_proxy:
 #   enabled: true
 #   listen: ":1502"     # used when the site has one unique Modbus TCP endpoint
-#   allow_write: false  # keep off unless you trust every host on the LAN
+#   allow_write: false  # read-only proxy; FTW owns control
+#   # true gives LAN clients write ownership; FTW only reads these endpoints.
+#   # All configured unit IDs on each endpoint share this choice. Unknown unit
+#   # IDs (including broadcast 0) are blocked. The external controller owns
+#   # device safety. A disconnect does not return control to FTW; change the
+#   # setting and restart. Ownership stays in force if the listener fails.
 #
 # Two inverters (different host:port) each need their own listen address:
 #   capabilities.modbus.proxy_listen: ":1502"  /  ":1503"
@@ -187,7 +193,7 @@ ocpp:
   path: /
   username: ftw
   password: ""                     # required when enabled; use a long random string
-  heartbeat_interval_s: 60
+  heartbeat_interval_s: 30
   # Serve wss:// instead of ws://. client_ca_file additionally requires each
   # charger to present a certificate signed by that CA whose CN or DNS SAN
   # matches the identity in the URL — OCPP 2.0.1 security profile 3.
@@ -215,19 +221,23 @@ state:
 app_link:
   enabled: true
 
-# Anonymous fleet ping. Once a day, at a time that moves, the box tells the
-# FTW relay six things: its FTW version, its release channel, which driver
-# types it runs, roughly how much battery it has, its price zone and roughly
-# how old the install is. No id, no key, no serial, no site name, no counter
-# and no timestamp — nothing in the message says which box sent it. Two
-# limits: those six fields still describe a household, so a rare mix may be
-# the only one of its kind, and the relay sees the address during the request.
-# It saves only daily totals, so the result counts reports, not unique boxes.
-# Settings → FTW app → Fleet statistics shows the exact message this box would send. On by
-# default; `enabled: false` turns it off without a restart.
+# Anonymous daily reports. Statistics are one answer on the box: part of FTW
+# Cloud, and on for a box without Cloud until its owner turns them off under
+# Settings → FTW app → Anonymous statistics, which shows each message. Two
+# reports, each alone and at its own time. The fleet report carries six
+# things: FTW version, release channel, driver types, roughly how much
+# battery, price zone and roughly how old the install is. The energy report
+# carries a closed UTC day's six whole-kWh sums. No box id, no key, no serial,
+# no site name, no counter. Once a release names a relay, both go through it,
+# sealed with a random number drawn new for each report and the day it was
+# sent, so FTW Cloud never sees the address; until then the fleet report goes
+# straight to `endpoint`, which sees the address, and the energy report is not
+# sent.
+# `enabled: false` from an earlier release is read once and kept as "off"; it
+# is no longer a switch of its own.
 fleet_ping:
   enabled: true
-  # endpoint: https://relay.ftw.energy/fleet
+  # endpoint: https://cloud.ftw.energy/v1/fleet
 
 # Independently distributed Lua drivers. The signed stable catalog is refreshed
 # by default, but refresh never downloads, activates, or restarts a driver.
@@ -257,11 +267,11 @@ fleet_ping:
 #         ftw-drivers-2026-01: MX+j27UBkyM099hTyJlmMLK9qlTTDUJsaK/vH12fFKc=
 # Refresh only updates the signed catalog. Install and activation stay explicit.
 
-# Energyplan ships with Core and runs first in supported beta builds.
+# Energyplan ships with Core and runs first in supported beta and stable builds.
 # Core DP provides shadow comparisons and validated fallback plans.
 # planner:
 #   enabled: true
-#   # engine: energyplan # beta default; core selects the Go planner
+#   # engine: energyplan # release default; core selects the Go planner
 #   mode: passive_arbitrage
 #   forecast_trust: balanced   # cautious | balanced | bold (first boot; live value is SQLite)
 #   battery_export: unknown    # unknown | not_allowed | allowed (unknown = no battery sale)
@@ -275,3 +285,11 @@ fleet_ping:
 # price:
 #   demand_price_per_kw: 7000
 #   demand_top_n: 3
+
+# Tests and development only: read elprisetjustnu-format prices from another
+# server, with no Nord Pool fallback. The site rig serves pinned prices this
+# way (go/test/site/prices_test.go). Leave it unset on a real site.
+# Only the elprisetjustnu provider reads base_url; other providers ignore it.
+# price:
+#   provider: elprisetjustnu
+#   base_url: http://127.0.0.1:8099

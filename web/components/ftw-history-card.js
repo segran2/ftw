@@ -44,7 +44,7 @@ const DEFAULT_ACCENT = {
   load:          "var(--fg)",
   pv:            "var(--amber)",
   bat_charged:   "var(--cyan)",
-  bat_discharged:"var(--cyan-dim, var(--cyan))",
+  bat_discharged:"var(--energy-gives)",
 };
 
 // Several history cards often flip Week/Month together. Share the
@@ -177,7 +177,7 @@ class FtwHistoryCard extends FtwElement {
       cursor: pointer;
       transition: color 220ms ease;
     }
-    .toggle button.active { color: #0a0a0a; }
+    .toggle button.active { color: var(--on-accent); }
     .toggle button:not(.active):hover { color: var(--fg); }
     .toggle button:focus-visible {
       outline: 1px solid var(--accent-e);
@@ -359,11 +359,13 @@ class FtwHistoryCard extends FtwElement {
       .then((resp) => {
         if (seq !== this._reqSeq) return;
         const buckets = (resp && resp.days) || [];
-        let sum = 0;
+        let sum = 0, known = 0;
         // Pass kWh (not Wh) as `value` so the bar-chart's avg label
         // matches the per-bar displayValue units — otherwise the chart
         // would show bars as "10.5" and the avg line as "10500".
         const data = buckets.map((b) => {
+          if (b[field] == null) return {label:fmtDayShort(b.day), value:null, displayValue:"?", title:fmtDayShort(b.day)+": Unknown"};
+          known++;
           const wh = Number(b[field]) || 0;
           sum += wh;
           const kwh = wh / 1000;
@@ -383,14 +385,16 @@ class FtwHistoryCard extends FtwElement {
           // via a trailing <span class="avg-mini"> so the avg reads
           // as secondary text (smaller, muted) instead of a second
           // prominent number.
-          if (data.length) {
+          if (known > 0 && known < data.length) {
+            this._totalEl.textContent = fmtKwh(sum) + " · incomplete period";
+          } else if (known > 0) {
             const avgWh = sum / data.length;
             this._totalEl.innerHTML =
               escapeHtml(fmtKwh(sum) + " total") +
               ' <span class="avg-mini">(' +
               escapeHtml(fmtKwh(avgWh) + " avg") + ")</span>";
           } else {
-            this._totalEl.textContent = "— kWh";
+            this._totalEl.textContent = "Unknown";
           }
           this._chart.data = data;
         };

@@ -21,7 +21,13 @@ func RestartRequiredFor(oldCfg, newCfg *Config) []string {
 	// A save that needs no restart is the common path; clients type-assert
 	// restart_reasons as an array.
 	reasons := []string{}
+	if oldCfg.MeasurementOnly() != newCfg.MeasurementOnly() {
+		reasons = append(reasons, "setup.measurement_only — restart to change equipment control")
+	}
 
+	if oldCfg.Site.TimeZone != newCfg.Site.TimeZone {
+		reasons = append(reasons, "site.time_zone — the household clock is set at startup")
+	}
 	if oldCfg.API.Port != newCfg.API.Port {
 		reasons = append(reasons, "api.port — HTTP server binds the port at startup")
 	}
@@ -30,7 +36,7 @@ func RestartRequiredFor(oldCfg, newCfg *Config) []string {
 		reasons = append(reasons, "state.path / state.cold_dir — database files are opened at startup")
 	}
 	if priceNeedsRestart(oldCfg.Price, newCfg.Price) {
-		reasons = append(reasons, "price.provider / zone / API key — spot-price client is constructed at startup")
+		reasons = append(reasons, "price.provider / zone / API key / base_url — spot-price client is constructed at startup")
 	}
 	if plannerNeedsRestart(oldCfg.Planner, newCfg.Planner) {
 		reasons = append(reasons, "planner.enabled / engine — planner process is constructed at startup")
@@ -81,7 +87,7 @@ func priceNeedsRestart(oldP, newP *Price) bool {
 	if !oldOn {
 		return false
 	}
-	return oldP.Provider != newP.Provider || oldP.Zone != newP.Zone || oldP.APIKey != newP.APIKey || oldP.Currency != newP.Currency
+	return oldP.Provider != newP.Provider || oldP.Zone != newP.Zone || oldP.APIKey != newP.APIKey || oldP.Currency != newP.Currency || oldP.BaseURL != newP.BaseURL
 }
 
 func plannerNeedsRestart(oldP, newP *Planner) bool {
