@@ -204,7 +204,7 @@ export function controlStatus(row, live = true) {
   if (!live) return {title: 'Status not current', text: 'FTW has not reported for a while.', proof: '', next: 'Waiting for a fresh report.', tone: 'stale'};
   const title = REASON_TITLES[row.reason] || STATUS_TITLES[row.status] || 'Checking';
   const tone = row.severity === 'alarm' ? 'alarm' : row.severity === 'warning' ? 'warning' : row.status === 'following' ? 'ok' : 'neutral';
-  return {title, text: sentence(row), proof: proofLine(row), next: nextStep(row), tone};
+  return {title, text: row.message || sentence(row), proof: proofLine(row), next: nextStep(row), tone};
 }
 
 const CONFIRMATION = {

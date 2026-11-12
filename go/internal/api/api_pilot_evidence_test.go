@@ -126,3 +126,33 @@ func TestPilotLimitNeverHidesCommandFailureOrPendingCommand(t *testing.T) {
 		})
 	}
 }
+
+func TestEVWarningMessageInJournal(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEVTrace(0)
+		for range 72 {
+			now := time.Now()
+			e.extra = fmt.Sprintf(`,"max_a":15,"pilot_a":12,"pilot_observed_at":%q,"pilot_confirmed_at_ms":%d`, now.Format(time.RFC3339Nano), now.UnixMilli())
+			e.tick(10350, "plan")
+		}
+		const want = "FTW asked for 15 A and the charger signalled 12 A to the car. Measured charging: 0 W."
+		now := time.Now()
+		if got := e.verdict(t).Message; got != want {
+			t.Fatalf("live message = %q, want %q", got, want)
+		}
+		for _, v := range e.srv.JournalVerdicts(now) {
+			if v.Kind != "ev" {
+				continue
+			}
+			var saved ControlFeedback
+			if err := json.Unmarshal(v.Detail, &saved); err != nil {
+				t.Fatal(err)
+			}
+			if saved.Message != want {
+				t.Fatalf("journal message = %q, want %q", saved.Message, want)
+			}
+			return
+		}
+		t.Fatal("EV verdict missing from journal")
+	})
+}

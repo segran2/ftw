@@ -21,6 +21,7 @@ import (
 // are null, never invented zeros. Reasons describe only what Core or the
 // device reported, not a guessed physical cause.
 type ControlFeedback struct {
+	Message              string             `json:"message,omitempty"`
 	VehicleRequestActive *bool              `json:"vehicle_request_active,omitempty"`
 	Driver               string             `json:"driver"`
 	Kind                 string             `json:"kind"`
@@ -391,6 +392,7 @@ func (s *Server) controlFeedback(now time.Time) []ControlFeedback {
 	}
 	for i := range out {
 		setControlStatus(&out[i])
+		out[i].Message = evPowerWarning(out[i])
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Driver == out[j].Driver {
@@ -399,6 +401,25 @@ func (s *Server) controlFeedback(now time.Time) []ControlFeedback {
 		return out[i].Driver < out[j].Driver
 	})
 	return out
+}
+
+// evPowerWarning supplies the same wording to live clients and the journal.
+func evPowerWarning(f ControlFeedback) string {
+	if f.Kind != "ev" || f.Status != "not_following" || !f.ReadingsFresh ||
+		f.RequestedA == nil || f.PilotA == nil || f.ActualW == nil {
+		return ""
+	}
+	switch f.Reason {
+	case "power_below_target", "power_above_target", "no_power_response":
+	default:
+		return ""
+	}
+	power := fmt.Sprintf("%.0f W", math.Round(math.Abs(*f.ActualW)))
+	if math.Abs(*f.ActualW) >= 1000 {
+		power = fmt.Sprintf("%.1f kW", math.Abs(*f.ActualW)/1000)
+	}
+	return fmt.Sprintf("FTW asked for %.0f A and the charger signalled %.0f A to the car. Measured charging: %s.",
+		math.Round(*f.RequestedA), math.Round(*f.PilotA), power)
 }
 
 // setControlStatus answers "Are we in control?" from the classified reason.

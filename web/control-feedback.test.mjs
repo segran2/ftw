@@ -236,3 +236,11 @@ test('the plan and what happens now, in words', () => {
   assert.equal(planNowWords({...morning, why: 'other'}).why, 'FTW follows what the home and the sun do now, not the forecast.');
   assert.equal(planNowWords({...morning, planned_battery_w: -3000, battery_w: -1000, why: 'less_home'}).then, 'The battery gives only what the home needs.');
 });
+
+test('EV warnings display the exact message stored by Core', () => {
+  const ev = row({kind: 'ev', status: 'not_following', reason: 'no_power_response', severity: 'warning',
+    sent_w: 10350, actual_w: 0,
+    message: 'FTW asked for 15 A and the charger signalled 12 A to the car. Measured charging: 0 W.'});
+  assert.equal(controlStatus(ev).text, ev.message);
+  assert.match(controlStatus({...ev, message: undefined}).text, /10.3 kW charge.*no power/);
+});
