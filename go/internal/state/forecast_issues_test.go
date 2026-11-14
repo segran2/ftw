@@ -3,10 +3,12 @@ package state
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -230,14 +232,16 @@ func TestForecastHourlyLoadAfterIndexUpgrade(t *testing.T) {
 		archiveError("next", start, start, start+hour),
 		archiveError("late", start, start, start+2*hour),
 	}
-	samples[1].ConfigVersion = "other"
+	samples[1].Series = "other"
 	samples[4].AvailableAtMS = until + 1
 	if err := s.SaveForecastErrors(ctx, samples, until+1); err != nil {
 		t.Fatal(err)
 	}
+	legacyHourly := loadLegacyForecastErrors(t, s, start, until, true)
+	legacyAll := loadLegacyForecastErrors(t, s, start, until, false)
 	before, err := s.LoadForecastErrors(ctx, start, until, true)
-	if err != nil || len(before) != 3 {
-		t.Fatalf("pre-upgrade hourly load returned %d rows, err=%v", len(before), err)
+	if err != nil || len(before) != 3 || !reflect.DeepEqual(before, legacyHourly) {
+		t.Fatalf("pre-upgrade hourly load=%v, legacy=%v, err=%v", before, legacyHourly, err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -252,8 +256,8 @@ func TestForecastHourlyLoadAfterIndexUpgrade(t *testing.T) {
 		t.Fatalf("hourly history changed after upgrade: before=%v after=%v err=%v", before, after, err)
 	}
 	all, err := s.LoadForecastErrors(ctx, start, until, false)
-	if err != nil || len(all) != 4 {
-		t.Fatalf("all-slot load returned %d rows, err=%v", len(all), err)
+	if err != nil || len(all) != 4 || !reflect.DeepEqual(all, legacyAll) {
+		t.Fatalf("all-slot load=%v, legacy=%v, err=%v", all, legacyAll, err)
 	}
 
 	rows, err := s.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+forecastErrorLoadQuery(true), start, until, until, MaxForecastErrors+1)
@@ -282,5 +286,75 @@ func TestForecastHourlyLoadAfterIndexUpgrade(t *testing.T) {
 	}
 	if got, err := s.LoadForecastErrors(ctx, start, until, true); got != nil || err == nil || !strings.Contains(err.Error(), "invalid archived forecast error") {
 		t.Fatalf("invalid sample returned %v, err=%v", got, err)
+	}
+}
+
+func loadLegacyForecastErrors(t *testing.T, s *Store, start, until int64, hourly bool) []forecasting.ErrorSample {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT payload FROM forecast_errors WHERE start_ms>=? AND end_ms<=? AND available_at_ms<=?
+ AND (?=0 OR start_ms%3600000=0) ORDER BY start_ms DESC,series,lead LIMIT ?`, start, until, until, hourly, MaxForecastErrors+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var samples []forecasting.ErrorSample
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var sample forecasting.ErrorSample
+		if err := json.Unmarshal([]byte(payload), &sample); err != nil {
+			t.Fatal(err)
+		}
+		samples = append(samples, sample)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	slices.Reverse(samples)
+	return samples
+}
+
+func TestForecastHourlyIndexFailureSkipsNextStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if s != nil {
+			_ = s.Close()
+		}
+	}()
+	// Occupy the index name with a table so CREATE INDEX fails immediately.
+	if _, err := s.db.Exec(`CREATE TABLE forecast_errors_hourly (id INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = OpenWithBackgroundHistory(path, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.LoadConfig(forecastHourlyIndexFailureKey); !ok {
+		t.Fatal("index build failure was not recorded")
+	}
+	if _, err := s.db.Exec(`DROP TABLE forecast_errors_hourly`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = OpenWithBackgroundHistory(path, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='forecast_errors_hourly')`).Scan(&exists); err != nil || exists {
+		t.Fatalf("hourly index exists=%t after failed build, err=%v", exists, err)
 	}
 }

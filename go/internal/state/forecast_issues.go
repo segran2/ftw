@@ -69,17 +69,36 @@ CREATE INDEX IF NOT EXISTS forecast_errors_retention ON forecast_errors(
 	return err
 }
 
-// prepareForecastHourlyIndex runs during boot with its own budget. Reads
-// can use the existing timestamp index if preparation times out.
+const forecastHourlyIndexFailureKey = "forecast_errors_hourly_v1_build_failed"
+
+// prepareForecastHourlyIndex runs before live writers start. After a failed
+// build, hourly reads keep working through the timestamp index on later boots.
 func (s *Store) prepareForecastHourlyIndex() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	var skip bool
+	if err := s.db.QueryRowContext(ctx, `SELECT
+ EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='forecast_errors_hourly')
+ OR EXISTS(SELECT 1 FROM config WHERE key=?)`, forecastHourlyIndexFailureKey).Scan(&skip); err != nil {
+		slog.Warn("forecast hourly index status unavailable", "err", err)
+		return
+	}
+	if skip {
+		return
+	}
 	if err := s.InitForecastArchive(ctx); err != nil {
 		slog.Warn("forecast archive preparation failed", "err", err)
 		return
 	}
 	if err := s.EnsureForecastHourlyIndex(ctx); err != nil {
 		slog.Warn("forecast hourly index unavailable", "err", err)
+		// Give the marker its own deadline since the build may have used its
+		// entire budget.
+		recordCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := s.db.ExecContext(recordCtx, `INSERT OR IGNORE INTO config(key,value) VALUES (?,'1')`, forecastHourlyIndexFailureKey); err != nil {
+			slog.Warn("forecast hourly index failure could not be recorded", "err", err)
+		}
 	}
 }
 
