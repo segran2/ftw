@@ -244,7 +244,11 @@ test('EV shortfalls show the reported reason without changing the verdict', () =
       device_reason: '  current limited by equalizer  '});
     const before = controlStatus({...ev, device_reason: undefined});
     const shown = controlStatus(ev);
-    assert.equal(shown.next, 'The charger reports: current limited by equalizer.');
+    const advice = {
+      device_limit: ' Raise the limit in the charger’s app if you want faster charging.',
+      offered_current_lower: ' Check the charger’s load balancing and limits.',
+    };
+    assert.equal(shown.next, 'The charger reports: current limited by equalizer.' + (advice[reason] || ''));
     for (const key of ['title', 'text', 'tone', 'proof']) assert.equal(shown[key], before[key], `${reason}: ${key}`);
     assert.doesNotMatch(Object.values(shown).join(' '), /has not said why/);
     assert.equal(controlStatus(ev, false).title, 'Status not current');
